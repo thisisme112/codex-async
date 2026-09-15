@@ -17,10 +17,14 @@ use tokio_util::sync::CancellationToken;
 enum ExecutionCancellationTiming {
     PendingReview,
     AcceptedReview,
+    IdleThenAccepted,
+    IdleTurnWithdrawn,
 }
 
 #[test_case(ExecutionCancellationTiming::PendingReview; "pending_review")]
 #[test_case(ExecutionCancellationTiming::AcceptedReview; "accepted_review")]
+#[test_case(ExecutionCancellationTiming::IdleThenAccepted; "cell_idle_before_review")]
+#[test_case(ExecutionCancellationTiming::IdleTurnWithdrawn; "cell_turn_ends_before_prompt")]
 #[tokio::test]
 #[allow(
     clippy::await_holding_invalid_type,
@@ -70,9 +74,26 @@ async fn execution_cancellation_respects_network_approval_boundary(
         )
         .await
         .unwrap();
-    session.start_task(turn, Vec::new(), PendingTask).await;
+    let idle = matches!(
+        timing,
+        ExecutionCancellationTiming::IdleThenAccepted
+            | ExecutionCancellationTiming::IdleTurnWithdrawn
+    );
+    let hook = matches!(timing, ExecutionCancellationTiming::IdleTurnWithdrawn).then(|| {
+        crate::tools::code_mode::interactive_test_support::ReviewHook::install(&session, &turn)
+    });
+    if !idle {
+        session
+            .start_task(turn.clone(), Vec::new(), PendingTask)
+            .await;
+    }
     let service = &session.services.network_approval;
     register_call_with_default_shell_trigger(service, "execution-1").await;
+    if idle {
+        let mut calls = service.calls.lock().unwrap();
+        let call = calls.active_calls.get_mut("execution-1").unwrap();
+        Arc::get_mut(call).unwrap().prompt_origin = crate::tools::code_mode::ToolPromptOrigin::Cell;
+    }
     let request = NetworkPolicyRequest {
         protocol: NetworkProtocol::Http,
         host: "example.com".to_string(),
@@ -88,6 +109,49 @@ async fn execution_cancellation_respects_network_approval_boundary(
     };
     let decision = service.handle_inline_policy_request(Arc::clone(&session), request.clone());
     tokio::pin!(decision);
+    if idle {
+        assert!(poll!(decision.as_mut()).is_pending());
+        assert!(
+            events.try_recv().is_err(),
+            "idle review must not emit an ownerless prompt"
+        );
+        assert!(!*session.subscribe_elicitation_pause_state().borrow());
+        session.start_task(turn, Vec::new(), PendingTask).await;
+        session.services.code_mode_service.completions.activity();
+    }
+    if let Some(hook) = &hook {
+        timeout(Duration::from_secs(5), async {
+            tokio::select! { _ = hook.entered.notified() => {}, r = &mut decision => panic!("premature review: {r:?}") }
+        }).await.unwrap();
+        session
+            .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Replaced)
+            .await;
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event.msg, EventMsg::ExecApprovalRequest(_)));
+        }
+        hook.release.notify_one();
+        timeout(Duration::from_secs(5), async {
+            loop { tokio::select! {
+                event = events.recv() => { if matches!(event.unwrap().msg, EventMsg::HookCompleted(_)) { break; } },
+                r = &mut decision => panic!("must wait for replacement turn: {r:?}"),
+            } }
+        }).await.unwrap();
+        assert!(poll!(decision.as_mut()).is_pending());
+        assert!(!*session.subscribe_elicitation_pause_state().borrow());
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event.msg, EventMsg::ExecApprovalRequest(_)));
+        }
+        let (next, _) = session
+            .new_turn_with_sub_id(
+                "replacement".to_string(),
+                Default::default(),
+                crate::session::turn_context::NewTurnContextOptions::default(),
+            )
+            .await
+            .unwrap();
+        session.start_task(next, Vec::new(), PendingTask).await;
+        session.services.code_mode_service.completions.activity();
+    }
     let approval = timeout(Duration::from_secs(5), async {
         loop {
             tokio::select! {
@@ -102,12 +166,21 @@ async fn execution_cancellation_respects_network_approval_boundary(
     })
     .await
     .unwrap();
+    if let Some(hook) = &hook {
+        assert_eq!(approval.turn_id, "replacement");
+        assert_eq!(
+            *hook.turns.lock().unwrap(),
+            vec!["active-turn", "replacement"]
+        );
+    }
     let expected_decision = match timing {
         ExecutionCancellationTiming::PendingReview => {
             service.record_call_outcome("execution-1", "original execution denial".to_string());
             NetworkDecision::deny("not_allowed")
         }
-        ExecutionCancellationTiming::AcceptedReview => {
+        ExecutionCancellationTiming::AcceptedReview
+        | ExecutionCancellationTiming::IdleThenAccepted
+        | ExecutionCancellationTiming::IdleTurnWithdrawn => {
             let commit_guard = service.session_policy_commit_lock.lock().await;
             session
                 .notify_approval(
@@ -622,6 +695,7 @@ async fn register_call_with_default_shell_trigger(
     let cancellation_token = CancellationToken::new();
     service
         .register_call(ActiveNetworkApprovalCall {
+            prompt_origin: crate::tools::code_mode::ToolPromptOrigin::Direct,
             registration_id: registration_id.to_string(),
             turn_id: "turn-1".to_string(),
             tool_name: ToolName::plain("exec_command"),
@@ -662,6 +736,7 @@ async fn active_call_preserves_triggering_command_context() {
 
     service
         .register_call(ActiveNetworkApprovalCall {
+            prompt_origin: crate::tools::code_mode::ToolPromptOrigin::Direct,
             registration_id: "registration-1".to_string(),
             turn_id: "turn-1".to_string(),
             trigger: expected.clone(),

@@ -182,6 +182,8 @@ async fn non_utf8_cwd_preserves_approval_routing(
 #[tokio::test]
 async fn explicit_mcp_reviewer_override_takes_precedence_over_action_context() {
     let (session, turn, events) = make_session_and_context_with_rx().await;
+    // A user prompt needs an owner even when this test bypasses task dispatch.
+    *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
     let action = ApprovalAction::McpToolCall {
         id: "mcp-override".to_string(),
         server: "example".to_string(),
@@ -215,8 +217,10 @@ async fn explicit_mcp_reviewer_override_takes_precedence_over_action_context() {
         network_approval_context: None,
     };
 
+    let approval = session.request_reviewer_approval(action, &context);
+    tokio::pin!(approval);
     tokio::select! {
-        resolution = session.request_reviewer_approval(action, &context) => {
+        resolution = &mut approval => {
             panic!("expected a user approval request, got {resolution:?}");
         }
         event = events.recv() => {
@@ -234,4 +238,23 @@ async fn explicit_mcp_reviewer_override_takes_precedence_over_action_context() {
             );
         }
     }
+    session
+        .resolve_elicitation(
+            "example".to_string(),
+            rmcp::model::RequestId::String("mcp_tool_call_approval_mcp-override".into()),
+            codex_rmcp_client::ElicitationResponse {
+                action: rmcp::model::ElicitationAction::Accept,
+                content: None,
+                meta: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        approval.await,
+        ApprovalResolution {
+            decision: ReviewDecision::Approved,
+            source: ApprovalResolutionSource::User,
+        }
+    );
 }

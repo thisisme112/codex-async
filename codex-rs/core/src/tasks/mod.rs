@@ -895,6 +895,7 @@ impl Session {
                         .is_none()
                 {
                     self.services.code_mode_service.completions.suppress();
+                    self.services.code_mode_service.stop_dispatch();
                 }
                 *active = None;
                 self.services.code_mode_service.completions.activity();
@@ -923,6 +924,7 @@ impl Session {
             TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
         ) {
             self.services.code_mode_service.completions.suppress();
+            self.services.code_mode_service.stop_dispatch();
         }
         if matches!(
             reason,

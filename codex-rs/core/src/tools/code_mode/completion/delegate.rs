@@ -62,6 +62,7 @@ impl CodeModeSessionDelegate for CompletionDelegate {
     }
 
     fn cell_completion_ready(&self, cell_id: &CellId) {
+        self.inner.cell_completion_ready(cell_id);
         let mut state = self.completions.state();
         if let Some(entry) = state.entries.get_mut(&self.execution) {
             if !valid_cell_id(cell_id) || entry.cell_id.as_ref().is_some_and(|id| id != cell_id) {

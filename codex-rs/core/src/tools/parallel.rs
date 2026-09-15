@@ -181,8 +181,9 @@ impl ToolCallRuntime {
                     let _ = execution_started_at.set(Instant::now());
                 }
 
-                let result = router
-                    .dispatch_tool_call_with_terminal_outcome(
+                let prompt_origin = crate::tools::code_mode::ToolPromptOrigin::from_source(&source);
+                let result = prompt_origin
+                    .scope(router.dispatch_tool_call_with_terminal_outcome(
                         session,
                         step_context,
                         invocation_cancellation_token,
@@ -190,7 +191,7 @@ impl ToolCallRuntime {
                         dispatch_call,
                         source,
                         dispatch_terminal_outcome_reached,
-                    )
+                    ))
                     .instrument(dispatch_span.clone())
                     .await;
                 drop(guard);

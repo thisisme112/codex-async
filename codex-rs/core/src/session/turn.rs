@@ -1553,7 +1553,7 @@ async fn run_sampling_request(
         Arc::clone(&step_context),
         Arc::clone(&turn_diff_tracker),
     );
-    let _code_mode_worker = sess.services.code_mode_service.start_turn_worker(
+    let mut code_mode_worker = sess.services.code_mode_service.start_turn_worker(
         &sess,
         Arc::clone(&step_context),
         Arc::clone(&turn_diff_tracker),
@@ -1605,6 +1605,9 @@ async fn run_sampling_request(
         .await
         {
             Ok(output) => {
+                if let Some(worker) = &mut code_mode_worker {
+                    worker.succeeded();
+                }
                 return Ok((output, original_input.unwrap_or(prompt.input)));
             }
             Err(err) => match err.details() {

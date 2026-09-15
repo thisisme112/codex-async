@@ -128,6 +128,7 @@ async fn detached_code_mode_callback_keeps_thread_id_on_dispatch_span() -> anyho
     let _untraced = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let _subscriber = tracing::subscriber::set_default(subscriber);
     let delegate = CodeModeCellDelegate {
+        execution: broker.workers.execution().0.take().unwrap(),
         broker: Arc::clone(&broker),
         step_context: Arc::clone(&step),
     };
@@ -184,6 +185,7 @@ async fn dropped_tool_callbacks_release_the_origin_before_dispatch() {
         /*executed_tool_calls*/ Default::default(),
     ));
     let delegate = CodeModeCellDelegate {
+        execution: broker.workers.execution().0.take().unwrap(),
         broker: Arc::clone(&broker),
         step_context: StepContext::for_test(Arc::clone(&turn)),
     };
@@ -232,4 +234,77 @@ async fn dropped_tool_callbacks_release_the_origin_before_dispatch() {
         response.unwrap(),
         Err("code mode nested tool call cancelled".to_string()),
     );
+}
+
+#[tokio::test]
+async fn replacement_hands_off_gated_call_and_idle_notify_does_not_block_tools() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let router = Arc::new(ToolRouter::from_registry(
+        &turn,
+        turn.model_info(),
+        ToolRegistry::with_handler_for_test(Arc::new(TestHandler)),
+        /*hosted_specs*/ Vec::new(),
+        &Default::default(),
+    ));
+    let step = StepContext::for_test(turn).with_tool_router_for_test(router);
+    let broker = Arc::new(CodeModeDispatchBroker::new(
+        session.thread_id,
+        Default::default(),
+    ));
+    let delegate = CodeModeCellDelegate {
+        execution: broker.workers.execution().0.take().unwrap(),
+        broker: broker.clone(),
+        step_context: step.clone(),
+    };
+    let cell_id = CellId::new("handoff".to_string());
+    let invocation = CodeModeNestedToolCall {
+        cell_id: cell_id.clone(),
+        runtime_tool_call_id: "queued".to_string(),
+        tool_name: ToolName::plain("audit_probe"),
+        tool_kind: CodeModeToolKind::Function,
+        input: Some(serde_json::json!({})),
+    };
+    let mut callback = delegate.invoke_tool(invocation.clone(), CancellationToken::new());
+    assert!(futures::poll!(callback.as_mut()).is_pending());
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let old = broker.start_turn_worker(session.clone(), step.clone(), tracker.clone());
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !broker.dispatch_rx.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(old); // Receiver holds the message, but its Cell gate is still closed.
+    let _replacement = broker.start_turn_worker(session.clone(), step, tracker);
+    broker.mark_cell_ready_for_dispatch(&cell_id, /*originating_call*/ None);
+    assert_eq!(callback.await, Ok(serde_json::json!("audit-probe-ok")));
+
+    let mut notification = delegate.notify(
+        "notice".to_string(),
+        cell_id,
+        "deferred text".to_string(),
+        CancellationToken::new(),
+    );
+    assert!(futures::poll!(notification.as_mut()).is_pending());
+    // This call must get past the idle notification using the same receiver.
+    assert_eq!(
+        delegate
+            .invoke_tool(invocation, CancellationToken::new())
+            .await,
+        Ok(serde_json::json!("audit-probe-ok"))
+    );
+    assert!(futures::poll!(notification.as_mut()).is_pending());
+    *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+    session.services.code_mode_service.completions.activity();
+    assert_eq!(notification.await, Ok(()));
+    assert!(
+        session
+            .input_queue
+            .has_pending_input(&session.active_turn)
+            .await
+    );
+    session.services.code_mode_service.shutdown_dispatch();
 }

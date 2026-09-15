@@ -567,10 +567,15 @@ impl Session {
             };
         }
 
+        let Some(mut active) = self.turn_for_tool_prompt().await else {
+            return McpServerElicitationOutcome {
+                response: None,
+                sent: false,
+            };
+        };
         let _elicitation = self.services.elicitations.register();
         let (tx_response, rx_response) = oneshot::channel();
         let prev_entry = {
-            let mut active = self.active_turn.lock().await;
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
@@ -583,6 +588,7 @@ impl Session {
                 None => None,
             }
         };
+        drop(active);
         if prev_entry.is_some() {
             warn!(
                 "Overwriting existing pending elicitation for server_name: {server_name}, request_id: {request_id}"

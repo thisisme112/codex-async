@@ -2,8 +2,13 @@ pub(crate) mod completion;
 mod delegate;
 mod execute_handler;
 pub(crate) mod execute_spec;
+mod interactive;
+#[cfg(test)]
+pub(crate) mod interactive_test_support;
 mod response_adapter;
 mod telemetry;
+mod worker_lifecycle;
+pub(crate) use interactive::ToolPromptOrigin;
 mod wait_handler;
 pub(crate) mod wait_spec;
 
@@ -50,10 +55,10 @@ use codex_utils_output_truncation::truncate_function_output_items_with_policy;
 
 use delegate::CodeModeCellDelegate;
 use delegate::CodeModeDispatchBroker;
-use delegate::CodeModeDispatchWorker;
 pub(crate) use execute_handler::CodeModeExecuteHandler;
 use response_adapter::into_function_call_output_content_items;
 pub(crate) use wait_handler::CodeModeWaitHandler;
+use worker_lifecycle::WorkerScope;
 
 pub(crate) const PUBLIC_TOOL_NAME: &str = codex_code_mode::PUBLIC_TOOL_NAME;
 pub(crate) const WAIT_TOOL_NAME: &str = codex_code_mode::WAIT_TOOL_NAME;
@@ -141,16 +146,31 @@ impl CodeModeService {
         request
             .yield_time_ms
             .get_or_insert(self.default_exec_yield_time_ms);
+        let mut execution = self.dispatch_broker.workers.execution();
+        let lease = execution
+            .0
+            .clone()
+            .ok_or("missing Code Mode execution lease")?;
         let delegate: Arc<dyn codex_code_mode::CodeModeSessionDelegate> =
             Arc::new(CodeModeCellDelegate {
                 broker: Arc::clone(&self.dispatch_broker),
                 step_context,
+                execution: lease.clone(),
             });
         let delegate = match completion {
             Some(reservation) => completion::CompletionDelegate::wrap(delegate, reservation),
             None => delegate,
         };
-        self.session().await?.execute(request, delegate).await
+        let started = self.session().await?.execute(request, delegate).await?;
+        // Old providers cannot release a retained worker at commit. Keep their old scope lifetime.
+        if started.completion_ready_support == codex_code_mode::CompletionReadySupport::Unsupported
+        {
+            lease.finish();
+        }
+        self.dispatch_broker
+            .bind_execution(&started.cell_id, &lease);
+        execution.0.take();
+        Ok(started)
     }
 
     pub(crate) async fn wait(
@@ -196,9 +216,19 @@ impl CodeModeService {
         .await;
     }
 
+    pub(crate) fn stop_dispatch(&self) {
+        self.dispatch_broker.workers.stop();
+    }
+
+    pub(crate) fn shutdown_dispatch(&self) {
+        self.shutdown_token.cancel();
+        self.dispatch_broker.workers.shutdown();
+        self.dispatch_broker.close();
+    }
+
     pub(crate) async fn shutdown(&self) -> Result<(), String> {
         self.completions.shutdown();
-        self.shutdown_token.cancel();
+        self.shutdown_dispatch();
         // Join any initialization already in progress without initializing an unused service.
         match self
             .session
@@ -239,14 +269,22 @@ impl CodeModeService {
         session: &Arc<Session>,
         step_context: Arc<StepContext>,
         tracker: SharedTurnDiffTracker,
-    ) -> Option<CodeModeDispatchWorker> {
-        if !step_context.tool_router.requires_code_mode_worker() {
+    ) -> Option<WorkerScope> {
+        self.completions.activity();
+        if self.shutdown_token.is_cancelled()
+            || (!step_context.tool_router.requires_code_mode_worker()
+                && !self.dispatch_broker.workers.has_executions())
+        {
             return None;
         }
-
         Some(
             self.dispatch_broker
-                .start_turn_worker(Arc::clone(session), step_context, tracker),
+                .workers
+                .replace(self.dispatch_broker.start_turn_worker(
+                    Arc::clone(session),
+                    step_context,
+                    tracker,
+                )),
         )
     }
 

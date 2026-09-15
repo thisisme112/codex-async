@@ -235,6 +235,7 @@ impl PendingHostApproval {
 }
 
 struct ActiveNetworkApprovalCall {
+    prompt_origin: crate::tools::code_mode::ToolPromptOrigin,
     registration_id: String,
     turn_id: String,
     trigger: GuardianNetworkAccessTrigger,
@@ -678,6 +679,19 @@ impl NetworkApprovalService {
             format!("Network access to \"{target}\" was blocked by policy.");
         let prompt_reason = format!("{} is not in the allowed_domains", request.host);
 
+        // Cached decisions above stay usable at idle. A new Cell-origin prompt waits
+        // for an ordinary turn, then uses the existing current-turn review policy.
+        let active_turn = if active_turn.is_none()
+            && let Some(call) = &owner_call
+            && call.prompt_origin == crate::tools::code_mode::ToolPromptOrigin::Cell
+        {
+            call.cancellation_token
+                .run_until_cancelled(session.review_context_for_cell_prompt(call.prompt_origin))
+                .await
+                .flatten()
+        } else {
+            active_turn
+        };
         let Some((turn_context, step_settings, strict_auto_review)) = active_turn else {
             if let Some(owner_call) = owner_call.as_ref() {
                 self.record_call_outcome(&owner_call.registration_id, policy_denial_message);
@@ -804,7 +818,44 @@ impl NetworkApprovalService {
             retry_reason: Some(policy_denial_message.clone()),
             network_approval_context: Some(network_approval_context.clone()),
         };
-        let approval = session.request_approval(action, approval_context);
+        let approval = async {
+            let origin = owner_call
+                .as_ref()
+                .map(|call| call.prompt_origin)
+                .unwrap_or_default();
+            if origin == crate::tools::code_mode::ToolPromptOrigin::Direct {
+                return origin
+                    .scope(session.request_approval(action, approval_context))
+                    .await;
+            }
+            session
+                .with_current_tool_review(origin, |turn, settings, strict| {
+                    let mut ctx = approval_context.clone();
+                    ctx.review_context = GuardianReviewContext::from_resolved_settings(
+                        turn.clone(),
+                        &settings,
+                        ctx.review_context.environments(),
+                    );
+                    ctx.strict_auto_review = strict;
+                    let mut action = action.clone();
+                    if let ApprovalAction::NetworkAccess { turn_id, .. } = &mut action {
+                        *turn_id = turn.sub_id.clone();
+                    }
+                    let session = &session;
+                    async move {
+                        if !allows_network_approval_flow(ctx.review_context.approval_policy) {
+                            return Err(ToolError::Rejected(
+                                "network approval is disabled by current policy".to_string(),
+                            ));
+                        }
+                        session.request_approval(action, ctx).await
+                    }
+                })
+                .await
+                .unwrap_or(Err(ToolError::Codex(
+                    codex_protocol::error::CodexErr::TurnAborted,
+                )))
+        };
         let approval_result = if let Some(owner_call) = &owner_call {
             // A ready review result takes precedence over concurrent cancellation.
             let Some(result) = owner_call
@@ -1203,6 +1254,7 @@ pub(crate) async fn begin_network_approval(
         .services
         .network_approval
         .register_call(ActiveNetworkApprovalCall {
+            prompt_origin: crate::tools::code_mode::ToolPromptOrigin::current(),
             registration_id: registration_id.clone(),
             turn_id: turn.sub_id.clone(),
             trigger,

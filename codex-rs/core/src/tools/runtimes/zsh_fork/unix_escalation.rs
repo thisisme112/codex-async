@@ -144,6 +144,7 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
         use_legacy_landlock: req.turn_environment.config().use_legacy_landlock,
     };
     let escalation_policy = CoreShellActionProvider {
+        prompt_origin: crate::tools::code_mode::ToolPromptOrigin::current(),
         policy: Arc::clone(&exec_policy),
         session: Arc::clone(&ctx.session),
         review_context: GuardianReviewContext::from(&ctx.step_context),
@@ -179,6 +180,7 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
 }
 
 struct CoreShellActionProvider {
+    prompt_origin: crate::tools::code_mode::ToolPromptOrigin,
     policy: Arc<RwLock<Policy>>,
     session: Arc<crate::session::session::Session>,
     review_context: GuardianReviewContext,
@@ -265,6 +267,7 @@ impl CoreShellActionProvider {
         argv: &[String],
         workdir: &AbsolutePathBuf,
         stopwatch: &Stopwatch,
+        decision_source: &DecisionSource,
         additional_permissions: Option<AdditionalPermissionProfile>,
     ) -> anyhow::Result<ReviewDecision> {
         let command = join_program_and_argv(program, argv);
@@ -281,32 +284,47 @@ impl CoreShellActionProvider {
         };
         match stopwatch
             .pause_for(async {
-                let (turn_context, step_settings, strict_auto_review) = self
-                    .session
-                    .active_turn_context_and_strict_auto_review()
+                self.session
+                    .with_current_tool_review(
+                        self.prompt_origin,
+                        |turn_context, step_settings, strict_auto_review| {
+                            let action = action.clone();
+                            async move {
+                                if self.prompt_origin
+                                    == crate::tools::code_mode::ToolPromptOrigin::Cell
+                                    && let Some(reason) = execve_prompt_is_rejected_by_policy(
+                                        step_settings.approval_policy(),
+                                        decision_source,
+                                    )
+                                {
+                                    return Err(ToolError::Rejected(reason.to_string()));
+                                }
+                                let approval_ctx = ApprovalContext {
+                                    review_context: GuardianReviewContext::from_resolved_settings(
+                                        Arc::clone(&turn_context),
+                                        &step_settings,
+                                        &turn_context.environments,
+                                    ),
+                                    // The running process can outlive its launching tool or code-mode cell.
+                                    cancellation_token: None,
+                                    call_id: self.call_id.clone(),
+                                    tool_name: self.tool_name.clone(),
+                                    strict_auto_review,
+                                    approval_reason: None,
+                                    retry_reason: None,
+                                    network_approval_context: None,
+                                };
+                                self.session.request_approval(action, approval_ctx).await
+                            }
+                        },
+                    )
                     .await
-                    .ok_or_else(|| {
-                        ToolError::Rejected(
+                    .unwrap_or_else(|| {
+                        Err(ToolError::Rejected(
                             "cannot approve intercepted execution without an active turn"
                                 .to_string(),
-                        )
-                    })?;
-                let approval_ctx = ApprovalContext {
-                    review_context: GuardianReviewContext::from_resolved_settings(
-                        Arc::clone(&turn_context),
-                        &step_settings,
-                        &turn_context.environments,
-                    ),
-                    // The running process can outlive its launching tool or code-mode cell.
-                    cancellation_token: None,
-                    call_id: self.call_id.clone(),
-                    tool_name: self.tool_name.clone(),
-                    strict_auto_review,
-                    approval_reason: None,
-                    retry_reason: None,
-                    network_approval_context: None,
-                };
-                self.session.request_approval(action, approval_ctx).await
+                        ))
+                    })
             })
             .await
         {
@@ -339,7 +357,14 @@ impl CoreShellActionProvider {
                     EscalationDecision::deny(Some("Execution forbidden by policy".to_string()))
                 } else {
                     let decision = self
-                        .prompt(program, argv, workdir, &self.stopwatch, prompt_permissions)
+                        .prompt(
+                            program,
+                            argv,
+                            workdir,
+                            &self.stopwatch,
+                            &decision_source,
+                            prompt_permissions,
+                        )
                         .await?;
                     match decision {
                         ReviewDecision::Approved
@@ -871,3 +896,7 @@ fn join_program_and_argv(program: &AbsolutePathBuf, argv: &[String]) -> Vec<Stri
 #[cfg(test)]
 #[path = "unix_escalation_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "unix_escalation_cell_tests.rs"]
+mod cell_tests;

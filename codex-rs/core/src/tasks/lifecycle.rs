@@ -93,6 +93,7 @@ impl Session {
         {
             let _active = self.active_turn.lock().await;
             self.services.code_mode_service.completions.suppress();
+            self.services.code_mode_service.stop_dispatch();
             turn_context
                 .extension_data
                 .insert(crate::tools::code_mode::completion::CompletionErrorObserved);

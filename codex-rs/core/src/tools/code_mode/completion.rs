@@ -30,7 +30,7 @@ const ID_BYTES: usize = 128;
 pub(crate) struct CompletionErrorObserved;
 
 pub(crate) const TRIGGER: &str = "code_mode_completion:";
-pub(super) const GUIDANCE: &str = "\nWhen this cell actually completes, this interactive thread can resume automatically once idle. You may end this turn while it runs; use wait to retrieve the result when notified. Additional tool calls, approval, or notify inside an idle cell may still wait for an active turn. Other automatic continuations are unchanged.";
+pub(super) const GUIDANCE: &str = "\nWhen this cell actually completes, this interactive thread can resume automatically once idle. You may end this turn while it runs; use wait to retrieve the result when notified. Subsequent tools that need no new approval can run while idle. Approval, user input and notify may wait for a new active turn. Other automatic continuations are unchanged.";
 
 #[derive(Default)]
 struct State {

@@ -2805,6 +2805,9 @@ impl Session {
         available_decisions: Option<Vec<ReviewDecision>>,
         plugin_attribution_override: Option<PluginCommandAttribution>,
     ) -> ReviewDecision {
+        let Some(mut active) = self.turn_for_tool_prompt().await else {
+            return ReviewDecision::Abort;
+        };
         let _elicitation = self.services.elicitations.register();
         //  command-level approvals use `call_id`.
         // `approval_id` identifies subcommand callbacks and stdin writes.
@@ -2812,7 +2815,6 @@ impl Session {
         // Add the tx_approve callback to the map before sending the request.
         let (tx_approve, rx_approve) = oneshot::channel();
         let prev_entry = {
-            let mut active = self.active_turn.lock().await;
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
@@ -2821,6 +2823,7 @@ impl Session {
                 None => None,
             }
         };
+        drop(active);
         if prev_entry.is_some() {
             warn!("Overwriting existing pending approval for call_id: {effective_approval_id}");
         }
@@ -2891,12 +2894,14 @@ impl Session {
         reason: Option<String>,
         grant_root: Option<PathBuf>,
     ) -> ReviewDecision {
+        let Some(mut active) = self.turn_for_tool_prompt().await else {
+            return ReviewDecision::Abort;
+        };
         let _elicitation = self.services.elicitations.register();
         // Add the tx_approve callback to the map before sending the request.
         let (tx_approve, rx_approve) = oneshot::channel();
         let approval_id = call_id.clone();
         let prev_entry = {
-            let mut active = self.active_turn.lock().await;
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
@@ -2905,6 +2910,7 @@ impl Session {
                 None => None,
             }
         };
+        drop(active);
         if prev_entry.is_some() {
             warn!("Overwriting existing pending approval for call_id: {approval_id}");
         }
@@ -3059,10 +3065,10 @@ impl Session {
             }
         }
 
+        let mut active = self.turn_for_tool_prompt().await?;
         let _elicitation = self.services.elicitations.register();
         let (tx_response, rx_response) = oneshot::channel();
         let prev_entry = {
-            let mut active = self.active_turn.lock().await;
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
@@ -3078,6 +3084,7 @@ impl Session {
                 None => None,
             }
         };
+        drop(active);
         if prev_entry.is_some() {
             warn!("Overwriting existing pending request_permissions for call_id: {call_id}");
         }
@@ -3116,12 +3123,12 @@ impl Session {
         call_id: String,
         args: RequestUserInputArgs,
     ) -> Option<AcceptedUserInputResponse> {
+        let mut active = self.turn_for_tool_prompt().await?;
         let _elicitation = self.services.elicitations.register();
         let sub_id = turn_context.sub_id.clone();
         let (tx_response, rx_response) = oneshot::channel();
         let event_id = sub_id.clone();
         let prev_entry = {
-            let mut active = self.active_turn.lock().await;
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
@@ -3130,6 +3137,7 @@ impl Session {
                 None => None,
             }
         };
+        drop(active);
         if prev_entry.is_some() {
             warn!("Overwriting existing pending user input for sub_id: {event_id}");
         }
@@ -3316,16 +3324,24 @@ impl Session {
         clippy::await_holding_invalid_type,
         reason = "active turn reads must stay consistent with the matching turn state"
     )]
-    pub(crate) async fn active_turn_context_and_strict_auto_review(
+    pub(crate) async fn review_context_for_cell_prompt(
         &self,
+        origin: crate::tools::code_mode::ToolPromptOrigin,
     ) -> Option<(Arc<TurnContext>, Arc<ResolvedStepSettings>, bool)> {
-        let active = self.active_turn.lock().await;
+        let active = self.turn_for_prompt_origin(origin).await?;
         let active = active.as_ref()?;
         let task = active.task.as_ref()?;
         let turn_context = Arc::clone(&task.turn_context);
         let step_settings = turn_context.current_settings.load_full();
         let ts = active.turn_state.lock().await;
         Some((turn_context, step_settings, ts.strict_auto_review_enabled()))
+    }
+
+    pub(crate) async fn active_turn_context_and_strict_auto_review(
+        &self,
+    ) -> Option<(Arc<TurnContext>, Arc<ResolvedStepSettings>, bool)> {
+        self.review_context_for_cell_prompt(crate::tools::code_mode::ToolPromptOrigin::Direct)
+            .await
     }
 
     pub(crate) async fn granted_session_permissions(
@@ -4815,6 +4831,12 @@ impl Session {
         let had_active_turn = self.active_turn.lock().await.is_some();
         self.abort_all_tasks(TurnAbortReason::Interrupted).await;
         if !had_active_turn {
+            if self.features().enabled(Feature::CodeModeInterrupt) {
+                self.services
+                    .code_mode_service
+                    .interrupt_active_cells()
+                    .await;
+            }
             self.cancel_mcp_startup();
         }
     }
