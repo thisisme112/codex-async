@@ -22,6 +22,8 @@ jobs:
       CARGO_PROFILE_RELEASE_DEBUG: "0"
       CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "off"
       AWS_LC_SYS_NO_JITTER_ENTROPY: "1"
+      # musl-gcc must not produce a PIE with a runtime loader dependency.
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-feature=+crt-static -C relocation-model=static -C link-arg=-static -C link-arg=-no-pie"
     defaults:
       run:
         shell: bash
@@ -78,6 +80,10 @@ jobs:
               strip --strip-debug --strip-unneeded "$path"
             fi
             file "$path"
+            if readelf -l "$path" | grep -q INTERP; then
+              echo "Unexpected runtime loader dependency: $path" >&2
+              exit 1
+            fi
             if readelf -d "$path" | grep -q '(NEEDED)'; then
               echo "Unexpected shared-library dependency: $path" >&2
               exit 1
