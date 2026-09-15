@@ -90,6 +90,8 @@ enum ProcessHandle {
 /// processes.
 pub(crate) struct UnifiedExecProcess {
     process_handle: ProcessHandle,
+    pub(super) completion:
+        std::sync::OnceLock<crate::tools::code_mode::completion::CommandCompletion>,
     output_tx: broadcast::Sender<Vec<u8>>,
     output: OutputHandles,
     output_drained: Arc<Notify>,
@@ -133,6 +135,7 @@ impl UnifiedExecProcess {
 
         Self {
             process_handle,
+            completion: std::sync::OnceLock::new(),
             output_tx,
             output,
             output_drained,
@@ -228,7 +231,14 @@ impl UnifiedExecProcess {
         }
     }
 
+    pub(super) fn retire_completion(&self) {
+        if let Some(completion) = self.completion.get() {
+            completion.retire();
+        }
+    }
+
     pub(super) fn terminate(&self) {
+        self.retire_completion();
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => process_handle.terminate(),
             ProcessHandle::ExecServer(process_handle) => {
@@ -242,6 +252,7 @@ impl UnifiedExecProcess {
     }
 
     pub(super) async fn terminate_confirmed(&self) -> Result<(), UnifiedExecError> {
+        self.retire_completion();
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => process_handle.terminate(),
             ProcessHandle::ExecServer(process_handle) => {

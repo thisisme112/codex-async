@@ -54,14 +54,20 @@ impl TurnLifecycleContributor for StartGate {
     }
 }
 
-#[test_case("interrupt")]
-#[test_case("error")]
-#[test_case("withdrawn")]
-#[test_case("replaced")]
-#[test_case("consumed")]
-#[test_case("shutdown")]
+#[test_case("interrupt", false; "cell_interrupt")]
+#[test_case("interrupt", true; "command_interrupt")]
+#[test_case("error", false; "cell_error")]
+#[test_case("error", true; "command_error")]
+#[test_case("withdrawn", false; "cell_withdrawn")]
+#[test_case("withdrawn", true; "command_withdrawn")]
+#[test_case("replaced", false; "cell_replaced")]
+#[test_case("replaced", true; "command_replaced")]
+#[test_case("consumed", false; "cell_consumed")]
+#[test_case("consumed", true; "command_consumed")]
+#[test_case("shutdown", false; "cell_shutdown")]
+#[test_case("shutdown", true; "command_shutdown")]
 #[tokio::test]
-async fn completion_task_revalidates_after_async_start_preparation(race: &str) {
+async fn completion_task_revalidates_after_async_start_preparation(race: &str, command: bool) {
     let (mut session, turn) = make_session_and_context().await;
     let gate = Arc::new(StartGate::default());
     let mut extensions = ExtensionRegistryBuilder::new();
@@ -75,15 +81,31 @@ async fn completion_task_revalidates_after_async_start_preparation(race: &str) {
     let completions = Arc::clone(&session.services.code_mode_service.completions);
     completions.state().enabled = true;
     let cell_id = CellId::new("generation:1".to_string());
-    let mut reservation = completions
-        .reserve("call", "origin")
-        .expect("available capacity")
-        .expect("enabled completion");
+    let mut reservation = if command {
+        completions.reserve_command(
+            "call", "origin", /*process_id*/ 1000, /*cell*/ None,
+        )
+    } else {
+        completions.reserve("call", "origin")
+    }
+    .unwrap()
+    .unwrap();
     let delegate = CompletionDelegate::wrap(Arc::new(NoopCodeModeSessionDelegate), &reservation);
-    reservation.bind(&cell_id, CompletionReadySupport::Supported);
-    delegate.cell_completion_ready(&cell_id);
+    if command {
+        reservation.command_handle().ready();
+    } else {
+        reservation.bind(&cell_id, CompletionReadySupport::Supported);
+        delegate.cell_completion_ready(&cell_id);
+    }
     reservation.yielded();
-    completions.record_outputs("origin", &[super::tests::output("call", &cell_id)]);
+    completions.record_outputs(
+        "origin",
+        &[if command {
+            super::commands::tests::output("call", /*id*/ 1000)
+        } else {
+            super::tests::output("call", &cell_id)
+        }],
+    );
     let (trigger, _) = completions.batch().expect("ready batch");
     let active = ActiveTurn::default();
     turn.extension_data.insert(CompletionAdmission {
@@ -123,7 +145,13 @@ async fn completion_task_revalidates_after_async_start_preparation(race: &str) {
             };
             *session.active_turn.lock().await = Some(active);
         }
-        "consumed" => delegate.cell_closed(&cell_id),
+        "consumed" => {
+            if command {
+                reservation.command_handle().retire();
+            } else {
+                delegate.cell_closed(&cell_id);
+            }
+        }
         "shutdown" => completions.shutdown(),
         _ => unreachable!(),
     }

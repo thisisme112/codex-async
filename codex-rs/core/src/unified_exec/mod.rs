@@ -86,6 +86,7 @@ pub(crate) struct UnifiedExecContext {
     pub step_context: Arc<StepContext>,
     pub cancellation_token: CancellationToken,
     pub call_id: String,
+    pub completion_owner: Option<codex_code_mode::CellId>,
 }
 
 impl UnifiedExecContext {
@@ -100,6 +101,7 @@ impl UnifiedExecContext {
             step_context,
             cancellation_token,
             call_id,
+            completion_owner: None,
         }
     }
 }
@@ -155,7 +157,9 @@ pub(crate) struct ProcessStore {
 impl ProcessStore {
     fn remove(&mut self, process_id: i32) -> Option<ProcessEntry> {
         self.reserved_process_ids.remove(&process_id);
-        self.processes.remove(&process_id)
+        let entry = self.processes.remove(&process_id)?;
+        entry.process.retire_completion();
+        Some(entry)
     }
 }
 

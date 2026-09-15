@@ -29,8 +29,8 @@ impl CompletionAdmission {
 }
 
 impl CodexThread {
-    /// Attaches cell completion wake to an interactive client's live thread.
-    /// Existing Code Mode activation is unchanged; ordinary clients remain opted out.
+    /// Attaches shared Cell/command completion wake to an interactive client's live thread.
+    /// Existing Code Mode activation is unchanged; other clients remain opted out.
     pub fn enable_code_mode_completion_wake(self: &Arc<Self>) {
         let completions = Arc::clone(&self.session.services.code_mode_service.completions);
         let mut state = completions.state();
@@ -67,7 +67,7 @@ async fn dispatch(thread: Weak<CodexThread>, completions: Arc<Completions>) {
                 continue;
             }
             if let Err(error) = result {
-                tracing::warn!(%error, "failed to start code-mode completion turn");
+                tracing::warn!(%error, "failed to start background completion turn");
             }
         }
         tokio::select! {

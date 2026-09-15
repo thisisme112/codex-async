@@ -557,7 +557,8 @@ impl ThreadManager {
     }
 
     /// Opts future root threads into completion wake for an interactive host.
-    /// Only exposed Code Mode cells with provider acknowledgment can wake a thread.
+    /// Exposed Code Mode cells (with provider acknowledgment) and local background
+    /// commands share the same bounded, idle-only dispatcher.
     pub fn enable_code_mode_completion_wake(&self) {
         self.state
             .code_mode_completion_wake

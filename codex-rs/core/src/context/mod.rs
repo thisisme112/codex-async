@@ -125,3 +125,6 @@ pub(crate) use user_instructions::UserInstructions;
 pub(crate) use user_shell_command::UserShellCommand;
 pub(crate) use user_verification_notice::UserVerificationNotice;
 pub(crate) use world_state::ManagedDeveloperInstructions;
+
+mod exec_completion;
+pub(crate) use exec_completion::ExecCompletion;

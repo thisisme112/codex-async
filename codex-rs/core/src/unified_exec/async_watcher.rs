@@ -195,6 +195,13 @@ pub(crate) fn spawn_exit_watcher(
         }
         let _interaction_guard = interaction_lock.lock_owned().await;
 
+        if let Some(completion) = process.completion.get() {
+            if process.failure_message().is_some() {
+                completion.retire();
+            } else {
+                completion.ready();
+            }
+        }
         let duration = Instant::now().saturating_duration_since(started_at);
         let plugin_metrics_sidecar = plugin_metrics_sidecar
             .as_ref()

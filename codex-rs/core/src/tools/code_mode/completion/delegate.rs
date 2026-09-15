@@ -52,6 +52,7 @@ impl CodeModeSessionDelegate for CompletionDelegate {
     }
 
     fn cell_closed(&self, cell_id: &CellId) {
+        self.completions.owner_finished(self.execution);
         self.completions.retire(self.execution);
         self.inner.cell_closed(cell_id);
     }
@@ -71,13 +72,14 @@ impl CodeModeSessionDelegate for CompletionDelegate {
             }
         }
         drop(state);
-        self.completions.activity();
+        self.completions.owner_finished(self.execution);
     }
 }
 
 impl Drop for CompletionDelegate {
     fn drop(&mut self) {
         // Provider disconnect/replacement must not leave a candidate behind.
+        self.completions.owner_finished(self.execution);
         self.completions.retire(self.execution);
     }
 }

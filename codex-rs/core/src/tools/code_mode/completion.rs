@@ -1,4 +1,7 @@
-//! Bounded, identity-only wake bookkeeping. Runtime readiness never owns a result.
+//! Shared bounded, identity-only Cell/command wake bookkeeping. No result ownership.
+//! Kept with the existing service so both producers use its live-thread activation,
+//! suppression and idle admission; command-specific bookkeeping lives in `commands`.
+mod commands;
 mod delegate;
 mod dispatcher;
 
@@ -17,6 +20,7 @@ use uuid::Uuid;
 use crate::context::CodeModeCompletion;
 use crate::context::ContextualUserFragment;
 
+pub(crate) use commands::CommandCompletion;
 pub(super) use delegate::CompletionDelegate;
 pub(crate) use dispatcher::CompletionAdmission;
 
@@ -44,6 +48,20 @@ struct Entry {
     ready: bool,
     yielded: bool,
     exposed: bool,
+    command: Option<commands::Command>,
+}
+
+impl State {
+    fn eligible(&self, key: &Uuid) -> bool {
+        self.entries.get(key).is_some_and(|entry| {
+            entry.eligible()
+                && entry.command.as_ref().is_none_or(|command| {
+                    command.owner.is_none_or(|owner| {
+                        command.owner_finished && !self.entries.contains_key(&owner)
+                    })
+                })
+        })
+    }
 }
 
 impl Entry {
@@ -94,19 +112,27 @@ impl Completions {
         call_id: &str,
         turn_id: &str,
     ) -> Result<Option<Reservation>, String> {
-        let mut state = self.state();
+        self.reserve_locked(&mut self.state(), call_id, turn_id)
+    }
+
+    fn reserve_locked(
+        self: &Arc<Self>,
+        state: &mut State,
+        call_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<Reservation>, String> {
         if !state.enabled {
             return Ok(None);
         }
         if self.shutdown.is_cancelled() {
-            return Err("Code Mode completion monitoring is shutting down".to_string());
+            return Err("Background completion monitoring is shutting down".to_string());
         }
         if state.entries.len() == CAPACITY {
-            return Err("Code Mode completion monitoring is full (64 cells). Retrieve or terminate an existing cell before starting another.".to_string());
+            return Err("Background completion monitoring is full (64 operations). Retrieve or terminate an existing cell or command before starting another.".to_string());
         }
         if call_id.len() > ID_BYTES || turn_id.len() > ID_BYTES {
             return Err(
-                "Code Mode execution identity exceeds the completion monitoring limit".to_string(),
+                "Background execution identity exceeds the completion monitoring limit".to_string(),
             );
         }
         let execution = Uuid::new_v4();
@@ -120,6 +146,7 @@ impl Completions {
                 ready: false,
                 yielded: false,
                 exposed: false,
+                command: None,
             },
         );
         Ok(Some(Reservation {
@@ -146,14 +173,41 @@ impl Completions {
     pub(crate) fn record_outputs(&self, turn_id: &str, items: &[ResponseItem]) {
         let mut state = self.state();
         for item in items {
-            let ResponseItem::CustomToolCallOutput {
-                call_id, output, ..
-            } = item
-            else {
-                continue;
+            let (call_id, output, custom) = match item {
+                ResponseItem::CustomToolCallOutput {
+                    call_id, output, ..
+                } => (call_id, output, true),
+                ResponseItem::FunctionCallOutput {
+                    call_id: Some(call_id),
+                    output,
+                    ..
+                } => (call_id, output, false),
+                _ => continue,
             };
             state.entries.retain(|_, entry| {
                 if entry.turn_id != turn_id || &entry.call_id != call_id {
+                    return true;
+                }
+                if let Some(command) = &entry.command {
+                    let exposed = output.success != Some(false)
+                        && if command.owner.is_some() {
+                            custom
+                        } else {
+                            entry.yielded
+                                && !custom
+                                && output.body.to_text().is_some_and(|text| {
+                                    text.lines().any(|line| {
+                                        line == format!(
+                                            "Process running with session ID {}",
+                                            command.process_id
+                                        )
+                                    })
+                                })
+                        };
+                    entry.exposed |= exposed;
+                    return exposed;
+                }
+                if !custom {
                     return true;
                 }
                 let Some(cell_id) = &entry.cell_id else {
@@ -202,11 +256,7 @@ impl Completions {
         !self.shutdown.is_cancelled()
             && !state.suppressed
             && state.batch.as_ref().is_some_and(|batch| {
-                batch.trigger == trigger
-                    && batch
-                        .executions
-                        .iter()
-                        .all(|key| state.entries.get(key).is_some_and(Entry::eligible))
+                batch.trigger == trigger && batch.executions.iter().all(|key| state.eligible(key))
             })
     }
 
@@ -247,7 +297,7 @@ impl Completions {
             }
         }
         if executions.is_empty() {
-            return None;
+            return self.command_batch(&mut state);
         }
         let trigger = format!("{TRIGGER}{}", Uuid::new_v4());
         state.batch = Some(Batch {
@@ -261,7 +311,7 @@ impl Completions {
 /// Drops a reservation if execution or the initial response handoff fails.
 /// Successful yielded outputs transfer ownership to the bounded registry until
 /// history acknowledges them, or the originating turn finishes without exposure.
-pub(super) struct Reservation {
+pub(crate) struct Reservation {
     completions: Arc<Completions>,
     execution: Uuid,
     handed_off: bool,
@@ -285,11 +335,12 @@ impl Reservation {
         true
     }
 
-    pub(super) fn yielded(&mut self) {
+    pub(crate) fn yielded(&mut self) {
         if let Some(entry) = self.completions.state().entries.get_mut(&self.execution) {
             entry.yielded = true;
         }
         self.handed_off = true;
+        self.completions.activity();
     }
 }
 

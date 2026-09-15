@@ -483,6 +483,7 @@ impl UnifiedExecProcessManager {
             entry
         };
         if let Some(entry) = removed {
+            entry.process.retire_completion();
             unregister_network_approval_for_entry(&entry).await;
         }
     }
@@ -502,6 +503,28 @@ impl UnifiedExecProcessManager {
         context: &UnifiedExecContext,
         mut completion: Option<&mut Completion<'_>>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+        let mut wake = if completion.is_none() && !request.turn_environment.environment.is_remote()
+        {
+            match context
+                .session
+                .services
+                .code_mode_service
+                .completions
+                .reserve_command(
+                    &context.call_id,
+                    &context.step_context.turn.sub_id,
+                    request.process_id,
+                    context.completion_owner.as_ref(),
+                ) {
+                Ok(wake) => wake,
+                Err(message) => {
+                    self.release_process_id(request.process_id).await;
+                    return Err(UnifiedExecError::process_failed(message));
+                }
+            }
+        } else {
+            None
+        };
         let cwd = request.cwd.clone();
         let process = self
             .open_session_with_sandbox(&request, cwd.clone(), context)
@@ -520,6 +543,9 @@ impl UnifiedExecProcessManager {
             permissions,
         } = attempt;
         let process = Arc::new(process);
+        if let Some(wake) = &wake {
+            let _ = process.completion.set(wake.command_handle());
+        }
         if let Some(completion) = completion.as_ref() {
             let _ = completion.process.set(Arc::clone(&process));
         }
@@ -816,6 +842,11 @@ impl UnifiedExecProcessManager {
             hook_command: Some(request.hook_command.clone()),
         };
 
+        if response.process_id.is_some()
+            && let Some(wake) = &mut wake
+        {
+            wake.yielded();
+        }
         Ok(response)
     }
 
@@ -922,6 +953,7 @@ impl UnifiedExecProcessManager {
         } = self
             .prepare_process_handles(process_id, &locked_process)
             .await?;
+        process.retire_completion();
         let mut status_after_write = None;
 
         if !request.input.is_empty() {
@@ -1688,7 +1720,10 @@ impl UnifiedExecProcessManager {
             let entries: Vec<ProcessEntry> = processes
                 .processes
                 .drain()
-                .map(|(_, entry)| entry)
+                .map(|(_, entry)| {
+                    entry.process.retire_completion();
+                    entry
+                })
                 .collect();
             processes.reserved_process_ids.clear();
             entries
@@ -1725,6 +1760,7 @@ impl UnifiedExecProcessManager {
             let Some(entry) = store.processes.get(&process_id) else {
                 return false;
             };
+            entry.process.retire_completion();
             (Arc::clone(&entry.process), entry.process.has_exited())
         };
 

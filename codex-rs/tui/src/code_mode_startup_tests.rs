@@ -202,6 +202,9 @@ async fn embedded_client_completion_wake_is_default_and_ordinary_client_stays_op
                 request_id: RequestId::String("thread".to_string()),
                 params: ThreadStartParams {
                     model: Some("test-gpt-5.1-codex".to_string()),
+                    // This isolated TUI harness has no argv0 sandbox helper.
+                    sandbox: (mode == ClientMode::CodeModeDisabled)
+                        .then_some(codex_app_server_protocol::SandboxMode::DangerFullAccess),
                     ..Default::default()
                 },
             })
@@ -219,6 +222,50 @@ async fn embedded_client_completion_wake_is_default_and_ordinary_client_stays_op
                     .iter()
                     .any(|tool| tool["name"] == "exec")
             );
+            #[cfg(unix)]
+            {
+                responses::mount_sse_once(&server, responses::sse(vec![
+                    responses::ev_function_call("direct", "exec_command", r#"{"cmd":"sleep 1.5; printf client-command-result","yield_time_ms":250,"login":false}"#),
+                    responses::ev_completed("command"),
+                ])).await;
+                let yielded =
+                    responses::mount_sse_once(&server, responses::sse_completed("command-yielded"))
+                        .await;
+                let first = submit(&client, &thread_id, "run a background command").await?;
+                assert_eq!(completed(&mut client, &thread_id).await?, first);
+                let output = yielded
+                    .single_request()
+                    .function_call_output("direct")
+                    .to_string();
+                let id = output
+                    .split("Process running with session ID ")
+                    .nth(1)
+                    .unwrap_or_else(|| panic!("running command: {output}"))
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>();
+                let wake = responses::mount_sse_once(&server, responses::sse(vec![
+                    responses::ev_function_call("read-command", "write_stdin", &serde_json::json!({"session_id": id.parse::<i32>()?, "chars":"", "yield_time_ms":1000}).to_string()),
+                    responses::ev_completed("command-wake"),
+                ])).await;
+                let result =
+                    responses::mount_sse_once(&server, responses::sse_completed("command-read"))
+                        .await;
+                tokio::time::sleep(Duration::from_millis(/*millis*/ 100)).await;
+                assert!(wake.requests().is_empty());
+                assert_ne!(completed(&mut client, &thread_id).await?, first);
+                assert!(
+                    wake.single_request()
+                        .body_contains_text("<exec_completion>")
+                );
+                assert!(
+                    result
+                        .single_request()
+                        .function_call_output("read-command")
+                        .to_string()
+                        .contains("client-command-result")
+                );
+            }
             client.shutdown().await?;
             continue;
         }
@@ -261,7 +308,7 @@ async fn embedded_client_completion_wake_is_default_and_ordinary_client_stays_op
         .await;
         let result =
             responses::mount_sse_once(&server, responses::sse_completed("retrieved")).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(/*millis*/ 100)).await;
         assert!(wake.requests().is_empty(), "no polling before readiness");
         if mode == ClientMode::Ordinary {
             tokio::time::sleep(Duration::from_millis(1600)).await;
@@ -292,7 +339,7 @@ async fn embedded_client_completion_wake_is_default_and_ordinary_client_stays_op
                 .to_string()
                 .contains("client retained result")
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(/*millis*/ 100)).await;
         assert_eq!(wake.requests().len(), 1);
         client.shutdown().await?;
     }
