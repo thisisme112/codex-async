@@ -1,0 +1,20 @@
+name: Build codexg family
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [background-completion-wake]
+    paths:
+      - .github/workflows/codexg-*.yml
+      - codex-rs/**
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    uses: ./.github/workflows/codexg-macos.yml
+  ubuntu:
+    uses: ./.github/workflows/codexg-ubuntu.yml
+  windows:
+    uses: ./.github/workflows/codexg-windows.yml

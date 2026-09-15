@@ -2,10 +2,7 @@ name: Build codexg for Apple Silicon
 
 on:
   workflow_dispatch:
-  push:
-    branches: [background-completion-wake]
-    paths:
-      - .github/workflows/codexg-macos.yml
+  workflow_call:
 
 permissions:
   contents: read
