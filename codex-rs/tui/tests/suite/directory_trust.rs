@@ -18,6 +18,31 @@ use tokio_tungstenite::tungstenite::Message;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connected_trust_cancellation_and_acceptance_control_task_creation() -> Result<()> {
+    const DAEMON_OVERVIEW_CWD: &str = "CODEX_TEST_DAEMON_OVERVIEW_CWD";
+    if let Some(cwd) = std::env::var_os(DAEMON_OVERVIEW_CWD) {
+        // Exercise the daemon-backed TUI directly. The CLI's `agents` preflight
+        // manages a standalone installation, which this mock-server test does
+        // not own. The production startup routing still runs inside run_main.
+        let mut cli = <codex_tui::Cli as clap::Parser>::parse_from([
+            std::ffi::OsString::from("codex"),
+            "--no-alt-screen".into(),
+            "-C".into(),
+            cwd,
+        ]);
+        cli.agents_overview = true;
+        let paths = codex_arg0::Arg0DispatchPaths {
+            codex_self_exe: Some(codex_utils_cargo_bin::cargo_bin("codex")?),
+            ..Default::default()
+        };
+        Box::pin(codex_tui::run_main(
+            cli,
+            paths,
+            codex_config::LoaderOverrides::default(),
+            /*explicit_remote_endpoint*/ None,
+        ))
+        .await?;
+        return Ok(());
+    }
     for trust_level in [None, Some("untrusted")] {
         let repo_root = codex_utils_cargo_bin::repo_root()?;
         let codex_home = tempfile::tempdir_in("/tmp")?;
@@ -141,11 +166,13 @@ async fn connected_trust_cancellation_and_acceptance_control_task_creation() -> 
                 });
             }
         });
-        let mut terminal = PtyCodex::start(
-            &repo_root,
-            codex_home,
-            &["do not submit this launch prompt"],
-        )?;
+        let mut command = std::process::Command::new(std::env::current_exe()?);
+        // The unoptimized full TUI loop runs on a libtest thread in this child.
+        const TUI_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+        command.args(["--exact", "suite::directory_trust::connected_trust_cancellation_and_acceptance_control_task_creation", "--nocapture"])
+            .env(DAEMON_OVERVIEW_CWD, &repo_root)
+            .env("RUST_MIN_STACK", TUI_STACK_SIZE_BYTES.to_string());
+        let mut terminal = PtyCodex::start_command(codex_home, command)?;
         let prompt = if trust_level.is_some() {
             "Open restricted"
         } else {

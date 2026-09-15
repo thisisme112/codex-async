@@ -19,7 +19,7 @@ struct ActiveCallback {
     cancellation: CancellationToken,
 }
 
-pub(super) type ClosedCell = (CellId, Arc<dyn CodeModeSessionDelegate>);
+pub(super) type CellDelegate = (CellId, Arc<dyn CodeModeSessionDelegate>);
 
 pub(super) enum CallbackAdmission {
     Active(CancellationToken, Arc<dyn CodeModeSessionDelegate>),
@@ -29,6 +29,8 @@ pub(super) enum CallbackAdmission {
 }
 
 struct ExecutionRecord {
+    completion_ready: bool,
+    completion_notified: bool,
     delegate: Arc<dyn CodeModeSessionDelegate>,
     cell_id: Option<CellId>,
     tool_call_id: String,
@@ -134,6 +136,8 @@ impl SessionState {
         self.executions.insert(
             request.execution_id.clone(),
             ExecutionRecord {
+                completion_ready: request.completion_ready,
+                completion_notified: false,
                 tool_call_id: request.tool_call_id.clone(),
                 enabled_tools,
                 delegate,
@@ -170,7 +174,7 @@ impl SessionState {
     pub(super) fn mark_execution_ready(
         &mut self,
         execution_id: &str,
-    ) -> Result<Option<ClosedCell>, String> {
+    ) -> Result<Option<CellDelegate>, String> {
         self.require_open()?;
         let execution = self
             .executions
@@ -277,7 +281,7 @@ impl SessionState {
         ))
     }
 
-    pub(super) fn finish_notification(&mut self, execution_id: &str) -> Option<ClosedCell> {
+    pub(super) fn finish_notification(&mut self, execution_id: &str) -> Option<CellDelegate> {
         let execution = self.executions.get_mut(execution_id)?;
         execution.notifications = execution.notifications.checked_sub(1)?;
         self.notifications -= 1;
@@ -315,7 +319,7 @@ impl SessionState {
     pub(super) fn close_cell(
         &mut self,
         closed: grpc::CellClosed,
-    ) -> Result<Option<ClosedCell>, String> {
+    ) -> Result<Option<CellDelegate>, String> {
         self.require_open()?;
         self.check_cell_ownership(&closed.execution_id, &closed.cell_id)?;
         let Some(execution) = self.executions.get_mut(&closed.execution_id) else {
@@ -336,7 +340,7 @@ impl SessionState {
         Ok(self.close_execution_if_ready(&closed.execution_id))
     }
 
-    pub(super) fn close(&mut self, failure: Option<String>) -> Vec<ClosedCell> {
+    pub(super) fn close(&mut self, failure: Option<String>) -> Vec<CellDelegate> {
         if self.closed {
             return Vec::new();
         }
@@ -357,7 +361,7 @@ impl SessionState {
             .collect()
     }
 
-    fn close_execution_if_ready(&mut self, execution_id: &str) -> Option<ClosedCell> {
+    fn close_execution_if_ready(&mut self, execution_id: &str) -> Option<CellDelegate> {
         self.executions
             .get(execution_id)
             .is_some_and(|execution| {
@@ -370,7 +374,7 @@ impl SessionState {
             .flatten()
     }
 
-    pub(super) fn remove_execution(&mut self, execution_id: &str) -> Option<ClosedCell> {
+    pub(super) fn remove_execution(&mut self, execution_id: &str) -> Option<CellDelegate> {
         let execution = self.executions.remove(execution_id)?;
         self.notifications -= execution.notifications;
         execution.cancellation.cancel();
@@ -409,3 +413,6 @@ impl SessionState {
 #[cfg(test)]
 #[path = "state_tests.rs"]
 mod tests;
+
+#[path = "completion_ready_state.rs"]
+mod completion_ready;

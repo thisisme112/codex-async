@@ -39,7 +39,7 @@ async fn automatic_reconnect_restores_draft_and_routes_new_notifications() -> Re
         for connection in 0..3 {
             let mut socket = loop {
                 let (stream, _) = listener.accept().await?;
-                // Startup probes the default daemon socket before opening its WebSocket.
+                // Accept the explicit remote connection's WebSocket handshake.
                 if let Ok(socket) = tokio_tungstenite::accept_async(stream).await {
                     break socket;
                 }
@@ -135,7 +135,7 @@ async fn automatic_reconnect_restores_draft_and_routes_new_notifications() -> Re
         }
         Ok::<_, anyhow::Error>(methods)
     });
-    let mut terminal = PtyCodex::start(&repo_root, codex_home, &[])?;
+    let mut terminal = PtyCodex::start(&repo_root, codex_home, &["--remote", "unix://"])?;
     terminal.wait_for_startup()?;
     let mut disconnect_tx = Some(disconnect_tx);
     let mut restore_tx = Some(restore_tx);

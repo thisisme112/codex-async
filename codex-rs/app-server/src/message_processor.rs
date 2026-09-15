@@ -271,6 +271,13 @@ impl MessageProcessor {
     /// Create a new `MessageProcessor`, retaining a handle to the outgoing
     /// `Sender` so handlers can enqueue messages to be written to stdout.
     pub(crate) fn new(args: MessageProcessorArgs) -> Self {
+        Self::new_with_completion_wake(args, crate::in_process::CompletionWake::Disabled)
+    }
+
+    pub(crate) fn new_with_completion_wake(
+        args: MessageProcessorArgs,
+        completion_wake: crate::in_process::CompletionWake,
+    ) -> Self {
         let MessageProcessorArgs {
             outgoing,
             analytics_events_client,
@@ -369,6 +376,12 @@ impl MessageProcessor {
                     thread_state_manager.clone(),
                 )),
             );
+            if matches!(
+                completion_wake,
+                crate::in_process::CompletionWake::Interactive
+            ) {
+                manager.enable_code_mode_completion_wake();
+            }
             match code_mode_session_provider {
                 Some(provider) => manager.with_code_mode_session_provider(provider),
                 None => manager,

@@ -56,6 +56,7 @@ impl Session {
             return;
         }
 
+        self.services.code_mode_service.completions.activity();
         for contributor in self.services.extensions.thread_lifecycle_contributors() {
             contributor
                 .on_thread_idle(codex_extension_api::ThreadIdleInput {
@@ -89,6 +90,13 @@ impl Session {
         turn_context: &TurnContext,
         error: CodexErrorInfo,
     ) {
+        {
+            let _active = self.active_turn.lock().await;
+            self.services.code_mode_service.completions.suppress();
+            turn_context
+                .extension_data
+                .insert(crate::tools::code_mode::completion::CompletionErrorObserved);
+        }
         for contributor in self.services.extensions.turn_lifecycle_contributors() {
             contributor
                 .on_turn_error(codex_extension_api::TurnErrorInput {

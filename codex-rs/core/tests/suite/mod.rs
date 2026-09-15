@@ -51,6 +51,7 @@ mod client;
 mod client_websockets;
 mod cloud_config;
 mod code_mode;
+mod code_mode_completion;
 mod code_mode_elicitation;
 mod codex_apps_protocol;
 mod codex_delegate;

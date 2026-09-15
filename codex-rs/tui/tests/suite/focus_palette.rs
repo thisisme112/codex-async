@@ -166,6 +166,17 @@ impl PtyCodex {
         codex_home: TempDir,
         extra_args: &[&str],
     ) -> Result<Self> {
+        // The public CLI exposes --remote for connected fixtures.
+        let mut command = Command::new(codex_utils_cargo_bin::cargo_bin("codex")?);
+        command
+            .args(extra_args)
+            .arg("--no-alt-screen")
+            .arg("-C")
+            .arg(repo_root);
+        Self::start_command(codex_home, command)
+    }
+
+    pub(super) fn start_command(codex_home: TempDir, mut command: Command) -> Result<Self> {
         let mut master_fd = -1;
         let mut slave_fd = -1;
         let mut window_size = libc::winsize {
@@ -197,13 +208,7 @@ impl PtyCodex {
         let stdin = slave.try_clone().context("clone pseudo-terminal stdin")?;
         let stdout = slave.try_clone().context("clone pseudo-terminal stdout")?;
 
-        let codex = codex_utils_cargo_bin::cargo_bin("codex-tui")
-            .or_else(|_| codex_utils_cargo_bin::cargo_bin("codex"))?;
-        let child = Command::new(codex)
-            .args(extra_args)
-            .arg("--no-alt-screen")
-            .arg("-C")
-            .arg(repo_root)
+        let child = command
             .env("TERM", "xterm-256color")
             .env("OPENAI_API_KEY", "focus-palette-test")
             .env("CODEX_HOME", codex_home.path())
@@ -354,7 +359,10 @@ impl PtyCodex {
                 return Ok(());
             }
             if let Some(status) = self.child.try_wait()? {
-                bail!("Codex exited while waiting for {text:?} ({status})");
+                bail!(
+                    "Codex exited while waiting for {text:?} ({status}); screen:\n{}",
+                    self.screen_contents()
+                );
             }
         }
         bail!("missing {text:?}; screen:\n{}", self.screen_contents())

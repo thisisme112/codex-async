@@ -57,6 +57,7 @@ impl fmt::Display for CellId {
 
 pub struct StartedCell {
     pub cell_id: CellId,
+    pub completion_ready_support: crate::CompletionReadySupport,
     initial_response: CodeModeSessionResultFuture<'static, RuntimeResponse>,
 }
 
@@ -86,6 +87,7 @@ impl StartedCell {
     ) -> Self {
         Self {
             cell_id,
+            completion_ready_support: crate::CompletionReadySupport::Unsupported,
             initial_response: Box::pin(initial_response),
         }
     }
@@ -116,6 +118,22 @@ pub trait CodeModeSessionDelegate: Send + Sync {
 
     /// Releases delegate state associated with a cell after it reaches a terminal state.
     fn cell_closed(&self, cell_id: &CellId);
+
+    /// Opts this execution into completion readiness when the provider supports it.
+    fn wants_completion_ready(&self) -> bool {
+        false
+    }
+
+    /// Reports successful publication of a terminal result and its stored values.
+    ///
+    /// Called at most once, including for script errors, without consuming output.
+    /// It may precede `execute` returning or the initial yielded output handoff.
+    /// It does not acknowledge model exposure, and a concurrent wait or termination
+    /// may already have claimed the result. Cancellation before commit emits no
+    /// event; `cell_closed` independently retires state on retrieval or cleanup.
+    /// The ID has the same session/generation scope as `StartedCell::cell_id`.
+    /// Implementations must return promptly without waiting for a turn or result.
+    fn cell_completion_ready(&self, _cell_id: &CellId) {}
 }
 
 /// A session delegate for clients that do not expose nested tools or notifications.

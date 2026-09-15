@@ -1036,6 +1036,7 @@ async fn dropping_a_grpc_lease_retires_its_server_session() -> Result<()> {
         .context("connect raw gRPC client")?;
     let mut lease = client
         .open_session(grpc::OpenSessionRequest {
+            completion_ready: false,
             cell_execution_limits: None,
         })
         .await

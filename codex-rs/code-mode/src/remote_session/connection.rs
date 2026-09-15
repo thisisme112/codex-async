@@ -204,8 +204,12 @@ impl Connection {
         let handshake = async {
             let session_limits_capability = Capability::new(SESSION_RESOURCE_LIMITS_CAPABILITY)
                 .map_err(|error| error.to_string())?;
-            let optional_capabilities = CapabilitySet::try_new([session_limits_capability])
-                .map_err(|error| error.to_string())?;
+            let completion_ready_capability =
+                Capability::new(codex_code_mode_protocol::host::CELL_COMPLETION_READY_CAPABILITY)
+                    .map_err(|err| err.to_string())?;
+            let optional_capabilities =
+                CapabilitySet::try_new([session_limits_capability, completion_ready_capability])
+                    .map_err(|error| error.to_string())?;
             let hello = ClientHello::new(
                 SupportedProtocolVersions::try_new([ProtocolVersion::V1])
                     .map_err(|err| err.to_string())?,
@@ -273,7 +277,7 @@ impl Connection {
                 async move { drive_reader(reader, reader_events, reader_cancellation).await },
             );
 
-        let (driver, execute_claim_tx) = ConnectionDriver::new(
+        let (mut driver, execute_claim_tx) = ConnectionDriver::new(
             command_rx,
             event_rx,
             event_tx.clone(),
@@ -284,6 +288,9 @@ impl Connection {
                 cancellation: cancellation.clone(),
             },
         );
+        driver.completion_ready = capabilities.iter().any(|capability| {
+            capability.as_str() == codex_code_mode_protocol::host::CELL_COMPLETION_READY_CAPABILITY
+        });
         let driver_task = tokio::spawn(driver.run());
         tokio::spawn(
             ConnectionSupervisor {

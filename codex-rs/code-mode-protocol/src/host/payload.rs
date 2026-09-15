@@ -175,6 +175,9 @@ impl From<WireToolDefinition> for ToolDefinition {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireExecuteRequest {
+    /// Sent only after negotiating `cell-completion-ready`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub completion_ready: bool,
     pub tool_call_id: String,
     pub enabled_tools: Vec<WireToolDefinition>,
     pub source: String,
@@ -187,6 +190,7 @@ impl TryFrom<ExecuteRequest> for WireExecuteRequest {
 
     fn try_from(value: ExecuteRequest) -> Result<Self, Self::Error> {
         Ok(Self {
+            completion_ready: false,
             tool_call_id: value.tool_call_id,
             enabled_tools: value.enabled_tools.into_iter().map(Into::into).collect(),
             source: value.source,

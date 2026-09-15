@@ -374,6 +374,10 @@ pub(super) async fn run_main_inner(
         .await?;
     startup_draft.apply_config(&config);
 
+    // The shared daemon has no interactive completion-wake capability yet.
+    // Model settings can select Code Mode even without a config feature override.
+    let app_server_target = code_mode_startup::interactive_target(app_server_target, &cli);
+
     let mut cloud_config_bundle = if workload_identity_selected {
         cloud_config_bundle
     } else {

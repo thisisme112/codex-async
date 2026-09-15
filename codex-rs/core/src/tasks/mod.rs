@@ -284,6 +284,24 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) {
+        self.start_task_with_completion_admission(turn_context, input, task)
+            .await;
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "completion admission and mailbox transfer must remain atomic with task installation; the callees only take queue and turn-state locks"
+    )]
+    pub(crate) async fn start_task_with_completion_admission<T: SessionTask>(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+    ) -> bool {
+        let completion_admission = turn_context
+            .extension_data
+            .get::<crate::tools::code_mode::completion::CompletionAdmission>(
+        );
         self.activate_plugin_selection(&turn_context).await;
         // Inherited or recovered roots are applied before task start. Otherwise this
         // task owns its turn, including background work. Later mail cannot change it.
@@ -312,9 +330,20 @@ impl Session {
         )
         .await;
 
-        let (pending_items, _) = self.input_queue.drain_mailbox_input_items().await;
+        // A completion reservation can be withdrawn during preparation. Leave
+        // mailbox ownership untouched until its task installation is committed.
+        let pending_items = if completion_admission.is_none() {
+            self.input_queue.drain_mailbox_input_items().await.0
+        } else {
+            Vec::new()
+        };
         let turn_state = {
             let mut active = self.active_turn.lock().await;
+            if completion_admission.as_ref().is_some_and(|admission| {
+                !admission.permits(&active, &self.services.code_mode_service.completions)
+            }) {
+                return false;
+            }
             let turn = active.get_or_insert_with(ActiveTurn::default);
             debug_assert!(turn.task.is_none());
             Arc::clone(&turn.turn_state)
@@ -327,6 +356,25 @@ impl Session {
             .await;
 
         let mut active = self.active_turn.lock().await;
+        if completion_admission.as_ref().is_some_and(|admission| {
+            !admission.permits(&active, &self.services.code_mode_service.completions)
+        }) {
+            // No RunningTask owns this published lifecycle start. Balance it here,
+            // outside the admission lock and with only the rejected turn's store.
+            drop(active);
+            self.emit_turn_abort_lifecycle(
+                TurnAbortReason::Replaced,
+                turn_context.extension_data.as_ref(),
+            )
+            .await;
+            return false;
+        }
+        if completion_admission.is_some() {
+            let (pending_items, _) = self.input_queue.drain_mailbox_input_items().await;
+            self.input_queue
+                .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_items)
+                .await;
+        }
         let turn = active.get_or_insert_with(ActiveTurn::default);
         debug_assert!(turn.task.is_none());
         let agent_execution_guard = self.services.agent_control.execution_guard(
@@ -407,6 +455,10 @@ impl Session {
             _timer: timer,
         };
         turn.task = Some(running_task);
+        if completion_admission.is_some() {
+            self.services.code_mode_service.completions.delivered();
+        }
+        true
     }
 
     /// Returns whether an extension has marked this thread as durably asleep.
@@ -527,6 +579,10 @@ impl Session {
         }
 
         if let Some(turn_context) = turn_context.as_deref() {
+            self.services
+                .code_mode_service
+                .completions
+                .finish_turn(&turn_context.sub_id);
             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
                 .await;
         }
@@ -574,6 +630,10 @@ impl Session {
                 .await;
         }
         if let Some(turn_context) = turn_context.as_deref() {
+            self.services
+                .code_mode_service
+                .completions
+                .finish_turn(&turn_context.sub_id);
             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
                 .await;
         }
@@ -818,13 +878,26 @@ impl Session {
         )
         .await;
 
+        self.services
+            .code_mode_service
+            .completions
+            .finish_turn(&turn_context.sub_id);
         let cleared_active_turn = {
             let mut active = self.active_turn.lock().await;
             if let Some(active_turn) = active.as_ref()
                 && active_turn.task.is_none()
                 && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
             {
+                if idle_cause != ThreadIdleCause::Completed
+                    && turn_context
+                        .extension_data
+                        .get::<crate::tools::code_mode::completion::CompletionErrorObserved>()
+                        .is_none()
+                {
+                    self.services.code_mode_service.completions.suppress();
+                }
                 *active = None;
+                self.services.code_mode_service.completions.activity();
                 true
             } else {
                 false
@@ -845,6 +918,12 @@ impl Session {
 
     async fn take_active_turn(&self, reason: &TurnAbortReason) -> Option<ActiveTurn> {
         let mut active = self.active_turn.lock().await;
+        if matches!(
+            reason,
+            TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
+        ) {
+            self.services.code_mode_service.completions.suppress();
+        }
         if matches!(
             reason,
             TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited

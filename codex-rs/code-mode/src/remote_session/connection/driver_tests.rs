@@ -57,13 +57,17 @@ struct DriverHarness {
 
 impl DriverHarness {
     fn start() -> Self {
+        Self::with_completion_ready(false)
+    }
+
+    fn with_completion_ready(completion_ready: bool) -> Self {
         let (command_tx, command_rx) = mpsc::channel(/*max_capacity*/ 16);
         let (event_tx, event_rx) = mpsc::channel(/*max_capacity*/ 16);
         let (outgoing_tx, outgoing_rx) = mpsc::channel(/*max_capacity*/ 16);
         let cancellation = CancellationToken::new();
         let alive = Arc::new(AtomicBool::new(true));
         let failure = Arc::new(StdMutex::new(None));
-        let (driver, execute_claim_tx) = ConnectionDriver::new(
+        let (mut driver, execute_claim_tx) = ConnectionDriver::new(
             command_rx,
             event_rx,
             event_tx.clone(),
@@ -74,6 +78,7 @@ impl DriverHarness {
                 cancellation: cancellation.clone(),
             },
         );
+        driver.completion_ready = completion_ready;
         let driver_task = tokio::spawn(driver.run());
         Self {
             command_tx,
@@ -2000,3 +2005,6 @@ async fn dropped_shutdown_waiter_does_not_abort_remote_cleanup() {
         Err(mpsc::error::TryRecvError::Empty)
     ));
 }
+
+#[path = "completion_ready_tests.rs"]
+mod completion_ready_tests;

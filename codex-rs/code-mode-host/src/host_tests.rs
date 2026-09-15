@@ -88,6 +88,7 @@ async fn decode_frame(frame: EncodedFrame) -> HostToClient {
 
 fn execute_request(source: &str) -> WireExecuteRequest {
     WireExecuteRequest {
+        completion_ready: false,
         tool_call_id: "call-1".to_string(),
         enabled_tools: Vec::new(),
         source: source.to_string(),
@@ -256,49 +257,54 @@ impl AsyncWrite for BlockingWriter {
 }
 
 #[tokio::test]
-async fn session_resource_limits_are_negotiated_when_optional_or_required() {
-    let resource_limits_capability =
-        Capability::new(SESSION_RESOURCE_LIMITS_CAPABILITY).expect("resource limits capability");
-    let resource_limits =
-        CapabilitySet::try_new([resource_limits_capability.clone()]).expect("host capabilities");
-
-    for (required, optional) in [
-        (
-            CapabilitySet::empty(),
-            CapabilitySet::try_new([resource_limits_capability]).expect("optional capabilities"),
-        ),
-        (resource_limits.clone(), CapabilitySet::empty()),
+async fn capabilities_are_negotiated_when_optional_or_required() {
+    for name in [
+        SESSION_RESOURCE_LIMITS_CAPABILITY,
+        codex_code_mode_protocol::host::CELL_COMPLETION_READY_CAPABILITY,
     ] {
-        let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 1024);
-        let (host_reader, host_writer) = tokio::io::split(host_stream);
-        let (client_reader, client_writer) = tokio::io::split(client_stream);
-        let host = tokio::spawn(run(host_reader, host_writer));
-        let mut reader = FramedReader::new(client_reader);
-        let mut writer = FramedWriter::new(client_writer);
+        let resource_limits_capability = Capability::new(name).expect("valid capability");
+        let resource_limits = CapabilitySet::try_new([resource_limits_capability.clone()])
+            .expect("host capabilities");
 
-        writer
-            .write(&ClientToHost::ClientHello(
-                ClientHello::new(
-                    SupportedProtocolVersions::try_new([ProtocolVersion::V1])
-                        .expect("supported versions"),
-                    required,
-                    optional,
-                )
-                .expect("client hello"),
-            ))
-            .await
-            .expect("write hello");
-        assert_eq!(
-            reader.read::<HostToClient>().await.expect("host hello"),
-            Some(HostToClient::HostHello(HostHello::new(
-                ProtocolVersion::V1,
-                resource_limits.clone(),
-            )))
-        );
+        for (required, optional) in [
+            (
+                CapabilitySet::empty(),
+                CapabilitySet::try_new([resource_limits_capability])
+                    .expect("optional capabilities"),
+            ),
+            (resource_limits.clone(), CapabilitySet::empty()),
+        ] {
+            let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 1024);
+            let (host_reader, host_writer) = tokio::io::split(host_stream);
+            let (client_reader, client_writer) = tokio::io::split(client_stream);
+            let host = tokio::spawn(run(host_reader, host_writer));
+            let mut reader = FramedReader::new(client_reader);
+            let mut writer = FramedWriter::new(client_writer);
 
-        drop(writer);
-        drop(reader);
-        host.await.expect("host task").expect("host connection");
+            writer
+                .write(&ClientToHost::ClientHello(
+                    ClientHello::new(
+                        SupportedProtocolVersions::try_new([ProtocolVersion::V1])
+                            .expect("supported versions"),
+                        required,
+                        optional,
+                    )
+                    .expect("client hello"),
+                ))
+                .await
+                .expect("write hello");
+            assert_eq!(
+                reader.read::<HostToClient>().await.expect("host hello"),
+                Some(HostToClient::HostHello(HostHello::new(
+                    ProtocolVersion::V1,
+                    resource_limits.clone(),
+                )))
+            );
+
+            drop(writer);
+            drop(reader);
+            host.await.expect("host task").expect("host connection");
+        }
     }
 }
 

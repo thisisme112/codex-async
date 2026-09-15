@@ -290,9 +290,14 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             }
             stored_values = self.inner.stored_values.lock() => stored_values,
         };
-        cell_state.commit_completion(event, pending_initial_yield_items, || {
+        let committed = cell_state.commit_completion(event, pending_initial_yield_items, || {
             stored_values.extend(stored_value_writes);
-        })
+        });
+        drop(stored_values);
+        if matches!(committed, CompletionCommit::Committed) {
+            self.delegate.cell_completion_ready(&self.cell_id);
+        }
+        committed
     }
 
     async fn closed(&self) {
@@ -316,3 +321,7 @@ fn actor_error(cell_id: &CellId, error: CellError) -> Error {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "completion_ready_tests.rs"]
+mod completion_ready_tests;

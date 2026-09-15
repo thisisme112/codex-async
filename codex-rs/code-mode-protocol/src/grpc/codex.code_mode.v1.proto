@@ -35,6 +35,8 @@ service CodeModeHost {
 }
 
 message OpenSessionRequest {
+  // Opt in to understanding completion events; each Execute also opts in.
+  bool completion_ready = 2;
   optional SessionCellExecutionLimits cell_execution_limits = 1;
 }
 
@@ -50,10 +52,13 @@ message SessionEvent {
     Notification notification = 3;
     NotificationCancelled notification_cancelled = 4;
     CellClosed cell_closed = 5;
+    CellCompletionReady cell_completion_ready = 6;
   }
 }
 
 message SessionOpened {
+  // False for old hosts or when the client did not opt in.
+  bool completion_ready = 2;
   string session_id = 1;
 }
 
@@ -144,7 +149,14 @@ message CellClosed {
   uint64 final_tool_call_sequence = 3;
 }
 
+// Non-consuming: results and stored values have committed. Cleanup is separate.
+message CellCompletionReady {
+  string execution_id = 1;
+  string cell_id = 2;
+}
+
 message ExecuteRequest {
+  bool completion_ready = 8;
   string session_id = 1;
 
   // Chosen by the client so callbacks can be correlated before cell admission.

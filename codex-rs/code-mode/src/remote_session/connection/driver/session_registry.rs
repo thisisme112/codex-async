@@ -14,6 +14,7 @@ pub(super) struct CellOwner {
     pub(super) session_id: SessionId,
     pub(super) cell_id: CellId,
     pub(super) delegate: Arc<dyn CodeModeSessionDelegate>,
+    completion_ready: bool,
 }
 
 pub(super) struct DelegateTarget {
@@ -141,6 +142,7 @@ impl SessionRegistry {
                 session_id: session.id.clone(),
                 cell_id: public_id.clone(),
                 delegate,
+                completion_ready: false,
             },
         );
         Ok(public_id)
@@ -166,6 +168,24 @@ impl SessionRegistry {
             cell_id: owner.cell_id.clone(),
             delegate: Arc::clone(&owner.delegate),
         })
+    }
+
+    pub(super) fn completion_ready(&mut self, session_id: &SessionId, cell_id: &WireCellId) {
+        let Some(session) = self.records.get_mut(session_id) else {
+            return;
+        };
+        if session.phase != SessionPhase::Ready {
+            return;
+        }
+        let Some(owner) = session.cells.get_mut(cell_id) else {
+            return;
+        };
+        if !owner.completion_ready && owner.delegate.wants_completion_ready() {
+            owner.completion_ready = true;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                owner.delegate.cell_completion_ready(&owner.cell_id);
+            }));
+        }
     }
 
     pub(super) fn remove_cell(

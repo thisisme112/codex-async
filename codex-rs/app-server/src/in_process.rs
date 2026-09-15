@@ -369,7 +369,23 @@ impl InProcessClientHandle {
 /// This function sends `initialize` followed by `initialized` before returning
 /// the handle, so callers receive a ready-to-use runtime. If initialize fails,
 /// the runtime is shut down and an `InvalidData` error is returned.
-pub async fn start(mut args: InProcessStartArgs) -> IoResult<InProcessClientHandle> {
+pub async fn start(args: InProcessStartArgs) -> IoResult<InProcessClientHandle> {
+    start_with_completion_wake(args, CompletionWake::Disabled).await
+}
+
+/// Host capability for interactive clients that remain connected between turns.
+#[derive(Clone, Copy)]
+pub enum CompletionWake {
+    Disabled,
+    Interactive,
+}
+
+/// Starts an embedded runtime with an explicit client completion-wake capability.
+/// This does not activate Code Mode tools; provider negotiation is still required.
+pub async fn start_with_completion_wake(
+    mut args: InProcessStartArgs,
+    completion_wake: CompletionWake,
+) -> IoResult<InProcessClientHandle> {
     if let Ok(Some(err)) = check_execpolicy_for_warnings(&args.config.config_layer_stack).await {
         let (path, range) = crate::exec_policy_warning_location(&err);
         args.config_warnings.push(ConfigWarningNotification {
@@ -380,7 +396,7 @@ pub async fn start(mut args: InProcessStartArgs) -> IoResult<InProcessClientHand
         });
     }
     let initialize = args.initialize.clone();
-    let client = start_uninitialized(args).await?;
+    let client = start_uninitialized(args, completion_wake).await?;
 
     let initialize_response = client
         .request(ClientRequest::Initialize {
@@ -419,7 +435,10 @@ async fn run_outbound_router(
     }
 }
 
-async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClientHandle> {
+async fn start_uninitialized(
+    args: InProcessStartArgs,
+    completion_wake: CompletionWake,
+) -> IoResult<InProcessClientHandle> {
     args.config.auth_config().validate()?;
     let channel_capacity = args.channel_capacity.max(1);
     let installation_id = resolve_installation_id(&args.config.codex_home).await?;
@@ -475,7 +494,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
         );
         let (processor_tx, mut processor_rx) = mpsc::channel::<ProcessorCommand>(channel_capacity);
         let mut processor_handle = tokio::spawn(async move {
-            let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+            let processor_args = MessageProcessorArgs {
                 outgoing: Arc::clone(&processor_outgoing),
                 analytics_events_client,
                 arg0_paths: args.arg0_paths,
@@ -496,7 +515,11 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                 rpc_transport: AppServerRpcTransport::InProcess,
                 remote_control_handle: None,
                 plugin_startup_tasks: Some(PluginStartupConfig::Current),
-            }));
+            };
+            let processor = Arc::new(MessageProcessor::new_with_completion_wake(
+                processor_args,
+                completion_wake,
+            ));
             let mut thread_created_rx = processor.thread_created_receiver();
             let session = Arc::new(ConnectionSessionState::new(
                 crate::transport::ConnectionOrigin::InProcess,

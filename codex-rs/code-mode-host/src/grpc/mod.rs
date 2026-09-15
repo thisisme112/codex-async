@@ -6,6 +6,10 @@ mod session;
 mod validation;
 mod waits;
 
+#[cfg(test)]
+#[path = "completion_ready_tests.rs"]
+mod completion_ready_tests;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -63,7 +67,9 @@ impl GrpcCodeModeHost {
     ) -> Result<Response<GrpcStream<proto::SessionEvent>>, Status> {
         let _permit = self.state.request_permit()?;
         let limits = conversions::session_limits(request.cell_execution_limits)?;
-        Ok(Response::new(self.state.open_session(limits)?))
+        Ok(Response::new(
+            self.state.open_session(limits, request.completion_ready)?,
+        ))
     }
 
     #[tracing::instrument(
@@ -137,6 +143,8 @@ impl GrpcCodeModeHost {
         validation::identifier(&request.execution_id, "execution ID")?;
         let request_permit = self.state.request_permit()?;
         let execution_id = request.execution_id.clone();
+        let completion_execution_id =
+            (session.completion_ready && request.completion_ready).then(|| execution_id.clone());
         let request = conversions::execute_request(request)?;
         let cell_permit = self.state.cell_permit()?;
         session.reserve_execution(&execution_id)?;
@@ -148,7 +156,7 @@ impl GrpcCodeModeHost {
             _ = session.closed.cancelled() => {
                 return Err(Status::cancelled("code-mode session is closed"));
             }
-            result = session.runtime.execute(request, Arc::new(delegate::GrpcDelegate::new(Arc::downgrade(&session)))) => {
+            result = session.runtime.execute(request, Arc::new(delegate::GrpcDelegate::new(Arc::downgrade(&session), completion_execution_id))) => {
                 result.map_err(Status::failed_precondition)?
             }
         };

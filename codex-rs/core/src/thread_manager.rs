@@ -382,6 +382,7 @@ pub(crate) struct ThreadManagerState {
     skills_service: Arc<HostSkillsService>,
     plugins_manager: Arc<PluginsManager>,
     mcp_manager: Arc<McpManager>,
+    code_mode_completion_wake: AtomicBool,
     code_mode_session_provider: Arc<dyn CodeModeSessionProvider>,
     extensions: Arc<ExtensionRegistry<Config>>,
     user_instructions_provider: Arc<dyn UserInstructionsProvider>,
@@ -513,6 +514,7 @@ impl ThreadManager {
             };
         Self {
             state: Arc::new(ThreadManagerState {
+                code_mode_completion_wake: AtomicBool::new(false),
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
@@ -552,6 +554,14 @@ impl ThreadManager {
         };
         state.thread_id_generator = Arc::new(generator);
         self
+    }
+
+    /// Opts future root threads into completion wake for an interactive host.
+    /// Only exposed Code Mode cells with provider acknowledgment can wake a thread.
+    pub fn enable_code_mode_completion_wake(&self) {
+        self.state
+            .code_mode_completion_wake
+            .store(true, Ordering::Release);
     }
 
     /// Replaces the process-wide provider before this manager is shared with threads.
@@ -661,6 +671,7 @@ impl ThreadManager {
         let agent_graph_store = local_agent_graph_store_from_state_db(state_db.as_ref());
         Self {
             state: Arc::new(ThreadManagerState {
+                code_mode_completion_wake: AtomicBool::new(false),
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
@@ -2167,6 +2178,11 @@ impl ThreadManagerState {
         let new_thread = self
             .finalize_thread_spawn(session, io, tracked_session_source)
             .await?;
+        if self.code_mode_completion_wake.load(Ordering::Acquire)
+            && !new_thread.thread.session_source.is_non_root_agent()
+        {
+            new_thread.thread.enable_code_mode_completion_wake();
+        }
         new_thread.thread.emit_thread_ready_lifecycle().await;
         if source_changed_during_startup.load(Ordering::Acquire) {
             new_thread.thread.session.request_mcp_runtime_refresh();

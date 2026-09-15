@@ -1288,6 +1288,7 @@ impl Session {
     }
 
     pub(crate) fn mark_interrupted(&self) {
+        self.services.code_mode_service.completions.suppress();
         self.agent_status.send_replace(AgentStatus::Interrupted);
     }
 
@@ -3567,6 +3568,10 @@ impl Session {
                 .history
                 .record_annotated_items(&items, model_info.truncation_policy.into());
         }
+        self.services
+            .code_mode_service
+            .completions
+            .record_outputs(&turn_context.sub_id, &response_items);
         for image in image_preparations {
             self.services
                 .analytics_events_client

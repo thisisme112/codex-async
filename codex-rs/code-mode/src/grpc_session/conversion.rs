@@ -18,6 +18,7 @@ pub(super) fn execute_request(
     request: ExecuteRequest,
 ) -> Result<grpc::ExecuteRequest, String> {
     Ok(grpc::ExecuteRequest {
+        completion_ready: false,
         session_id: session_id.to_string(),
         execution_id,
         tool_call_id: request.tool_call_id,

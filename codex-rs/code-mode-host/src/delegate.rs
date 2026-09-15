@@ -13,13 +13,18 @@ use tokio_util::sync::CancellationToken;
 use crate::peer::HostPeer;
 
 pub(super) struct RemoteDelegate {
+    pub(super) completion_ready: bool,
     session_id: SessionId,
     peer: Arc<HostPeer>,
 }
 
 impl RemoteDelegate {
     pub(super) fn new(session_id: SessionId, peer: Arc<HostPeer>) -> Self {
-        Self { session_id, peer }
+        Self {
+            session_id,
+            peer,
+            completion_ready: false,
+        }
     }
 }
 
@@ -76,6 +81,15 @@ impl CodeModeSessionDelegate for RemoteDelegate {
                 }
             }
         })
+    }
+
+    fn wants_completion_ready(&self) -> bool {
+        self.completion_ready
+    }
+
+    fn cell_completion_ready(&self, cell_id: &CellId) {
+        self.peer
+            .completion_ready(self.session_id.clone(), cell_id.clone());
     }
 
     fn cell_closed(&self, cell_id: &CellId) {

@@ -13,6 +13,7 @@ pub(super) async fn open_session(
 ) -> (String, GrpcStream<proto::SessionEvent>) {
     let mut stream = host
         .open_session(Request::new(proto::OpenSessionRequest {
+            completion_ready: false,
             cell_execution_limits: None,
         }))
         .await
@@ -35,6 +36,7 @@ pub(super) fn execute_request(
     source: &str,
 ) -> proto::ExecuteRequest {
     proto::ExecuteRequest {
+        completion_ready: false,
         session_id: session_id.to_string(),
         execution_id: execution_id.to_string(),
         tool_call_id: "outer-call".to_string(),

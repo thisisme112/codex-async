@@ -15,11 +15,15 @@ use super::session::GrpcSession;
 
 pub(super) struct GrpcDelegate {
     session: Weak<GrpcSession>,
+    completion_execution_id: Option<String>,
 }
 
 impl GrpcDelegate {
-    pub(super) fn new(session: Weak<GrpcSession>) -> Self {
-        Self { session }
+    pub(super) fn new(session: Weak<GrpcSession>, completion_execution_id: Option<String>) -> Self {
+        Self {
+            session,
+            completion_execution_id,
+        }
     }
 }
 
@@ -108,6 +112,26 @@ impl CodeModeSessionDelegate for GrpcDelegate {
                 )
                 .await
         })
+    }
+
+    fn wants_completion_ready(&self) -> bool {
+        self.completion_execution_id.is_some()
+    }
+
+    fn cell_completion_ready(&self, cell_id: &CellId) {
+        if let Some(execution_id) = &self.completion_execution_id
+            && let Some(session) = self.session.upgrade()
+        {
+            // Execution identity is known before runtime admission. This also
+            // handles completion before the host registers the returned cell ID.
+            let _ = session.events.send_now(
+                proto::session_event::Event::CellCompletionReady(proto::CellCompletionReady {
+                    execution_id: execution_id.clone(),
+                    cell_id: cell_id.to_string(),
+                }),
+                /*cell_permit*/ None,
+            );
+        }
     }
 
     fn cell_closed(&self, cell_id: &CellId) {

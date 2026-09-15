@@ -325,9 +325,33 @@ impl InProcessAppServerClient {
     /// The returned client is ready for requests and ordered event consumption.
     /// Request queues remain bounded without blocking on unread notifications.
     pub async fn start(args: InProcessClientStartArgs) -> IoResult<Self> {
+        Self::start_with_completion_wake(
+            args,
+            codex_app_server::in_process::CompletionWake::Disabled,
+        )
+        .await
+    }
+
+    /// Starts the interactive TUI runtime, capable of receiving new turns while idle.
+    /// Code Mode cells resume the idle thread after supported completion notifications.
+    pub async fn start_interactive(args: InProcessClientStartArgs) -> IoResult<Self> {
+        Self::start_with_completion_wake(
+            args,
+            codex_app_server::in_process::CompletionWake::Interactive,
+        )
+        .await
+    }
+
+    async fn start_with_completion_wake(
+        args: InProcessClientStartArgs,
+        completion_wake: codex_app_server::in_process::CompletionWake,
+    ) -> IoResult<Self> {
         let channel_capacity = args.channel_capacity.max(1);
-        let mut handle =
-            codex_app_server::in_process::start(args.into_runtime_start_args()).await?;
+        let mut handle = codex_app_server::in_process::start_with_completion_wake(
+            args.into_runtime_start_args(),
+            completion_wake,
+        )
+        .await?;
         let request_sender = handle.sender();
         let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(channel_capacity);
         // e9996ec62a preserved transcript events by awaiting a bounded queue, but that can

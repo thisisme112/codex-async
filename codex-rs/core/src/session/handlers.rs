@@ -282,6 +282,10 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
 }
 
 pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
+    {
+        let _active = sess.active_turn.lock().await;
+        sess.services.code_mode_service.completions.shutdown();
+    }
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }

@@ -133,15 +133,17 @@ impl ConnectionDriver {
             let _ = response_tx.send(Err(err));
             return true;
         }
-        let request = match request.try_into() {
-            Ok(request) => request,
-            Err(err) => {
-                let _ = response_tx.send(Err(format!(
-                    "failed to encode code-mode execute request: {err}"
-                )));
-                return true;
-            }
-        };
+        let mut request: codex_code_mode_protocol::host::WireExecuteRequest =
+            match request.try_into() {
+                Ok(request) => request,
+                Err(err) => {
+                    let _ = response_tx.send(Err(format!(
+                        "failed to encode code-mode execute request: {err}"
+                    )));
+                    return true;
+                }
+            };
+        request.completion_ready = self.completion_ready && delegate.wants_completion_ready();
         let request_id = match self.requests.allocate_id() {
             Ok(id) => id,
             Err(err) => {

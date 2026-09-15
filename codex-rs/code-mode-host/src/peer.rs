@@ -30,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 const CELL_MESSAGE_CAPACITY: usize = 128;
 
 pub(super) struct HostPeer {
+    pub(super) completion_ready: bool,
     outgoing_tx: mpsc::Sender<EncodedFrame>,
     pending: Mutex<HashMap<DelegateRequestId, PendingDelegate>>,
     delegate_permits: Arc<Semaphore>,
@@ -52,6 +53,7 @@ enum CellRoute {
 }
 
 enum CellMessage {
+    CompletionReady,
     Delegate {
         id: DelegateRequestId,
         request: DelegateRequest,
@@ -69,6 +71,7 @@ impl HostPeer {
     pub(super) fn new(outgoing_tx: mpsc::Sender<EncodedFrame>) -> Self {
         Self {
             outgoing_tx,
+            completion_ready: false,
             pending: Mutex::new(HashMap::new()),
             delegate_permits: Arc::new(Semaphore::new(MAX_PENDING_DELEGATE_CALLS)),
             cell_routes: StdMutex::new(HashMap::new()),
@@ -258,6 +261,12 @@ impl HostPeer {
             .await;
         });
         initial_response_sent_rx
+    }
+
+    pub(super) fn completion_ready(&self, session_id: SessionId, cell_id: CellId) {
+        if self.completion_ready {
+            let _ = self.route_cell_message((session_id, cell_id), CellMessage::CompletionReady);
+        }
     }
 
     pub(super) fn close_cell(&self, session_id: SessionId, cell_id: CellId) {
@@ -453,6 +462,9 @@ async fn drive_cell(
                 }) => {
                     peer.send_delegate_if_pending(id, key.0.clone(), request, dispatched_tx).await;
                 }
+                Some(CellMessage::CompletionReady) => {
+                    let _ = peer.send(HostToClient::CellCompletionReady { session_id: key.0.clone(), cell_id: (&key.1).into() });
+                }
                 Some(CellMessage::Closed) | None => break true,
             },
             _ = peer.disconnected.cancelled() => {
@@ -485,6 +497,9 @@ async fn drive_cell(
                         dispatched_tx,
                     }) => {
                         peer.send_delegate_if_pending(id, key.0.clone(), request, dispatched_tx).await;
+                    }
+                    Some(CellMessage::CompletionReady) => {
+                        let _ = peer.send(HostToClient::CellCompletionReady { session_id: key.0.clone(), cell_id: (&key.1).into() });
                     }
                     Some(CellMessage::Closed) | None => break,
                 },

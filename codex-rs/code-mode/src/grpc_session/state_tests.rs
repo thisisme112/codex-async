@@ -11,6 +11,7 @@ use super::SessionState;
 
 fn request(execution_id: &str) -> grpc::ExecuteRequest {
     grpc::ExecuteRequest {
+        completion_ready: false,
         session_id: "session".to_string(),
         execution_id: execution_id.to_string(),
         tool_call_id: "call".to_string(),
@@ -29,6 +30,42 @@ fn request(execution_id: &str) -> grpc::ExecuteRequest {
         yield_time_ms: None,
         max_output_tokens: None,
     }
+}
+
+#[test]
+fn readiness_is_non_consuming_deduplicated_and_scoped_to_live_opted_in_executions() {
+    let mut state = SessionState::default();
+    let delegate: Arc<dyn codex_code_mode_protocol::CodeModeSessionDelegate> =
+        Arc::new(NoopCodeModeSessionDelegate);
+    let mut request = request("execution");
+    request.completion_ready = true;
+    state
+        .begin_execution(&request, Arc::clone(&delegate))
+        .unwrap();
+    let event = grpc::CellCompletionReady {
+        execution_id: request.execution_id.clone(),
+        cell_id: "cell".to_string(),
+    };
+    // The lease stream can beat Execute's starting event to the client.
+    let (cell, target) = state.completion_ready(event.clone()).unwrap().unwrap();
+    assert_eq!(cell, CellId::new("cell".to_string()));
+    assert!(Arc::ptr_eq(&target, &delegate));
+    assert!(state.completion_ready(event.clone()).unwrap().is_none());
+    state
+        .admit_execution(&request.execution_id, "cell")
+        .unwrap();
+    assert!(
+        state
+            .mark_execution_ready(&request.execution_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(state.remove_execution(&request.execution_id).is_some());
+    assert!(state.completion_ready(event.clone()).unwrap().is_none());
+
+    request.completion_ready = false;
+    state.begin_execution(&request, delegate).unwrap();
+    assert!(state.completion_ready(event).unwrap().is_none());
 }
 
 fn tool_call(execution_id: &str, invocation_id: u128) -> grpc::ToolCall {

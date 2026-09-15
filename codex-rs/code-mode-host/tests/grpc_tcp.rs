@@ -144,6 +144,7 @@ async fn tcp_listener_opens_a_grpc_session() -> Result<()> {
         .context("failed to connect to gRPC code-mode host")?;
     let mut events = client
         .open_session(grpc::OpenSessionRequest {
+            completion_ready: false,
             cell_execution_limits: None,
         })
         .await

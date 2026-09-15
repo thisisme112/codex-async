@@ -168,6 +168,11 @@ pub enum HostToClient {
     },
     #[serde(rename = "delegate/cancel")]
     CancelDelegateRequest { id: DelegateRequestId },
+    #[serde(rename = "cell/completionReady")]
+    CellCompletionReady {
+        session_id: SessionId,
+        cell_id: WireCellId,
+    },
     #[serde(rename = "cell/closed")]
     CellClosed {
         session_id: SessionId,

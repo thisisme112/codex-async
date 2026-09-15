@@ -80,7 +80,8 @@ impl SessionInner {
             call_id = %request.tool_call_id,
         );
         let trace = codex_otel::span_w3c_trace_context(&execute_span);
-        let request = conversion::execute_request(&self.id, execution_id.clone(), request)?;
+        let mut request = conversion::execute_request(&self.id, execution_id.clone(), request)?;
+        request.completion_ready = self.completion_ready && delegate.wants_completion_ready();
         self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -113,6 +114,7 @@ impl SessionInner {
         let runtime_timeout =
             Duration::from_millis(request.yield_time_ms.unwrap_or(DEFAULT_EXEC_YIELD_TIME_MS))
                 .saturating_add(Duration::from_secs(1));
+        let completion_ready = request.completion_ready;
         let opening = async {
             let mut client = self.client();
             let mut request = tonic::Request::new(request);
@@ -170,7 +172,7 @@ impl SessionInner {
         };
         let (response_tx, response_rx) = oneshot::channel();
         let mut claim = ownership;
-        let started = StartedCell::from_future(cell_id.clone(), async move {
+        let mut started = StartedCell::from_future(cell_id.clone(), async move {
             let closure = claim
                 .session
                 .state
@@ -191,6 +193,10 @@ impl SessionInner {
             drop(claim);
             Ok(response)
         });
+        if completion_ready {
+            started.completion_ready_support =
+                codex_code_mode_protocol::CompletionReadySupport::Supported;
+        }
         if started_tx.send(Ok(started)).is_err() {
             return;
         }

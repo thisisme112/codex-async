@@ -40,6 +40,15 @@ impl CodeModeSessionDelegate for GenerationDelegate {
         )
     }
 
+    fn wants_completion_ready(&self) -> bool {
+        self.delegate.wants_completion_ready()
+    }
+
+    fn cell_completion_ready(&self, cell_id: &CellId) {
+        self.delegate
+            .cell_completion_ready(&public_cell_id(self.generation, cell_id));
+    }
+
     fn cell_closed(&self, cell_id: &CellId) {
         self.delegate
             .cell_closed(&public_cell_id(self.generation, cell_id));
@@ -72,12 +81,15 @@ pub(super) fn public_started_cell(generation: u64, started: StartedCell) -> Star
         return started;
     }
     let cell_id = public_cell_id(generation, &started.cell_id);
-    StartedCell::from_future(cell_id, async move {
+    let completion_ready_support = started.completion_ready_support;
+    let mut started = StartedCell::from_future(cell_id, async move {
         started
             .initial_response()
             .await
             .map(|response| public_runtime_response(generation, response))
-    })
+    });
+    started.completion_ready_support = completion_ready_support;
+    started
 }
 
 fn public_runtime_response(generation: u64, response: RuntimeResponse) -> RuntimeResponse {

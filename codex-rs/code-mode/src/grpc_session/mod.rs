@@ -30,7 +30,7 @@ use tonic::transport::Channel;
 use tracing::Instrument;
 
 use self::operations::WaitSlot;
-use self::state::ClosedCell;
+use self::state::CellDelegate;
 use self::state::SessionState;
 use self::transport::GrpcTransport;
 use self::transport::SharedTransport;
@@ -114,6 +114,7 @@ impl GrpcCodeModeSessionProvider {
         let open_session_span = tracing::info_span!("code_mode.grpc.open_session");
         let mut open_session_request = tonic::Request::new(grpc::OpenSessionRequest {
             cell_execution_limits,
+            completion_ready: true,
         });
         inject_span_traceparent(&mut open_session_request, &open_session_span);
         let (lease, first) = async {
@@ -135,6 +136,7 @@ impl GrpcCodeModeSessionProvider {
 
         let inner = Arc::new(SessionInner {
             id: opened.session_id,
+            completion_ready: opened.completion_ready,
             client,
             runtime: tokio::runtime::Handle::current(),
             state: Mutex::new(SessionState::default()),
@@ -246,6 +248,7 @@ impl Drop for GrpcCodeModeSession {
 
 pub(super) struct SessionInner {
     pub(super) id: String,
+    completion_ready: bool,
     pub(super) client: GrpcClient,
     runtime: tokio::runtime::Handle,
     state: Mutex<SessionState>,
@@ -273,7 +276,7 @@ impl SessionInner {
         Ok(())
     }
 
-    pub(super) fn report_closed_cell(&self, cell: Option<ClosedCell>) {
+    pub(super) fn report_closed_cell(&self, cell: Option<CellDelegate>) {
         if let Some((cell_id, delegate)) = cell {
             self.wait_slots
                 .lock()

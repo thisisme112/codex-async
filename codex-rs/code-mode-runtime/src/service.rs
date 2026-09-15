@@ -8,6 +8,7 @@ use codex_code_mode_protocol::CodeModeSessionCellExecutionLimits;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::CodeModeSessionResultFuture;
 use codex_code_mode_protocol::CodeModeToolKind;
+use codex_code_mode_protocol::CompletionReadySupport;
 use codex_code_mode_protocol::DEFAULT_EXEC_YIELD_TIME_MS;
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::ExecuteToPendingOutcome;
@@ -67,6 +68,11 @@ impl InProcessCodeModeSession {
         request: ExecuteRequest,
         delegate: Arc<dyn CodeModeSessionDelegate>,
     ) -> Result<StartedCell, String> {
+        let completion_ready_support = if delegate.wants_completion_ready() {
+            CompletionReadySupport::Supported
+        } else {
+            CompletionReadySupport::Unsupported
+        };
         let yield_time_ms = request.yield_time_ms.unwrap_or(DEFAULT_EXEC_YIELD_TIME_MS);
         let started = self
             .runtime
@@ -88,7 +94,9 @@ impl InProcessCodeModeSession {
                 .and_then(|event| runtime_response(&response_cell_id, event));
             let _ = response_tx.send(response);
         });
-        Ok(StartedCell::from_result_receiver(cell_id, response_rx))
+        let mut started = StartedCell::from_result_receiver(cell_id, response_rx);
+        started.completion_ready_support = completion_ready_support;
+        Ok(started)
     }
 
     pub async fn execute_to_pending(
@@ -293,6 +301,13 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
 
     fn cell_closed(&self, cell_id: &runtime::CellId) {
         self.delegate.cell_closed(&protocol_cell_id(cell_id));
+    }
+
+    fn cell_completion_ready(&self, cell_id: &runtime::CellId) {
+        if self.delegate.wants_completion_ready() {
+            self.delegate
+                .cell_completion_ready(&protocol_cell_id(cell_id));
+        }
     }
 }
 

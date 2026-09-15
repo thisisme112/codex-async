@@ -51,6 +51,10 @@ use uuid::Uuid;
 #[path = "turn_input_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "completion_withdrawal_tests.rs"]
+mod completion_withdrawal_tests;
+
 /// Why input is starting a turn; shared by admission and input delivery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TurnStartKind {
@@ -278,6 +282,7 @@ async fn start_or_steer(
     {
         Ok(turn_id) => {
             settings.apply_steered(session, submission_id).await?;
+            session.services.code_mode_service.completions.resume();
             Ok(TurnInputSubmission::Steered { turn_id })
         }
         Err(NotSubmittedReason::NoActiveTurn) => {
@@ -324,6 +329,7 @@ async fn start_or_steer(
             if has_explicit_input {
                 task_input.push(pending_turn_input(session, input).await);
             }
+            session.services.code_mode_service.completions.resume();
             session
                 .spawn_task(turn_context, task_input, RegularTask::new())
                 .await;
@@ -349,6 +355,11 @@ async fn start_if_idle(
         responsesapi_client_metadata,
         ..
     } = request;
+    let completion_trigger = start
+        .turn_trigger
+        .as_ref()
+        .filter(|trigger| trigger.starts_with(crate::tools::code_mode::completion::TRIGGER))
+        .cloned();
     if session.input_queue.has_trigger_turn_mailbox_items().await {
         return Ok(TurnInputSubmission::NotSubmitted {
             reason: NotSubmittedReason::PendingTriggerTurn,
@@ -387,7 +398,15 @@ async fn start_if_idle(
 
     let turn_state = {
         let mut active_turn = session.active_turn.lock().await;
-        if active_turn.is_some() {
+        if active_turn.is_some()
+            || completion_trigger.as_ref().is_some_and(|trigger| {
+                !session
+                    .services
+                    .code_mode_service
+                    .completions
+                    .permits(trigger)
+            })
+        {
             return Ok(TurnInputSubmission::NotSubmitted {
                 reason: NotSubmittedReason::NotIdle,
             });
@@ -397,7 +416,9 @@ async fn start_if_idle(
     };
 
     if session.input_queue.has_trigger_turn_mailbox_items().await {
-        session.clear_reserved_idle_turn(&turn_state).await;
+        session
+            .clear_reserved_idle_turn(&turn_state, completion_trigger.is_none())
+            .await;
         session.maybe_start_turn_for_pending_work().await;
         return Ok(TurnInputSubmission::NotSubmitted {
             reason: NotSubmittedReason::PendingTriggerTurn,
@@ -407,7 +428,9 @@ async fn start_if_idle(
     let settings = match PreparedTurnInputSettings::prepare(session, thread_settings, start).await {
         Ok(settings) => settings,
         Err(error) => {
-            session.clear_reserved_idle_turn(&turn_state).await;
+            session
+                .clear_reserved_idle_turn(&turn_state, completion_trigger.is_none())
+                .await;
             return Err(error);
         }
     };
@@ -417,16 +440,28 @@ async fn start_if_idle(
     {
         Ok(Some(turn_context)) => turn_context,
         Ok(None) => {
-            session.clear_reserved_idle_turn(&turn_state).await;
+            session
+                .clear_reserved_idle_turn(&turn_state, completion_trigger.is_none())
+                .await;
             return Ok(TurnInputSubmission::NotSubmitted {
                 reason: NotSubmittedReason::PlanMode,
             });
         }
         Err(error) => {
-            session.clear_reserved_idle_turn(&turn_state).await;
+            session
+                .clear_reserved_idle_turn(&turn_state, completion_trigger.is_none())
+                .await;
             return Err(error);
         }
     };
+    if let Some(trigger) = completion_trigger.as_ref() {
+        turn_context.extension_data.insert(
+            crate::tools::code_mode::completion::CompletionAdmission {
+                turn_state: Arc::clone(&turn_state),
+                trigger: trigger.clone(),
+            },
+        );
+    }
     if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
         turn_context
             .turn_metadata_state
@@ -461,9 +496,20 @@ async fn start_if_idle(
             // Recovery resumes an existing turn without a new empty user message.
         }
     }
-    session
-        .start_task(turn_context, task_input, RegularTask::new())
-        .await;
+    if matches!(kind, TurnStartKind::User | TurnStartKind::Recovery) {
+        session.services.code_mode_service.completions.resume();
+    }
+    if !session
+        .start_task_with_completion_admission(turn_context, task_input, RegularTask::new())
+        .await
+    {
+        session
+            .clear_reserved_idle_turn(&turn_state, completion_trigger.is_none())
+            .await;
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::NotIdle,
+        });
+    }
     Ok(TurnInputSubmission::Started {
         turn_id: submission_id,
     })
@@ -501,6 +547,7 @@ async fn steer(
     {
         Ok(turn_id) => {
             settings.apply_steered(session, submission_id).await?;
+            session.services.code_mode_service.completions.resume();
             Ok(TurnInputSubmission::Steered { turn_id })
         }
         Err(reason) => Ok(TurnInputSubmission::NotSubmitted { reason }),
@@ -556,13 +603,20 @@ impl Session {
         Ok(())
     }
 
-    async fn clear_reserved_idle_turn(&self, turn_state: &Arc<tokio::sync::Mutex<TurnState>>) {
+    async fn clear_reserved_idle_turn(
+        &self,
+        turn_state: &Arc<tokio::sync::Mutex<TurnState>>,
+        notify_on_withdrawal: bool,
+    ) {
         let mut active_turn_guard = self.active_turn.lock().await;
         if let Some(active_turn) = active_turn_guard.as_ref()
             && active_turn.task.is_none()
             && Arc::ptr_eq(&active_turn.turn_state, turn_state)
         {
             *active_turn_guard = None;
+            if notify_on_withdrawal {
+                self.services.code_mode_service.completions.activity();
+            }
         }
     }
 

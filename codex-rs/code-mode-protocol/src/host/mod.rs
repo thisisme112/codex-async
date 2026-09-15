@@ -12,6 +12,9 @@ mod types;
 /// Maximum number of unresolved delegate callbacks allowed per host connection.
 pub const MAX_PENDING_DELEGATE_CALLS: usize = 1_024;
 
+/// Negotiated support for non-consuming cell completion events.
+pub const CELL_COMPLETION_READY_CAPABILITY: &str = "cell-completion-ready";
+
 /// Negotiated support for cell execution resource limits on `session/open`.
 pub const SESSION_RESOURCE_LIMITS_CAPABILITY: &str = "session-cell-execution-resource-limits";
 

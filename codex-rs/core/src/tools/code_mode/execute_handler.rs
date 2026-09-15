@@ -66,6 +66,13 @@ impl CodeModeExecuteHandler {
         }
         enabled_tools.sort_by(|left, right| left.name.cmp(&right.name));
         enabled_tools.dedup_by(|left, right| left.name == right.name);
+        let mut completion = exec
+            .session
+            .services
+            .code_mode_service
+            .completions
+            .reserve(&call_id, &exec.turn.sub_id)
+            .map_err(FunctionCallError::RespondToModel)?;
         let started_at = std::time::Instant::now();
         let started_cell = exec
             .session
@@ -80,10 +87,14 @@ impl CodeModeExecuteHandler {
                     max_output_tokens: args.max_output_tokens,
                 },
                 Arc::clone(&step_context),
+                completion.as_ref(),
             )
             .await
             .map_err(FunctionCallError::RespondToModel)?;
         let cell_id = started_cell.cell_id.clone();
+        let wake_supported = completion.as_ref().is_some_and(|reservation| {
+            reservation.bind(&cell_id, started_cell.completion_ready_support)
+        });
         tracing::Span::current().record("cell.id", trace_id(cell_id.as_str()));
         telemetry.cell_id = Some(cell_id.to_string());
         exec.session
@@ -146,14 +157,26 @@ impl CodeModeExecuteHandler {
         let wall_time = response
             .code_mode_host_duration()
             .unwrap_or_else(|| started_at.elapsed());
-        handle_runtime_response(
+        let yielded = matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. });
+        let mut output = handle_runtime_response(
             &step_context.settings.model_info,
             response,
             args.max_output_tokens,
             wall_time,
         )
         .await
-        .map_err(FunctionCallError::RespondToModel)
+        .map_err(FunctionCallError::RespondToModel)?;
+        if yielded && wake_supported {
+            output.body.push(
+                codex_protocol::models::FunctionCallOutputContentItem::InputText {
+                    text: super::completion::GUIDANCE.to_string(),
+                },
+            );
+            if let Some(reservation) = completion.as_mut() {
+                reservation.yielded();
+            }
+        }
+        Ok(output)
     }
 }
 

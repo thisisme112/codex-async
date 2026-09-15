@@ -1,3 +1,4 @@
+mod completion_ready;
 mod description;
 pub mod grpc;
 pub mod host;
@@ -6,6 +7,7 @@ mod response;
 mod runtime;
 mod session;
 
+pub use completion_ready::CompletionReadySupport;
 pub use description::CODE_MODE_PRAGMA_PREFIX;
 pub use description::CodeModeToolKind;
 pub use description::EnabledToolMetadata;

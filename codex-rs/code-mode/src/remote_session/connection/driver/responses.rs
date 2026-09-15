@@ -104,6 +104,7 @@ impl ConnectionDriver {
             }
             HostToClient::Response { .. }
             | HostToClient::InitialResponse { .. }
+            | HostToClient::CellCompletionReady { .. }
             | HostToClient::CellClosed { .. }
             | HostToClient::CancelDelegateRequest { .. }
             | HostToClient::HostHello(_)
@@ -132,6 +133,15 @@ impl ConnectionDriver {
                     )
                 });
                 self.delegates.cancel(id);
+                true
+            }
+            HostToClient::CellCompletionReady {
+                session_id,
+                cell_id,
+            } => {
+                if self.completion_ready {
+                    self.sessions.completion_ready(&session_id, &cell_id);
+                }
                 true
             }
             HostToClient::CellClosed {
@@ -186,6 +196,8 @@ impl ConnectionDriver {
                 Ok(HostResponse::ExecutionStarted { cell_id }) => {
                     // The host owns a checked, never-reused ID sequence. Retain only live
                     // IDs so client memory scales with concurrency, not session lifetime.
+                    let completion_ready =
+                        self.completion_ready && delegate.wants_completion_ready();
                     let remote_cell_id = cell_id.clone();
                     let public_id = match self.sessions.admit_cell(&session, cell_id, delegate) {
                         Ok(public_id) => public_id,
@@ -213,7 +225,12 @@ impl ConnectionDriver {
                             response_tx: initial_response_tx,
                         },
                     );
-                    let started = StartedCell::from_result_receiver(public_id, initial_response_rx);
+                    let mut started =
+                        StartedCell::from_result_receiver(public_id, initial_response_rx);
+                    if completion_ready {
+                        started.completion_ready_support =
+                            codex_code_mode_protocol::CompletionReadySupport::Supported;
+                    }
                     if cancellation.is_cancelled() || response_tx.is_closed() {
                         return self.terminate_abandoned_cell(session, remote_cell_id);
                     }

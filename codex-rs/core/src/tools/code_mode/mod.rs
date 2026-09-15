@@ -1,3 +1,4 @@
+pub(crate) mod completion;
 mod delegate;
 mod execute_handler;
 pub(crate) mod execute_spec;
@@ -70,6 +71,7 @@ pub(crate) struct ExecContext {
 }
 
 pub(crate) struct CodeModeService {
+    pub(crate) completions: Arc<completion::Completions>,
     session: OnceCell<Arc<dyn CodeModeSession>>,
     session_provider: Arc<dyn CodeModeSessionProvider>,
     availability: Result<(), String>,
@@ -77,6 +79,12 @@ pub(crate) struct CodeModeService {
     default_exec_yield_time_ms: u64,
     shutdown_token: CancellationToken,
     unavailable_warning_emitted: AtomicBool,
+}
+
+impl Drop for CodeModeService {
+    fn drop(&mut self) {
+        self.completions.shutdown();
+    }
 }
 
 impl CodeModeService {
@@ -89,6 +97,7 @@ impl CodeModeService {
         let dispatch_broker = Arc::new(CodeModeDispatchBroker::new(thread_id, executed_tool_calls));
         let availability = session_provider.availability();
         Self {
+            completions: Arc::default(),
             session: OnceCell::new(),
             session_provider,
             availability,
@@ -123,18 +132,24 @@ impl CodeModeService {
         Arc::clone(&self.session_provider)
     }
 
-    pub(crate) async fn execute(
+    async fn execute(
         &self,
         mut request: codex_code_mode::ExecuteRequest,
         step_context: Arc<StepContext>,
+        completion: Option<&completion::Reservation>,
     ) -> Result<codex_code_mode::StartedCell, String> {
         request
             .yield_time_ms
             .get_or_insert(self.default_exec_yield_time_ms);
-        let delegate = Arc::new(CodeModeCellDelegate {
-            broker: Arc::clone(&self.dispatch_broker),
-            step_context,
-        });
+        let delegate: Arc<dyn codex_code_mode::CodeModeSessionDelegate> =
+            Arc::new(CodeModeCellDelegate {
+                broker: Arc::clone(&self.dispatch_broker),
+                step_context,
+            });
+        let delegate = match completion {
+            Some(reservation) => completion::CompletionDelegate::wrap(delegate, reservation),
+            None => delegate,
+        };
         self.session().await?.execute(request, delegate).await
     }
 
@@ -142,13 +157,23 @@ impl CodeModeService {
         &self,
         request: codex_code_mode::WaitRequest,
     ) -> Result<codex_code_mode::WaitOutcome, String> {
-        self.session().await?.wait(request).await
+        let cell_id = request.cell_id.clone();
+        let outcome = self.session().await?.wait(request).await?;
+        if !matches!(
+            &outcome,
+            codex_code_mode::WaitOutcome::LiveCell(RuntimeResponse::Yielded { .. })
+        ) {
+            // The result is already claimed even if a remote cleanup callback is delayed.
+            self.completions.retire_cell(&cell_id);
+        }
+        Ok(outcome)
     }
 
     pub(crate) async fn terminate(
         &self,
         cell_id: CellId,
     ) -> Result<codex_code_mode::WaitOutcome, String> {
+        self.completions.retire_cell(&cell_id);
         self.session().await?.terminate(cell_id).await
     }
 
@@ -170,6 +195,7 @@ impl CodeModeService {
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), String> {
+        self.completions.shutdown();
         self.shutdown_token.cancel();
         // Join any initialization already in progress without initializing an unused service.
         match self

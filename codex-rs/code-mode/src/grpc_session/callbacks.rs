@@ -90,6 +90,22 @@ impl SessionInner {
                 self.handle_notification(notification)
             }
             grpc::session_event::Event::NotificationCancelled(_) => Ok(()),
+            grpc::session_event::Event::CellCompletionReady(ready) => {
+                if !self.completion_ready {
+                    return Ok(());
+                }
+                let target = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .completion_ready(ready)?;
+                if let Some((cell_id, delegate)) = target {
+                    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        delegate.cell_completion_ready(&cell_id)
+                    }));
+                }
+                Ok(())
+            }
             grpc::session_event::Event::CellClosed(closed) => {
                 let cell = self
                     .state

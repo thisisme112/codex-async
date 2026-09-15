@@ -60,7 +60,7 @@ const OUTGOING_CHANNEL_CAPACITY: usize = 128;
 
 enum NegotiatedConnection {
     Rejected,
-    Accepted,
+    Accepted(CapabilitySet),
 }
 
 struct HostLimits {
@@ -109,12 +109,16 @@ where
 {
     let mut reader = FramedReader::new(reader);
     let mut writer = FramedWriter::new(writer);
-    match negotiate(&mut reader, &mut writer).await? {
+    let capabilities = match negotiate(&mut reader, &mut writer).await? {
         NegotiatedConnection::Rejected => return Ok(()),
-        NegotiatedConnection::Accepted => {}
-    }
+        NegotiatedConnection::Accepted(capabilities) => capabilities,
+    };
     let (outgoing_tx, outgoing_rx) = mpsc::channel::<EncodedFrame>(OUTGOING_CHANNEL_CAPACITY);
-    let peer = Arc::new(HostPeer::new(outgoing_tx));
+    let mut peer = HostPeer::new(outgoing_tx);
+    peer.completion_ready = capabilities.iter().any(|capability| {
+        capability.as_str() == codex_code_mode_protocol::host::CELL_COMPLETION_READY_CAPABILITY
+    });
+    let peer = Arc::new(peer);
     let state = Arc::new(HostState {
         sessions: Mutex::new(HashMap::new()),
         limits: Arc::new(HostLimits::new()),
@@ -253,15 +257,20 @@ async fn negotiate<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         return Ok(NegotiatedConnection::Rejected);
     }
 
-    let resource_limits_capability = Capability::new(SESSION_RESOURCE_LIMITS_CAPABILITY)?;
-    let resource_limits_requested = client_hello
-        .required_capabilities()
-        .contains(&resource_limits_capability)
-        || client_hello
-            .optional_capabilities()
-            .contains(&resource_limits_capability);
-    let host_capabilities =
-        CapabilitySet::try_new(resource_limits_requested.then_some(resource_limits_capability))?;
+    let host_capabilities = CapabilitySet::try_new(
+        [
+            SESSION_RESOURCE_LIMITS_CAPABILITY,
+            codex_code_mode_protocol::host::CELL_COMPLETION_READY_CAPABILITY,
+        ]
+        .into_iter()
+        .map(Capability::new)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|capability| {
+            client_hello.required_capabilities().contains(capability)
+                || client_hello.optional_capabilities().contains(capability)
+        }),
+    )?;
     if let Some(capability) = client_hello
         .required_capabilities()
         .iter()
@@ -278,12 +287,12 @@ async fn negotiate<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         return Ok(NegotiatedConnection::Rejected);
     }
 
-    let hello = HostHello::new(ProtocolVersion::V1, host_capabilities);
+    let hello = HostHello::new(ProtocolVersion::V1, host_capabilities.clone());
     writer
         .write(&HostToClient::HostHello(hello))
         .await
         .context("failed to write code-mode host hello")?;
-    Ok(NegotiatedConnection::Accepted)
+    Ok(NegotiatedConnection::Accepted(host_capabilities))
 }
 
 struct HostState {
@@ -388,6 +397,7 @@ impl HostState {
                     self.respond(request_id, Err("code-mode request cancelled".to_string()));
                     return;
                 }
+                let completion_ready = request.completion_ready && self.peer.completion_ready;
                 let request = match request.try_into() {
                     Ok(request) => request,
                     Err(err) => {
@@ -412,10 +422,9 @@ impl HostState {
                     );
                     return;
                 };
-                let delegate = Arc::new(RemoteDelegate::new(
-                    session_id.clone(),
-                    Arc::clone(&self.peer),
-                ));
+                let mut delegate = RemoteDelegate::new(session_id.clone(), Arc::clone(&self.peer));
+                delegate.completion_ready = completion_ready;
+                let delegate = Arc::new(delegate);
                 let result = session.execute(request, delegate).await;
                 match result {
                     Ok(started) => {

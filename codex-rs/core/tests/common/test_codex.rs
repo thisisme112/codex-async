@@ -341,9 +341,18 @@ pub struct TestCodexBuilder {
     code_mode_host_program: Option<PathBuf>,
     history_mode: Option<ThreadHistoryMode>,
     models_manager: Option<SharedModelsManager>,
+    thread_manager_mutator: Option<Box<dyn FnOnce(ThreadManager) -> ThreadManager + Send>>,
 }
 
 impl TestCodexBuilder {
+    pub fn with_thread_manager(
+        mut self,
+        configure: impl FnOnce(ThreadManager) -> ThreadManager + Send + 'static,
+    ) -> Self {
+        self.thread_manager_mutator = Some(Box::new(configure));
+        self
+    }
+
     pub fn with_config<T>(mut self, mutator: T) -> Self
     where
         T: FnOnce(&mut Config) + Send + 'static,
@@ -741,6 +750,10 @@ impl TestCodexBuilder {
             )
         } else {
             thread_manager
+        };
+        let thread_manager = match self.thread_manager_mutator.take() {
+            Some(configure) => configure(thread_manager),
+            None => thread_manager,
         };
         let thread_manager = Arc::new(thread_manager);
         let user_shell_override = self.user_shell_override.clone();
@@ -1387,6 +1400,7 @@ pub fn test_codex() -> TestCodexBuilder {
         code_mode_host_program: None,
         history_mode: None,
         models_manager: None,
+        thread_manager_mutator: None,
     }
 }
 

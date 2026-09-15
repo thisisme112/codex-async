@@ -163,6 +163,7 @@ mod line_truncation;
 pub(crate) mod live_wrap;
 mod local_settings;
 pub use live_wrap::RowBuilder;
+mod code_mode_startup;
 mod local_chatgpt_auth;
 mod managed_new_thread_defaults;
 mod markdown;
@@ -291,7 +292,7 @@ async fn start_embedded_app_server(
         log_db,
         state_db,
         environment_manager,
-        InProcessAppServerClient::start,
+        InProcessAppServerClient::start_interactive,
     )
     .await
 }

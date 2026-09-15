@@ -135,6 +135,8 @@ pub(crate) trait SessionRuntimeDelegate: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), String>> + Send;
 
     fn cell_closed(&self, cell_id: &CellId);
+
+    fn cell_completion_ready(&self, _cell_id: &CellId) {}
 }
 
 /// A failure reported by a session runtime operation.

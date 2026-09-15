@@ -36,6 +36,7 @@ pub(super) struct DriverLifecycle {
 }
 
 pub(super) struct ConnectionDriver {
+    pub(super) completion_ready: bool,
     command_rx: mpsc::Receiver<DriverCommand>,
     event_rx: mpsc::Receiver<DriverEvent>,
     event_tx: mpsc::Sender<DriverEvent>,
@@ -62,6 +63,7 @@ impl ConnectionDriver {
         let (execute_claim_tx, execute_claim_rx) = mpsc::unbounded_channel();
         (
             Self {
+                completion_ready: false,
                 command_rx,
                 event_rx,
                 event_tx: event_tx.clone(),
