@@ -931,7 +931,9 @@ impl NetworkApprovalService {
             retry_reason: Some(policy_denial_message.clone()),
             network_approval_context: Some(network_approval_context.clone()),
         };
-        let approval = async {
+        // Reviewer futures are large in unoptimized builds. Keep their state
+        // behind indirection rather than embedding it in every caller's stack.
+        let approval = Box::pin(async {
             let origin = owner_call
                 .as_ref()
                 .map(|call| call.prompt_origin)
@@ -956,7 +958,7 @@ impl NetworkApprovalService {
                     let timing_call_id = owner_call
                         .as_ref()
                         .map(|call| call.trigger.call_id.as_str());
-                    async move {
+                    Box::pin(async move {
                         let mut pending_owner = pending_owner.lock().await;
                         let user_prompt = pending_owner.review_user_prompt(
                             session,
@@ -968,7 +970,7 @@ impl NetworkApprovalService {
                         session
                             .request_approval_with_user_prompt(&action, &ctx, user_prompt)
                             .await
-                    }
+                    })
                 })
                 .await
                 .unwrap_or(crate::tools::approvals::ApprovalResult {
@@ -978,7 +980,7 @@ impl NetworkApprovalService {
                     source: None,
                     cancellation_reason: None,
                 })
-        };
+        });
         let approval_result = if let Some(owner_call) = &owner_call {
             // A ready review result takes precedence over concurrent cancellation.
             let Some(result) = owner_call

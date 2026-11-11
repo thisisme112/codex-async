@@ -142,6 +142,11 @@ async fn execution_cancellation_respects_network_approval_boundary(
         cancellation: None,
     };
     let decision = service.handle_inline_policy_request(Arc::clone(&session), request.clone());
+    let future_bytes = std::mem::size_of_val(&decision);
+    assert!(
+        future_bytes < 128 * 1024,
+        "network review future must fit comfortably on the default test stack: {future_bytes} bytes"
+    );
     tokio::pin!(decision);
     if idle {
         assert!(poll!(decision.as_mut()).is_pending());
