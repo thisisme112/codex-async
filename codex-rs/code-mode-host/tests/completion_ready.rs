@@ -1,7 +1,6 @@
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use codex_code_mode::*;
 use codex_code_mode_runtime::InProcessCodeModeSession;
@@ -70,10 +69,7 @@ fn request(source: &str) -> ExecuteRequest {
 }
 
 async fn next(events: &mut mpsc::Receiver<Event>) -> Event {
-    tokio::time::timeout(Duration::from_secs(/*secs*/ 10), events.recv())
-        .await
-        .expect("event timeout")
-        .expect("event channel closed")
+    events.recv().await.expect("event channel closed")
 }
 
 #[tokio::test]

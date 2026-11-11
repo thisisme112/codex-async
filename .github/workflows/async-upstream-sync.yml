@@ -1,6 +1,15 @@
 name: Async fork upstream sync
 
 on:
+  push:
+    branches: ['integration/official-*']
+    paths:
+      - 'codex-rs/**'
+      - 'scripts/async_fork/**'
+      - 'scripts/codex_package/**'
+      - 'third_party/v8/**'
+      - '.github/workflows/async-upstream-sync.yml'
+      - 'justfile'
   schedule:
     - cron: '23 19 * * *' # 03:23 Asia/Shanghai
   workflow_dispatch:
@@ -23,7 +32,7 @@ concurrency:
 
 jobs:
   prepare:
-    if: '!inputs.verify_only'
+    if: github.event_name != 'push' && !inputs.verify_only
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     outputs:
@@ -105,7 +114,7 @@ jobs:
           retention-days: 7
 
   verify_manual_merge:
-    if: inputs.verify_only && !inputs.check_only
+    if: github.event_name == 'push' || (inputs.verify_only && !inputs.check_only)
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     permissions:

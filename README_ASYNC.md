@@ -30,7 +30,7 @@ python3 scripts/async_fork/sync.py check
 python3 scripts/async_fork/sync.py prepare --output /tmp/codex-async-sync
 ```
 
-`prepare` 不更新可用分支。`promote` 只用于已完成编译和测试的候选版本，不应绕过验证手工调用。手动 Actions 运行时勾选 `check_only` 可以只检查合并情况，不编译、不发布。需要验证手工处理冲突的分支时，选择该分支并勾选 `verify_only`，保持 `check_only` 不勾选；此模式编译和测试选中提交，但不会自动发布。
+`prepare` 不更新可用分支。`promote` 只用于已完成编译和测试的候选版本，不应绕过验证手工调用。手动 Actions 运行时勾选 `check_only` 可以只检查合并情况，不编译、不发布。需要验证手工处理冲突的分支时，选择该分支并勾选 `verify_only`，保持 `check_only` 不勾选；此模式编译和测试选中提交，但不会自动发布。`integration/official-*` 适配分支的代码或验证脚本推送也会自动触发同样的只读验证。
 
 ## 构建与使用
 

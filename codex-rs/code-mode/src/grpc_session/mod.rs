@@ -264,6 +264,7 @@ impl GrpcCodeModeSessionProvider {
 
         let inner = Arc::new(SessionInner {
             id: opened.session_id,
+            completion_ready: opened.completion_ready,
             output_truncation,
             route,
             runtime: tokio::runtime::Handle::current(),
@@ -405,6 +406,7 @@ impl Drop for GrpcCodeModeSession {
 
 pub(super) struct SessionInner {
     pub(super) id: String,
+    completion_ready: bool,
     output_truncation: CodeModeOutputTruncation,
     // Affinity belongs to the session: parents and children may share a transport
     // while being admitted to different hosts. The token is opaque to Codex.

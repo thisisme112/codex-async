@@ -191,6 +191,7 @@ async fn embedded_client_completion_wake_is_default_and_ordinary_client_stays_op
                 /*log_db*/ None,
                 state_db,
                 Arc::new(EnvironmentManager::default_for_tests()),
+                codex_app_server_client::EmbeddedNetworkPolicy::default(),
                 InProcessAppServerClient::start,
             )
             .await?

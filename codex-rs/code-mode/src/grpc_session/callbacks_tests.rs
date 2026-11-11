@@ -51,6 +51,7 @@ async fn missing_invocation_completion_racing_cancellation_preserves_session() {
 fn session(client: GrpcClient) -> Arc<SessionInner> {
     let client = Arc::new(client);
     Arc::new(SessionInner {
+        completion_ready: false,
         id: "session".to_string(),
         output_truncation: CodeModeOutputTruncation::Client,
         route: None,

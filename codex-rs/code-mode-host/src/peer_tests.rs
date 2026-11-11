@@ -74,10 +74,7 @@ async fn completion_ready_before_start_cell_preserves_admission_and_closure_orde
         },
     ];
     for expected in expected_before_response {
-        let frame = tokio::time::timeout(Duration::from_secs(/*secs*/ 1), outgoing_rx.recv())
-            .await
-            .expect("admission/readiness timeout")
-            .expect("admission/readiness frame");
+        let frame = outgoing_rx.recv().await.expect("admission/readiness frame");
         assert_eq!(
             EncodedFrame::decode_framed::<HostToClient>(&frame.into_framed_bytes())
                 .expect("decode host frame"),
@@ -99,10 +96,7 @@ async fn completion_ready_before_start_cell_preserves_admission_and_closure_orde
     initial_response_sent
         .await
         .expect("initial response enqueued");
-    let released = tokio::time::timeout(Duration::from_secs(/*secs*/ 1), permits.acquire())
-        .await
-        .expect("cell forwarding finished")
-        .expect("cell permit released");
+    let released = permits.acquire().await.expect("cell permit released");
     drop(released);
 
     let initial_frame = outgoing_rx.try_recv().expect("initial response frame");

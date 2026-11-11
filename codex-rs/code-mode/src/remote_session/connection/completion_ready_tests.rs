@@ -42,6 +42,7 @@ async fn readiness_requires_acknowledgment_and_preserves_generation_identity() {
         harness
             .command_tx
             .send(DriverCommand::Execute {
+                yield_signal: None,
                 session: session.clone(),
                 delegate: Arc::new(CompletionDelegate(sender)),
                 request: ExecuteRequest {
