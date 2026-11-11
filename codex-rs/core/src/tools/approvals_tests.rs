@@ -230,8 +230,10 @@ async fn explicit_mcp_reviewer_override_takes_precedence_over_action_context() {
     };
 
     let prompt = session.request_user_approval(&action, &context);
+    let approval = session.request_reviewer_approval(&action, &context, prompt);
+    tokio::pin!(approval);
     tokio::select! {
-        resolution = session.request_reviewer_approval(&action, &context, prompt) => {
+        resolution = &mut approval => {
             panic!("expected a user approval request, got {resolution:?}");
         }
         event = events.recv() => {
@@ -266,6 +268,7 @@ async fn explicit_mcp_reviewer_override_takes_precedence_over_action_context() {
         ApprovalResolution {
             decision: ReviewDecision::Approved,
             source: ApprovalResolutionSource::User,
+            cancellation_reason: None,
         }
     );
 }

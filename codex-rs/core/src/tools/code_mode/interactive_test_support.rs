@@ -3,6 +3,7 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use codex_hooks::HookMcpCall;
 use codex_hooks::HookMcpExecutor;
+use codex_hooks::HookMcpOutput;
 use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
 use std::sync::Arc;
@@ -17,7 +18,10 @@ pub(crate) struct ReviewHook {
     pub(crate) turns: Mutex<Vec<String>>,
 }
 impl HookMcpExecutor for ReviewHook {
-    fn execute(&self, call: HookMcpCall) -> futures::future::BoxFuture<'_, anyhow::Result<String>> {
+    fn execute(
+        &self,
+        call: HookMcpCall,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<HookMcpOutput>> {
         Box::pin(async move {
             let first = {
                 let mut turns = self.turns.lock().unwrap();
@@ -28,7 +32,11 @@ impl HookMcpExecutor for ReviewHook {
                 self.entered.notify_one();
                 self.release.notified().await;
             }
-            Ok(String::new()) // No decision: continue through the real reviewer/user path.
+            // No decision: continue through the real reviewer/user path.
+            Ok(HookMcpOutput {
+                text: String::new(),
+                source_tool_namespace: None,
+            })
         })
     }
 }
