@@ -88,6 +88,7 @@ async fn completion_ready_before_start_cell_preserves_admission_and_closure_orde
         cell_id: cell_id.clone(),
         content_items: Vec::new(),
         error_text: None,
+        result_buffered_for: Duration::ZERO,
         code_mode_host_duration: None,
     };
     response_tx

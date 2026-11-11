@@ -283,7 +283,11 @@ impl Completions {
             };
             notice.0.push(cell_id.clone());
             // Conservative hard cap: ASCII text cannot exceed one token per byte.
-            if notice.render().into_text().is_none_or(|text| text.len() > 512) {
+            if notice
+                .render()
+                .into_text()
+                .is_none_or(|text| text.len() > 512)
+            {
                 notice.0.pop();
                 break;
             }

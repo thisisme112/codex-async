@@ -537,28 +537,29 @@ impl UnifiedExecProcessManager {
         context: &UnifiedExecContext,
         mut completion: Option<&mut Completion<'_>>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
-        let mut wake =
-            if completion.is_none() && !request.prepared.turn_environment.environment().is_remote() {
-                match context
-                    .session
-                    .services
-                    .code_mode_service
-                    .completions
-                    .reserve_command(
-                        &context.call_id,
-                        &context.step_context.turn.sub_id,
-                        request.process_id,
-                        context.completion_owner.as_ref(),
-                    ) {
-                    Ok(wake) => wake,
-                    Err(message) => {
-                        self.release_process_id(request.process_id).await;
-                        return Err(UnifiedExecError::process_failed(message));
-                    }
+        let mut wake = if completion.is_none()
+            && !request.prepared.turn_environment.environment().is_remote()
+        {
+            match context
+                .session
+                .services
+                .code_mode_service
+                .completions
+                .reserve_command(
+                    &context.call_id,
+                    &context.step_context.turn.sub_id,
+                    request.process_id,
+                    context.completion_owner.as_ref(),
+                ) {
+                Ok(wake) => wake,
+                Err(message) => {
+                    self.release_process_id(request.process_id).await;
+                    return Err(UnifiedExecError::process_failed(message));
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
         let prepared = &request.prepared;
         let command = &prepared.resolved.command;
         let cwd = prepared.cwd.clone();

@@ -154,12 +154,7 @@ async fn embedded_client_completion_wake_is_default_and_ordinary_client_stays_op
             Some(AbsolutePathBuf::from_absolute_path_checked(
                 home.path().join("daemon.sock"),
             )?),
-            can_reuse_implicit_local_daemon(
-                &[],
-                &LoaderOverrides::default(),
-                /*strict_config*/ false,
-                /*has_non_replayable_launch_overrides*/ false,
-            ),
+            /*can_reuse_implicit_local_daemon*/ true,
             /*workload_identity_selected*/ false,
             /*exec_server_url*/ None,
         )?;

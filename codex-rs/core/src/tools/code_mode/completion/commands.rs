@@ -136,7 +136,11 @@ impl Completions {
                 continue;
             };
             notice.0.push(command.process_id);
-            if notice.render().into_text().is_none_or(|text| text.len() > 512) {
+            if notice
+                .render()
+                .into_text()
+                .is_none_or(|text| text.len() > 512)
+            {
                 notice.0.pop();
                 break;
             }
