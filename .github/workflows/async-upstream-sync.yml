@@ -9,6 +9,10 @@ on:
         description: Only inspect/merge; skip expensive Rust validation and publication
         type: boolean
         default: false
+      verify_only:
+        description: Validate the selected branch after manual conflict resolution; do not publish
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -19,6 +23,7 @@ concurrency:
 
 jobs:
   prepare:
+    if: '!inputs.verify_only'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     outputs:
@@ -61,6 +66,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
+      ASYNC_BUILD_JOBS: '2'
       CARGO_BUILD_JOBS: '1'
       CARGO_INCREMENTAL: '0'
       RAYON_NUM_THREADS: '1'
@@ -86,9 +92,53 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libcap-dev pkg-config libssl-dev
       - name: Validate CLI and asynchronous behavior
+        shell: bash
         run: |
           CORES=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
-          nice -n 15 taskset -c "$CORES" bash scripts/async_fork/validate.sh
+          nice -n 15 taskset -c "$CORES" bash scripts/async_fork/validate.sh 2>&1 | tee "$RUNNER_TEMP/async-validation.log"
+      - name: Keep validation logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: async-validation-log
+          path: ${{ runner.temp }}/async-validation.log
+          retention-days: 7
+
+  verify_manual_merge:
+    if: inputs.verify_only && !inputs.check_only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      ASYNC_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check synchronization safeguards and feature contract
+        run: |
+          python3 -m unittest discover -s scripts/async_fork -p 'test_*.py' -v
+          python3 scripts/async_fork/sync.py check
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libcap-dev pkg-config libssl-dev
+      - name: Validate the selected commit conservatively
+        shell: bash
+        run: |
+          set -o pipefail
+          CORES=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
+          nice -n 15 taskset -c "$CORES" bash scripts/async_fork/validate.sh 2>&1 | tee "$RUNNER_TEMP/async-validation.log"
+      - name: Keep validation logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: async-manual-validation-log
+          path: ${{ runner.temp }}/async-validation.log
+          retention-days: 7
 
   publish:
     needs: [prepare, validate]
