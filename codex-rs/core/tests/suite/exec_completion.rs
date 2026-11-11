@@ -387,7 +387,7 @@ async fn completion_capability_reaches_model_instructions_and_tools(
         test.submit_turn("Which tools are available?").await?;
         let request = mock.single_request();
         let body = request.body_json();
-        let instructions = body["instructions"].as_str().expect("model instructions");
+        let instructions = request.instructions_text();
         assert_eq!(
             instructions.matches("<background_execution>").count(),
             usize::from(enabled)

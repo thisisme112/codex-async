@@ -128,6 +128,13 @@ pub(super) fn builder(
                 .features
                 .enable(Feature::CodeMode)
                 .expect("enable Code Mode");
+            // The upstream harness installs its process host after the manager
+            // configurer. Keep it from replacing this controlled provider.
+            // Real process-host callbacks are exercised by the timer/MCP tests.
+            config
+                .features
+                .disable(Feature::CodeModeHost)
+                .expect("preserve controlled Code Mode provider");
         })
         .with_thread_manager(move |manager| {
             if client {

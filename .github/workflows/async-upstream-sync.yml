@@ -2,7 +2,7 @@ name: Async fork upstream sync
 
 on:
   push:
-    branches: ['integration/official-*']
+    branches: ['integration/official-*', 'integration/async-*']
     paths:
       - 'codex-rs/**'
       - 'scripts/async_fork/**'
@@ -133,7 +133,9 @@ jobs:
       fail-fast: false
       max-parallel: 3
       matrix:
-        suite: [runtime, core, cli]
+        # Fixture-only repairs can reuse successful runtime/core-unit/CLI runs.
+        # Scheduled upstream candidates still validate all three suites above.
+        suite: ${{ fromJSON(startsWith(github.ref, 'refs/heads/integration/async-') && '["async"]' || '["runtime","core","cli"]') }}
     permissions:
       contents: read
     env:

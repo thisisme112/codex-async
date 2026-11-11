@@ -7,7 +7,7 @@ STABLE_GIT_COMMIT=$(git rev-parse HEAD)
 BUILD_JOBS=${ASYNC_BUILD_JOBS:-1}
 case "$BUILD_JOBS" in 1|2) ;; *) echo 'ASYNC_BUILD_JOBS must be 1 or 2' >&2; exit 1 ;; esac
 SUITE=${ASYNC_VALIDATION_SUITE:-all}
-case "$SUITE" in all|runtime|core|cli) ;; *) echo 'Unknown ASYNC_VALIDATION_SUITE' >&2; exit 1 ;; esac
+case "$SUITE" in all|runtime|core|cli|async) ;; *) echo 'Unknown ASYNC_VALIDATION_SUITE' >&2; exit 1 ;; esac
 echo "Validating suite=$SUITE with build_jobs=$BUILD_JOBS"
 export CARGO_BUILD_JOBS="$BUILD_JOBS" CARGO_INCREMENTAL=0 RAYON_NUM_THREADS="$BUILD_JOBS" CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS"
 export CARGO_TARGET_DIR="$REPO_ROOT/codex-rs/target/async-ci"
@@ -91,6 +91,8 @@ if [[ "$SUITE" == all || "$SUITE" == runtime ]]; then
 fi
 if [[ "$SUITE" == all || "$SUITE" == core ]]; then
   just test -p codex-core --lib --cargo-profile dev-small -j 1 -E 'test(tools::code_mode) | test(tools::context) | test(tools::handlers::unified_exec::tests) | test(tools::handlers::shell_spec::tests) | test(tools::network_approval) | test(unified_exec::) | test(session::completion_withdrawal)'
+fi
+if [[ "$SUITE" == all || "$SUITE" == core || "$SUITE" == async ]]; then
   just test -p codex-core --test async_completion --cargo-profile dev-small -j 1
 fi
 if [[ "$SUITE" == all || "$SUITE" == cli ]]; then
