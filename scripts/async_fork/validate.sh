@@ -8,6 +8,27 @@ BUILD_JOBS=${ASYNC_BUILD_JOBS:-1}
 case "$BUILD_JOBS" in 1|2) ;; *) echo 'ASYNC_BUILD_JOBS must be 1 or 2' >&2; exit 1 ;; esac
 export CARGO_BUILD_JOBS="$BUILD_JOBS" CARGO_INCREMENTAL=0 RAYON_NUM_THREADS="$BUILD_JOBS" CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS"
 export CARGO_TARGET_DIR="$REPO_ROOT/codex-rs/target/async-ci"
+
+# Rust can spend several minutes on one crate without printing a new line.
+# Keep resource telemetry in the same durable log without making model requests.
+python3 -u - "$REPO_ROOT" <<'PY' &
+import datetime
+import shutil
+import sys
+import time
+from pathlib import Path
+
+while True:
+    memory = dict(line.split(':', 1) for line in Path('/proc/meminfo').read_text().splitlines())
+    available_mib = int(memory['MemAvailable'].split()[0]) // 1024
+    free_mib = shutil.disk_usage(sys.argv[1]).free // (1024 * 1024)
+    timestamp = datetime.datetime.now(datetime.UTC).isoformat(timespec='seconds')
+    print(f'[build heartbeat] {timestamp} available_memory={available_mib}MiB free_disk={free_mib}MiB', flush=True)
+    time.sleep(60)
+PY
+MONITOR_PID=$!
+trap 'kill "$MONITOR_PID" 2>/dev/null || true; wait "$MONITOR_PID" 2>/dev/null || true' EXIT
+
 TOOLS="$RUNNER_TEMP/async-ci-tools"
 mkdir -p "$TOOLS"
 export PATH="$TOOLS:$PATH"
