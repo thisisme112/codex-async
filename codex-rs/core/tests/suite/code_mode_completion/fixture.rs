@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use codex_code_mode::*;
 use codex_features::Feature;
@@ -23,6 +24,7 @@ impl ControlledSession {
                 text: "retained result".to_string(),
             }],
             error_text: None,
+            result_buffered_for: Duration::ZERO,
             code_mode_host_duration: None,
         });
         if let Some(delegate) = self.delegate.lock().expect("delegate lock").as_ref()

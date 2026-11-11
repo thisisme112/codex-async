@@ -7,6 +7,7 @@ use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 use tokio::sync::Notify;
 
 #[derive(Default)]
@@ -88,6 +89,7 @@ pub(crate) async fn sibling_cell_attempt(turn: Arc<TurnContext>, source: &str) {
                         cell_id,
                         content_items: Vec::new(),
                         error_text: None,
+                        result_buffered_for: Duration::ZERO,
                         code_mode_host_duration: None,
                     })
                 }))
