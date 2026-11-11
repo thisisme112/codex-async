@@ -81,12 +81,12 @@ async fn completion_contract_across_providers() {
         codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").unwrap(),
     );
     let grpc = GrpcCodeModeSessionProvider::new(&host.endpoint);
-    let sessions: Vec<Arc<dyn CodeModeSession>> = vec![
-        Arc::new(InProcessCodeModeSession::new()),
-        stdio.create_session().await.unwrap(),
-        grpc.create_session().await.unwrap(),
+    let sessions: Vec<(&str, Arc<dyn CodeModeSession>)> = vec![
+        ("in-process", Arc::new(InProcessCodeModeSession::new())),
+        ("stdio", stdio.create_session().await.unwrap()),
+        ("grpc", grpc.create_session().await.unwrap()),
     ];
-    for session in sessions {
+    for (provider, session) in sessions {
         for enabled in [true, false] {
             for ending in ["", "throw new Error('script failed');"] {
                 let (events, mut receiver) = mpsc::channel(/*buffer*/ 4);
@@ -107,7 +107,8 @@ async fn completion_contract_across_providers() {
                         CompletionReadySupport::Supported
                     } else {
                         CompletionReadySupport::Unsupported
-                    }
+                    },
+                    "provider={provider}, enabled={enabled}"
                 );
                 // Completion may precede consumption of the initial yielded output.
                 if enabled {

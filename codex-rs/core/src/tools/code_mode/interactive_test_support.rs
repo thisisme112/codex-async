@@ -8,7 +8,6 @@ use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
 use tokio::sync::Notify;
 
 #[derive(Default)]
@@ -72,81 +71,4 @@ impl ReviewHook {
         session.services.hooks.store(Arc::new(hooks));
         gate
     }
-}
-
-// Exercise the real service entry with failed and synchronously completed providers.
-// It must not mutate the shared originating turn of an older direct callback.
-pub(crate) async fn sibling_cell_attempt(turn: Arc<TurnContext>, source: &str) {
-    use codex_code_mode::*;
-    struct ImmediateSession;
-    impl CodeModeSession for ImmediateSession {
-        fn execute<'a>(
-            &'a self,
-            request: ExecuteRequest,
-            delegate: Arc<dyn CodeModeSessionDelegate>,
-            _preempt: Option<tokio_util::sync::CancellationToken>,
-        ) -> CodeModeSessionResultFuture<'a, StartedCell> {
-            Box::pin(async move {
-                if request.source == "fail" {
-                    return Err("execute failed".to_string());
-                }
-                let cell_id = CellId::new("synchronous".to_string());
-                delegate.cell_completion_ready(&cell_id);
-                Ok(StartedCell::from_future(cell_id.clone(), async move {
-                    Ok(RuntimeResponse::Result {
-                        cell_id,
-                        content_items: Vec::new(),
-                        error_text: None,
-                        result_buffered_for: Duration::ZERO,
-                        code_mode_host_duration: None,
-                    })
-                }))
-            })
-        }
-        fn wait<'a>(
-            &'a self,
-            _: WaitRequest,
-            _: Option<tokio_util::sync::CancellationToken>,
-        ) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
-            unreachable!()
-        }
-        fn terminate<'a>(
-            &'a self,
-            _: TerminateRequest,
-        ) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
-            unreachable!()
-        }
-        fn shutdown<'a>(&'a self) -> CodeModeSessionResultFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
-        }
-    }
-    let service = super::CodeModeService::new(
-        codex_protocol::ThreadId::default(),
-        Arc::new(DisabledCodeModeSessionProvider),
-        &turn.config.code_mode,
-        Default::default(),
-    );
-    assert!(service.session.set(Arc::new(ImmediateSession)).is_ok());
-    let started = service
-        .execute(
-            ExecuteRequest {
-                tool_call_id: "sibling".to_string(),
-                enabled_tools: Vec::new(),
-                source: source.to_string(),
-                yield_time_ms: None,
-                max_output_tokens: None,
-            },
-            crate::session::step_context::StepContext::for_test(turn),
-            /*completion*/ None,
-        )
-        .await;
-    if source == "fail" {
-        assert!(started.is_err());
-    } else {
-        assert!(matches!(
-            started.unwrap().initial_response().await.unwrap(),
-            RuntimeResponse::Result { .. }
-        ));
-    }
-    service.shutdown().await.unwrap();
 }

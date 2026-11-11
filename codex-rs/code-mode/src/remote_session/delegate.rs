@@ -67,6 +67,14 @@ impl CodeModeSessionDelegate for TracedCellDelegate {
         )
     }
 
+    fn wants_completion_ready(&self) -> bool {
+        self.delegate.wants_completion_ready()
+    }
+
+    fn cell_completion_ready(&self, cell_id: &CellId) {
+        self.delegate.cell_completion_ready(cell_id);
+    }
+
     fn cell_closed(&self, cell_id: &CellId) {
         self.delegate.cell_closed(cell_id);
     }
