@@ -169,6 +169,14 @@ async fn embedded_client_completion_wake_is_default_and_ordinary_client_stays_op
             default_target
         );
         cli.agents_overview = false;
+        let explicit_local = AppServerTarget::LocalDaemon {
+            endpoint: endpoint.clone(),
+            allow_embedded_fallback: false,
+        };
+        assert_eq!(
+            interactive_target(explicit_local.clone(), &cli),
+            explicit_local
+        );
         let explicit = AppServerTarget::Remote { endpoint };
         assert_eq!(interactive_target(explicit.clone(), &cli), explicit);
         assert_eq!(

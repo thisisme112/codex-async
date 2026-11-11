@@ -360,7 +360,12 @@ impl<'a> PendingHostApprovalOwner<'a> {
         policy_denial: &str,
         prompt: impl Future<Output = ApprovalResolution>,
     ) -> ApprovalResolution {
-        let queued = {
+        // A background review can retry when its selected turn ends before a
+        // prompt is registered. Keep the owned permit rather than queueing
+        // behind ourselves on that retry.
+        let queued = if self.prompt_permit.is_some() {
+            None
+        } else {
             let mut approvals = self
                 .service
                 .pending_host_approvals

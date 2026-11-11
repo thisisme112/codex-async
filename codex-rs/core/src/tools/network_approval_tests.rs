@@ -667,6 +667,22 @@ async fn manual_prompt_wakeups(decision: PendingApprovalDecision, expected: usiz
             std::future::ready(ApprovalResolution::user(ReviewDecision::Approved)),
         )
         .await;
+    {
+        // A withdrawn turn may retry the same owner before the decision is
+        // committed. Its retained permit must not make it wait on itself.
+        let retry = first.review_user_prompt(
+            &session,
+            &turn,
+            /*timing_call_id*/ None,
+            "denied",
+            std::future::ready(ApprovalResolution::user(ReviewDecision::Approved)),
+        );
+        tokio::pin!(retry);
+        assert!(matches!(
+            poll!(retry.as_mut()),
+            Poll::Ready(resolution) if resolution.decision == ReviewDecision::Approved
+        ));
+    }
     let mut owners = ["second", "third", "fourth"].map(owner);
     let mut waiters = owners.each_mut().map(|owner| {
         Box::pin(owner.review_user_prompt(
