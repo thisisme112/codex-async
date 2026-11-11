@@ -107,7 +107,9 @@ async fn typed_steering_restores_normal_output_for_an_existing_voice_item() {
 
     let mut rendered = String::new();
     while let Ok(event) = events.try_recv() {
-        if let AppEvent::InsertHistoryCell(cell) = event {
+        if let AppEvent::InsertHistoryCell(cell) = event
+            && !cell.as_any().is::<FinalMessageSeparator>()
+        {
             for line in cell.display_lines(/*width*/ 80) {
                 rendered.push_str(&line.to_string());
             }
@@ -115,10 +117,7 @@ async fn typed_steering_restores_normal_output_for_an_existing_voice_item() {
     }
     assert!(rendered.contains("typed answer"), "{rendered}");
     assert!(!rendered.contains("private voice commentary"), "{rendered}");
-    insta::assert_snapshot!(
-        "typed_steering_keeps_voice_commentary_private",
-        without_completion_metadata(&rendered)
-    );
+    insta::assert_snapshot!("typed_steering_keeps_voice_commentary_private", rendered);
     assert!(ops.try_recv().is_err());
 }
 
@@ -179,7 +178,7 @@ async fn voice_handoff_preserves_started_typed_reasoning_but_hides_new_reasoning
         &mut chat,
         thread_id,
         turn_id,
-        ThreadItem::Reasoning {
+        ThreadItemPayload::Reasoning {
             id: "typed-reasoning".into(),
             summary: Vec::new(),
             content: Vec::new(),
@@ -213,7 +212,7 @@ async fn voice_handoff_preserves_started_typed_reasoning_but_hides_new_reasoning
         &mut chat,
         thread_id,
         turn_id,
-        ThreadItem::Reasoning {
+        ThreadItemPayload::Reasoning {
             id: "typed-reasoning".into(),
             summary: vec!["Typed beginning and typed tail".into()],
             content: Vec::new(),
@@ -223,7 +222,7 @@ async fn voice_handoff_preserves_started_typed_reasoning_but_hides_new_reasoning
         &mut chat,
         thread_id,
         turn_id,
-        ThreadItem::Reasoning {
+        ThreadItemPayload::Reasoning {
             id: "private-reasoning".into(),
             summary: Vec::new(),
             content: Vec::new(),
@@ -243,7 +242,7 @@ async fn voice_handoff_preserves_started_typed_reasoning_but_hides_new_reasoning
         &mut chat,
         thread_id,
         turn_id,
-        ThreadItem::Reasoning {
+        ThreadItemPayload::Reasoning {
             id: "private-reasoning".into(),
             summary: vec!["private after handoff".into()],
             content: Vec::new(),

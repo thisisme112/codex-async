@@ -8,13 +8,9 @@ use codex_app_server_protocol::ThreadGoal;
 use codex_app_server_protocol::ThreadGoalUpdatedNotification;
 use codex_app_server_protocol::ThreadQueueChangedNotification;
 use codex_app_server_protocol::WarningNotification;
-use codex_core::NewThread;
-use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_exec_server::EnvironmentManager;
-use codex_extension_api::AgentSpawnFuture;
-use codex_extension_api::AgentSpawner;
 use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionRegistry;
 use codex_extension_api::ExtensionRegistryBuilder;
@@ -25,7 +21,6 @@ use codex_goal_extension::GoalService;
 use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
 use codex_protocol::ThreadId;
-use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_queue_extension::QueuedItemService;
@@ -37,6 +32,7 @@ use crate::thread_state::ThreadListenerCommand;
 use crate::thread_state::ThreadStateManager;
 
 pub(crate) struct ThreadExtensionDependencies {
+    pub(crate) sample_responses: Arc<crate::thread_sample::SampleResponseRegistry>,
     pub(crate) event_sink: Arc<dyn ExtensionEventSink>,
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) state_db: Option<StateDbHandle>,
@@ -45,6 +41,7 @@ pub(crate) struct ThreadExtensionDependencies {
     pub(crate) goal_service: Arc<GoalService>,
     pub(crate) environment_manager: Arc<EnvironmentManager>,
     pub(crate) executor_skill_provider: Arc<dyn codex_skills_extension::SkillProvider>,
+    pub(crate) cloud_skill_provider: Option<Arc<dyn codex_skills_extension::SkillProvider>>,
     pub(crate) git_attribution_base_url: String,
     pub(crate) http_client_factory: HttpClientFactory,
     /// Process-scoped queue shared by idle dispatch and app-server requests.
@@ -52,14 +49,12 @@ pub(crate) struct ThreadExtensionDependencies {
     pub(crate) turn_start_admission: Option<Arc<dyn TurnStartAdmission>>,
 }
 
-pub(crate) fn thread_extensions<S>(
-    guardian_agent_spawner: S,
+pub(crate) fn thread_extensions(
+    config: &Config,
     dependencies: ThreadExtensionDependencies,
-) -> Arc<ExtensionRegistry<Config>>
-where
-    S: AgentSpawner<StartThreadOptions, Spawned = NewThread, Error = CodexErr> + 'static,
-{
+) -> Arc<ExtensionRegistry<Config>> {
     let ThreadExtensionDependencies {
+        sample_responses,
         event_sink,
         auth_manager,
         state_db,
@@ -68,12 +63,19 @@ where
         goal_service,
         environment_manager,
         executor_skill_provider,
+        cloud_skill_provider,
         git_attribution_base_url,
         http_client_factory,
         queue_service,
         turn_start_admission,
     } = dependencies;
     let mut builder = ExtensionRegistryBuilder::<Config>::with_event_sink(Arc::clone(&event_sink));
+    if config
+        .features
+        .enabled(codex_features::Feature::MultiEnvCopyFile)
+    {
+        codex_multi_env_copy_file::install(&mut builder);
+    }
     if let Some(admission) = turn_start_admission {
         builder.turn_start_admission(admission);
     }
@@ -81,6 +83,7 @@ where
         codex_queue_extension::install(&mut builder, queue_service);
     }
     codex_history_notes_extension::install(&mut builder, auth_manager.clone());
+    crate::install_agent_message_board(&mut builder, thread_manager.clone());
     if let Some(state_db) = state_db {
         codex_goal_extension::install_with_backend(
             &mut builder,
@@ -101,39 +104,41 @@ where
         git_attribution_base_url,
         http_client_factory,
     );
-    codex_guardian_v2::install(
-        &mut builder,
-        guardian_agent_spawner,
-        auth_manager.clone(),
-        thread_manager,
-    );
+    codex_guardian_v2::install(&mut builder, auth_manager.clone(), thread_manager);
     codex_memories_extension::install(&mut builder, codex_otel::global());
     codex_mcp_extension::install(&mut builder);
-    codex_mcp_extension::install_executor_plugins(&mut builder, environment_manager);
+    codex_mcp_extension::install_plugins(&mut builder, environment_manager);
     codex_web_search_extension::install(&mut builder, auth_manager.clone());
     codex_image_generation_extension::install(&mut builder, auth_manager, |config: &Config| {
         Some(config.codex_home.clone())
     });
-    let skill_providers = codex_skills_extension::SkillProviders::new()
+    let mut skill_providers = codex_skills_extension::SkillProviders::new()
         .with_executor_provider(executor_skill_provider)
-        .with_orchestrator_provider(Arc::new(
-            codex_skills_extension::OrchestratorSkillProvider::new(),
-        ))
         .with_host_provider(Arc::new(codex_skills_extension::HostSkillProvider::new()));
+    if let Some(provider) = cloud_skill_provider {
+        skill_providers = skill_providers.with_cloud_provider(provider);
+    }
     codex_skills_extension::install_with_providers_and_metrics(
         &mut builder,
         skill_providers,
         codex_otel::global(),
         |config: &Config| codex_skills_extension::SkillsExtensionConfig {
             include_instructions: config.include_skill_instructions,
+            catalog_deltas_enabled: config
+                .features
+                .enabled(codex_features::Feature::SkillCatalogDeltas),
+            omit_descriptions: config
+                .features
+                .enabled(codex_features::Feature::OmitSkillDescriptions),
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: config.bundled_skills_enabled(),
-            orchestrator_skills_enabled: config.orchestrator_skills_enabled,
+            cloud_skill_enabled: config.cloud_skill_enabled,
             shadow_selection_enabled: config
                 .features
                 .enabled(codex_features::Feature::SkillSearch),
         },
     );
+    builder.model_request_contributor(sample_responses);
     Arc::new(builder.build())
 }
 
@@ -309,24 +314,6 @@ impl ExtensionEventSink for AppServerExtensionEventSink {
     }
 }
 
-pub(crate) fn guardian_agent_spawner(
-    thread_manager: Weak<ThreadManager>,
-) -> impl AgentSpawner<StartThreadOptions, Spawned = NewThread, Error = CodexErr> {
-    move |forked_from_thread_id: ThreadId,
-          options: StartThreadOptions|
-          -> AgentSpawnFuture<'static, NewThread, CodexErr> {
-        let thread_manager = thread_manager.clone();
-        Box::pin(async move {
-            let thread_manager = thread_manager.upgrade().ok_or_else(|| {
-                CodexErr::UnsupportedOperation("thread manager dropped".to_string())
-            })?;
-            thread_manager
-                .spawn_subagent(forked_from_thread_id, options)
-                .await
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use codex_protocol::protocol::ThreadGoal as CoreThreadGoal;
@@ -441,14 +428,12 @@ mod tests {
                 .connection_initialized(connection_id, ConnectionCapabilities::default())
                 .await;
         }
-        thread_state_manager
-            .try_ensure_connection_subscribed(
-                thread_id,
-                subscribed_connection,
-                /*experimental_raw_events*/ false,
-            )
-            .await
-            .expect("connection should be subscribed");
+        assert!(
+            thread_state_manager
+                .try_add_connection_to_thread(thread_id, subscribed_connection)
+                .await,
+            "connection should be subscribed"
+        );
         let sink = app_server_extension_event_sink(outgoing, thread_state_manager);
 
         sink.emit_warning(ExtensionWarning {
@@ -507,14 +492,12 @@ mod tests {
             message: "catalog was shortened".to_string(),
         });
         tokio::task::yield_now().await;
-        thread_state_manager
-            .try_ensure_connection_subscribed(
-                thread_id,
-                subscribed_connection,
-                /*experimental_raw_events*/ false,
-            )
-            .await
-            .expect("connection should be subscribed");
+        assert!(
+            thread_state_manager
+                .try_add_connection_to_thread(thread_id, subscribed_connection)
+                .await,
+            "connection should be subscribed"
+        );
 
         let envelope = timeout(Duration::from_secs(1), outgoing_rx.recv())
             .await
@@ -557,14 +540,12 @@ mod tests {
         thread_state_manager
             .connection_initialized(subscribed_connection, ConnectionCapabilities::default())
             .await;
-        thread_state_manager
-            .try_ensure_connection_subscribed(
-                thread_id,
-                subscribed_connection,
-                /*experimental_raw_events*/ false,
-            )
-            .await
-            .expect("connection should be subscribed");
+        assert!(
+            thread_state_manager
+                .try_add_connection_to_thread(thread_id, subscribed_connection)
+                .await,
+            "connection should be subscribed"
+        );
         let (listener_command_tx, listener_command_rx) = mpsc::unbounded_channel();
         drop(listener_command_rx);
         thread_state_manager.register_listener_command_tx(thread_id, listener_command_tx);

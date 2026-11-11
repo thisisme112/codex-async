@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::io;
 
-use codex_exec_server::ExecutorFileSystem;
+use codex_exec_server::EnvironmentAccess;
 use codex_exec_server::WalkEntryKind;
 use codex_exec_server::WalkOptions;
 use codex_utils_path_uri::PathUri;
@@ -15,7 +15,7 @@ use super::SKILLS_METADATA_DIR;
 use super::SKILLS_METADATA_FILENAME;
 
 const MAX_SKILLS_ENTRIES_PER_ROOT: usize = 20_000;
-pub(super) const MAX_CONCURRENT_SKILL_LOADS: usize = 64;
+pub(crate) const MAX_CONCURRENT_SKILL_LOADS: usize = 64;
 
 pub(super) enum DirectorySymlinkPolicy {
     Follow,
@@ -38,6 +38,7 @@ pub(super) struct SkillDiscovery {
     pub plugin_roots: HashSet<PathUri>,
     pub namespace_roots: HashSet<PathUri>,
     pub warnings: Vec<String>,
+    pub error: Option<String>,
 }
 
 pub(super) struct DiscoveredSkill {
@@ -52,7 +53,7 @@ pub(super) enum SkillMetadataDiscovery {
 }
 
 pub(super) async fn discover_skills(
-    file_system: &dyn ExecutorFileSystem,
+    file_system: &dyn EnvironmentAccess,
     root: &PathUri,
     options: SkillDiscoveryOptions,
 ) -> SkillDiscovery {
@@ -61,6 +62,7 @@ pub(super) async fn discover_skills(
         plugin_roots: HashSet::new(),
         namespace_roots: HashSet::new(),
         warnings: Vec::new(),
+        error: None,
     };
     let walk = match file_system
         .walk(
@@ -81,7 +83,6 @@ pub(super) async fn discover_skills(
                     HiddenDirectoryPolicy::Skip
                 ),
             },
-            /*sandbox*/ None,
         )
         .await
     {
@@ -89,6 +90,9 @@ pub(super) async fn discover_skills(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return empty_discovery(),
         Err(error) => {
             let mut discovery = empty_discovery();
+            if error.kind() == io::ErrorKind::Unsupported {
+                discovery.error = Some(error.to_string());
+            }
             discovery
                 .warnings
                 .push(format!("failed to walk skills root {root}: {error:#}"));
@@ -174,6 +178,7 @@ pub(super) async fn discover_skills(
         plugin_roots,
         namespace_roots: HashSet::from([root.clone()]),
         warnings,
+        error: None,
     }
 }
 

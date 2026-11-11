@@ -1,6 +1,7 @@
 //! Replay and captions reconcile once across thread and session changes.
 
 use super::*;
+use codex_app_server_protocol::ThreadItem;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
@@ -10,31 +11,32 @@ async fn replay_preserves_typed_updates_before_voice_steers_the_turn() {
     chat.replay_thread_turns(
         vec![Turn {
             id: "typed-then-voice".into(),
+            root_turn_id: None,
             items: vec![
-                user_item("Typed question"),
-                agent_item(
+                ThreadItem::untimed(user_item("Typed question")),
+                ThreadItem::untimed(agent_item(
                     "typed-update",
                     "Checking the typed request",
                     Some(MessagePhase::Commentary),
-                ),
-                ThreadItem::Reasoning {
+                )),
+                ThreadItem::untimed(ThreadItemPayload::Reasoning {
                     id: "typed-reasoning".into(),
                     summary: vec!["Typed reasoning summary".into()],
                     content: Vec::new(),
-                },
-                user_item(
+                }),
+                ThreadItem::untimed(user_item(
                     "<realtime_delegation><input>spoken correction</input></realtime_delegation>",
-                ),
-                agent_item(
+                )),
+                ThreadItem::untimed(agent_item(
                     "private-update",
                     "Private voice commentary",
                     Some(MessagePhase::Commentary),
-                ),
-                ThreadItem::Reasoning {
+                )),
+                ThreadItem::untimed(ThreadItemPayload::Reasoning {
                     id: "private-reasoning".into(),
                     summary: vec!["Private voice reasoning".into()],
                     content: Vec::new(),
-                },
+                }),
             ],
             items_view: TurnItemsView::Full,
             status: TurnStatus::Completed,
@@ -79,7 +81,8 @@ async fn in_progress_voice_replay_restores_the_late_reasoning_guard() {
     chat.replay_thread_turns(
         vec![Turn {
             id: "saved-voice-turn".into(),
-            items: vec![voice_request.clone()],
+            root_turn_id: None,
+            items: vec![ThreadItem::untimed(voice_request.clone())],
             items_view: TurnItemsView::Full,
             status: TurnStatus::InProgress,
             error: None,
@@ -90,12 +93,12 @@ async fn in_progress_voice_replay_restores_the_late_reasoning_guard() {
         ReplayKind::ThreadSnapshot,
     );
     chat.handle_server_notification(
-        ServerNotification::ItemStarted(ItemStartedNotification {
-            thread_id: thread_id.to_string(),
-            turn_id: "buffered-voice-turn".into(),
-            item: voice_request,
-            started_at_ms: 0,
-        }),
+        ServerNotification::ItemStarted(ItemStartedNotification::new(
+            thread_id.to_string(),
+            "buffered-voice-turn".into(),
+            voice_request,
+            /*started_at_ms*/ 0,
+        )),
         Some(ReplayKind::ThreadSnapshot),
     );
     while events.try_recv().is_ok() {}
@@ -114,7 +117,7 @@ async fn in_progress_voice_replay_restores_the_late_reasoning_guard() {
             &mut chat,
             thread_id,
             turn_id,
-            ThreadItem::Reasoning {
+            ThreadItemPayload::Reasoning {
                 id: "late-reasoning".into(),
                 summary: vec!["private after switch".into()],
                 content: Vec::new(),
@@ -340,19 +343,7 @@ async fn restored_partial_caption_accepts_late_completion_without_duplicate_hist
             before_turn_id: None,
         },
     ]));
-    let live = chat
-        .realtime_conversation
-        .live_transcript_cell
-        .as_ref()
-        .unwrap();
-    insta::assert_snapshot!(
-        "restored_voice_partial_live",
-        live.display_lines(/*width*/ 80)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
+    assert!(chat.realtime_conversation.live_transcript_cell.is_none());
     chat.on_realtime_transcript_delta("user".into(), "words".into());
     let retained = chat.take_realtime_transcript_cells_for_replay();
     assert_eq!(retained.len(), 1);

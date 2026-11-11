@@ -1,8 +1,10 @@
-//! Render composition for the main chat widget surface.
+//! Shared composer and live-history composition for inline and owned transcript surfaces.
 
+use super::provider_error::ProviderErrorNotice;
 use super::transcript::ActiveCellLayoutCache;
 use super::transcript::ActiveCellLayoutCacheKey;
 use super::*;
+use crate::keymap::KeymapContext;
 use crate::render::RectExt;
 use crate::terminal_hyperlinks::HyperlinkParagraph;
 use crate::wrapping::RtOptions;
@@ -13,7 +15,7 @@ use ratatui::widgets::Block;
 use std::cell::Cell;
 
 struct ExternalWriterNotice {
-    command_center_available: bool,
+    agents_navigation_key_available: bool,
     transcript_hint: Option<crate::key_hint::ShortcutHint>,
 }
 
@@ -64,8 +66,8 @@ impl ExternalWriterNotice {
         ]
         .into();
         let retry: Line<'static> = vec![
-            Span::styled("R", crate::style::accent_style()),
-            " to Retry".into(),
+            Span::styled("r", crate::style::accent_style()),
+            " to retry".into(),
         ]
         .into();
         let mut lines = word_wrap_lines(&[title], usize::from(width));
@@ -88,30 +90,32 @@ impl ExternalWriterNotice {
     }
 
     fn footer_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut items = vec![("r".to_string(), "retry".to_string())];
+        let mut items = vec![
+            ("r".to_string(), "retry".to_string()),
+            ("f".to_string(), "fork".to_string()),
+        ];
         let escape = crate::key_hint::plain(KeyCode::Esc).display_label();
-        let mut quit_keys = vec![
+        let quit_keys = [
             crate::key_hint::ctrl(KeyCode::Char('c')).display_label(),
             crate::key_hint::plain(KeyCode::Char('q')).display_label(),
         ];
-        if self.command_center_available {
-            items.push((escape, "command center".to_string()));
+        let key = if self.agents_navigation_key_available {
+            let left = crate::key_hint::plain(KeyCode::Left).display_label();
+            format!("{left}/{escape}")
         } else {
-            quit_keys.insert(/*index*/ 0, escape);
-        }
-        items.push((quit_keys.join("/").replace(" + ", "+"), "exit".to_string()));
+            escape
+        };
+        items.push((key, "command center".to_string()));
+        items.push((quit_keys.join("/"), "exit".to_string()));
         if let Some(hint) = self.transcript_hint {
-            items.push((
-                hint.display_label().replace(" + ", "+"),
-                "transcript".to_string(),
-            ));
+            items.push((hint.display_label(), "transcript".to_string()));
         }
         let mut spans = vec![" ".set_style(crate::style::footer_hint_label_style())];
         for (idx, (key, label)) in items.into_iter().enumerate() {
             if idx > 0 {
                 spans.push("   ".set_style(crate::style::footer_hint_label_style()));
             }
-            spans.push(key.set_style(crate::style::footer_hint_key_style()));
+            spans.extend(crate::key_hint::key_label_spans(&key));
             spans.push(format!(" {label}").set_style(crate::style::footer_hint_label_style()));
         }
         word_wrap_lines(&[Line::from(spans)], usize::from(width))
@@ -119,15 +123,48 @@ impl ExternalWriterNotice {
 }
 
 impl ChatWidget {
+    pub(crate) fn prepare_composer_images(&mut self, protocol: Option<crate::pets::ImageProtocol>) {
+        self.composer_images = protocol
+            .filter(|_| {
+                !self.bottom_pane.composer_local_images().is_empty()
+                    && self.no_modal_or_popup_active()
+            })
+            .and_then(|protocol| {
+                crate::transcript_image::composer::ComposerImages::for_terminal(
+                    protocol,
+                    self.composer_images.take(),
+                )
+            });
+    }
+
     pub(crate) fn as_renderable(&self) -> RenderableItem<'_> {
+        let backdrop = self.as_backdrop_renderable();
+        match self.centered_dialog() {
+            Some(dialog) => RenderableItem::Owned(Box::new(crate::bottom_pane::DialogOverlay {
+                backdrop,
+                dialog,
+            })),
+            None => backdrop,
+        }
+    }
+
+    pub(crate) fn centered_dialog(&self) -> Option<crate::bottom_pane::CenteredView<'_>> {
+        self.bottom_pane.centered_dialog()
+    }
+
+    fn as_backdrop_renderable(&self) -> RenderableItem<'_> {
         if self
             .bottom_pane
             .selected_index_for_active_view(crate::app::AGENTS_OVERVIEW_VIEW_ID)
             .is_some()
+            || (self.bottom_pane.has_centered_view()
+                && self
+                    .bottom_pane
+                    .selected_index_for_present_view(crate::app::AGENTS_OVERVIEW_VIEW_ID)
+                    .is_some())
         {
             return self
-                .bottom_pane
-                .as_renderable_with_composer_right_reserve(/*composer_right_reserve*/ 0);
+                .bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions::default());
         }
 
         let active_cell_right_reserve = self.ambient_pet_wrap_reserved_cols();
@@ -174,17 +211,7 @@ impl ChatWidget {
                 })),
             );
         }
-        if let Some(cell) = self.pending_token_activity_output() {
-            flex.push(
-                /*flex*/ 1,
-                RenderableItem::Owned(Box::new(TranscriptAreaRenderable {
-                    child: cell,
-                    top: 1,
-                    right: active_cell_right_reserve,
-                    persistent_layout: None,
-                })),
-            );
-        }
+
         if let Some(cell) = self.pending_rate_limit_reset_hint() {
             flex.push(
                 /*flex*/ 1,
@@ -196,22 +223,135 @@ impl ChatWidget {
                 })),
             );
         }
-        let bottom = if self.external_writer_view && !self.bottom_pane.has_active_view() {
+        flex.push(
+            /*flex*/ 0,
+            self.bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions::default())
+                .inset(Insets::tlbr(
+                    /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
+                )),
+        );
+        RenderableItem::Owned(Box::new(flex))
+    }
+
+    /// Returns the composer, footer, and active modal without the live transcript above it.
+    ///
+    /// Both transcript surfaces use this composition so read-only notices and cursor placement
+    /// remain consistent. Owned transcripts reserve their shared hint row above the composer.
+    pub(crate) fn bottom_pane_renderable<'a>(
+        &'a self,
+        mut options: crate::bottom_pane::ComposerRenderOptions<'a>,
+    ) -> RenderableItem<'a> {
+        if self.fork_in_progress {
+            RenderableItem::Owned(Box::new(
+                Paragraph::new("Forking conversation…".dim()).inset(Insets::tlbr(
+                    /*top*/ 1, /*left*/ 2, /*bottom*/ 1, /*right*/ 2,
+                )),
+            ))
+        } else if let Some(error) = &self.provider_error
+            && !self.bottom_pane.has_active_view()
+        {
+            let can_continue = self.thread_id.is_some() && self.current_rollout_path.is_some();
+            RenderableItem::Owned(Box::new(ProviderErrorNotice {
+                title: if can_continue
+                    && matches!(
+                        error,
+                        codex_app_server_protocol::ModelProviderError::ModelProviderMismatch { .. }
+                    ) {
+                    "Continue in a new chat"
+                } else {
+                    error.title()
+                },
+                message: self.provider_error_message(error),
+                can_continue,
+                configuration_location: self
+                    .remote_connection
+                    .as_ref()
+                    .filter(|remote| !remote.is_local_daemon)
+                    .map(|remote| format!("Configuration on {}", remote.address)),
+            }))
+        } else if self.external_writer_view && !self.bottom_pane.has_active_view() {
             RenderableItem::Owned(Box::new(ExternalWriterNotice {
-                command_center_available: self.remote_connection.is_some(),
+                agents_navigation_key_available: self.agents_navigation_key_available(),
                 transcript_hint: self.bottom_pane.transcript_shortcut_hint(),
             }))
         } else {
-            self.bottom_pane
-                .as_renderable_with_composer_right_reserve(active_cell_right_reserve)
-        };
-        flex.push(
-            /*flex*/ 0,
-            bottom.inset(Insets::tlbr(
-                /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
-            )),
-        );
-        RenderableItem::Owned(Box::new(flex))
+            let right_reserve = if self
+                .bottom_pane
+                .selected_index_for_active_view(crate::app::AGENTS_OVERVIEW_VIEW_ID)
+                .is_some()
+            {
+                0
+            } else {
+                self.ambient_pet_wrap_reserved_cols()
+            };
+            options.rendered_selection = Some(&self.rendered_selection);
+            options.image_previews = self.composer_images.as_ref();
+            options.warning_count = self.warning_display_state.count;
+            options.textarea_right_reserve = right_reserve;
+            options.separate_status_line = options.command_popup_placement
+                != crate::bottom_pane::CommandPopupPlacement::AboveComposer;
+            let bottom_pane = self.bottom_pane.backdrop_with_options(options);
+            let above_composer = if self.quick_dial_menu && !options.floating_shortcuts {
+                RenderableItem::Owned(Box::new(self.quick_dial_hud()))
+            } else if let Some(backend) = self.visible_new_backend_control() {
+                let mut spans = vec!["  ".into(), backend.into()];
+                let keymap = self.bottom_pane.keymap();
+                if let Some(key) = keymap.primary_hint(KeymapContext::Global, "change_host") {
+                    spans.extend(["  ".into(), key.into(), " to cycle".dim()]);
+                }
+                RenderableItem::Owned(Box::new(Paragraph::new(Line::from(spans))))
+            } else {
+                return bottom_pane;
+            };
+            let mut column = FlexRenderable::new();
+            column.push(/*flex*/ 1, above_composer);
+            column.push(/*flex*/ 0, bottom_pane);
+            RenderableItem::Owned(Box::new(column))
+        }
+    }
+
+    /// Returns compact live-history lines using the current rich or raw presentation.
+    #[cfg(test)]
+    pub(crate) fn active_cell_display_hyperlink_lines(
+        &self,
+        width: u16,
+    ) -> Option<Vec<HyperlinkLine>> {
+        self.active_cell_hyperlink_lines_with(width, |cell, width| {
+            cell.display_hyperlink_lines_for_mode(width, self.history_render_mode())
+        })
+    }
+
+    /// Combines the same live cells for compact and detailed transcript rendering.
+    pub(super) fn active_cell_hyperlink_lines_with(
+        &self,
+        width: u16,
+        render_cell: impl Fn(&dyn HistoryCell, u16) -> Vec<HyperlinkLine>,
+    ) -> Option<Vec<HyperlinkLine>> {
+        let cells = self
+            .transcript
+            .active_cell
+            .as_deref()
+            .into_iter()
+            .chain(
+                self.realtime_conversation
+                    .pending_history_cells
+                    .iter()
+                    .chain(self.realtime_conversation.live_transcript_cells())
+                    .map(AsRef::as_ref),
+            )
+            .chain(
+                self.pending_rate_limit_reset_hint()
+                    .map(|cell| cell as &dyn HistoryCell),
+            );
+        let mut lines = Vec::new();
+        for cell in cells {
+            let cell_lines = render_cell(cell, width);
+            if !cell_lines.is_empty() && !lines.is_empty() {
+                lines.push(HyperlinkLine::from(""));
+            }
+            lines.extend(cell_lines);
+        }
+        (!lines.is_empty()).then_some(lines)
     }
 
     pub(crate) fn note_rendered_width(&self, width: u16) {

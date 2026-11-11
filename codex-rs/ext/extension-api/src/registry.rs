@@ -5,6 +5,8 @@ use crate::ConfigContributor;
 use crate::ContextContributor;
 use crate::ExtensionEventSink;
 use crate::McpServerContributor;
+use crate::MessageLifecycleContributor;
+use crate::ModelRequestContributor;
 use crate::NoopExtensionEventSink;
 use crate::SkillInvocationContributor;
 use crate::ThreadLifecycleContributor;
@@ -38,6 +40,8 @@ impl<C: Sync> Default for ExtensionRegistryBuilder<C> {
                 turn_input_contributors: Vec::new(),
                 tool_contributors: Vec::new(),
                 tool_lifecycle_contributors: Vec::new(),
+                model_request_contributors: Vec::new(),
+                message_observers: Vec::new(),
                 turn_item_contributors: Vec::new(),
             },
         }
@@ -122,6 +126,11 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
         self.registry.turn_input_contributors.push(contributor);
     }
 
+    /// Registers a contributor for request-scoped response interception.
+    pub fn model_request_contributor(&mut self, contributor: Arc<dyn ModelRequestContributor>) {
+        self.registry.model_request_contributors.push(contributor);
+    }
+
     /// Registers one native tool contributor.
     pub fn tool_contributor(&mut self, contributor: Arc<dyn ToolContributor>) {
         self.registry.tool_contributors.push(contributor);
@@ -135,6 +144,11 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
     /// Registers one ordered turn-item contributor.
     pub fn turn_item_contributor(&mut self, contributor: Arc<dyn TurnItemContributor>) {
         self.registry.turn_item_contributors.push(contributor);
+    }
+
+    /// Registers a synchronous direct-message observer.
+    pub fn message_lifecycle_contributor(&mut self, hook: Arc<dyn MessageLifecycleContributor>) {
+        self.registry.message_observers.push(hook);
     }
 
     /// Finishes construction and returns the immutable registry.
@@ -157,11 +171,37 @@ pub struct ExtensionRegistry<C: Sync> {
     turn_input_contributors: Vec<Arc<dyn TurnInputContributor>>,
     tool_contributors: Vec<Arc<dyn ToolContributor>>,
     tool_lifecycle_contributors: Vec<Arc<dyn ToolLifecycleContributor>>,
+    model_request_contributors: Vec<Arc<dyn ModelRequestContributor>>,
+    message_observers: Vec<Arc<dyn MessageLifecycleContributor>>,
     turn_item_contributors: Vec<Arc<dyn TurnItemContributor>>,
     approval_review_contributors: Vec<Arc<dyn ApprovalReviewContributor>>,
 }
 
 impl<C: Sync> ExtensionRegistry<C> {
+    /// Copies the registered contributors into a builder for host-specific additions.
+    pub fn to_builder(&self) -> ExtensionRegistryBuilder<C> {
+        ExtensionRegistryBuilder {
+            registry: Self {
+                event_sink: self.event_sink.clone(),
+                turn_start_admission: self.turn_start_admission.clone(),
+                thread_lifecycle_contributors: self.thread_lifecycle_contributors.clone(),
+                turn_lifecycle_contributors: self.turn_lifecycle_contributors.clone(),
+                config_contributors: self.config_contributors.clone(),
+                token_usage_contributors: self.token_usage_contributors.clone(),
+                skill_invocation_contributors: self.skill_invocation_contributors.clone(),
+                context_contributors: self.context_contributors.clone(),
+                mcp_server_contributors: self.mcp_server_contributors.clone(),
+                turn_input_contributors: self.turn_input_contributors.clone(),
+                tool_contributors: self.tool_contributors.clone(),
+                tool_lifecycle_contributors: self.tool_lifecycle_contributors.clone(),
+                model_request_contributors: self.model_request_contributors.clone(),
+                message_observers: self.message_observers.clone(),
+                turn_item_contributors: self.turn_item_contributors.clone(),
+                approval_review_contributors: self.approval_review_contributors.clone(),
+            },
+        }
+    }
+
     /// Acquires the host's turn-start permit, or an empty permit for ungated hosts.
     /// A missing permit rejects the start before Core consumes pending input.
     pub fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
@@ -243,6 +283,16 @@ impl<C: Sync> ExtensionRegistry<C> {
     /// Returns the registered native tool contributors.
     pub fn tool_contributors(&self) -> &[Arc<dyn ToolContributor>] {
         &self.tool_contributors
+    }
+
+    /// Returns direct-message observers in registration order.
+    pub fn message_lifecycle_contributors(&self) -> &[Arc<dyn MessageLifecycleContributor>] {
+        &self.message_observers
+    }
+
+    /// Returns response interceptor contributors in registration order.
+    pub fn model_request_contributors(&self) -> &[Arc<dyn ModelRequestContributor>] {
+        &self.model_request_contributors
     }
 
     /// Returns the registered tool-lifecycle contributors.

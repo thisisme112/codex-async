@@ -2,15 +2,12 @@
 
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_client::TypedRequestError;
-use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::ClientRequest;
-use codex_app_server_protocol::ConfigReadParams;
-use codex_app_server_protocol::ConfigReadResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxMode;
 use codex_app_server_protocol::SandboxPolicy;
 use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
@@ -22,6 +19,7 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
+use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
 use codex_protocol::openai_models::ReasoningEffort;
 use color_eyre::eyre::eyre;
 use serde_json::Value;
@@ -35,27 +33,28 @@ const STRUCTURED_RESPONSE_MAX_BYTES: usize = 8 * 1024;
 
 /// Preserve the visible thread's provider, permissions, and external-tool isolation.
 pub(crate) struct TemporaryStructuredThreadOptions {
+    pub(crate) thread_source: ThreadSource,
     pub(crate) model: String,
     pub(crate) model_provider: String,
     pub(crate) cwd: String,
     pub(crate) active_permission_profile: Option<String>,
-    pub(crate) mcp_server_names: Vec<String>,
 }
 
 /// Start an ephemeral thread without widening permissions or exposing tools and environment access.
 ///
 /// Structured prompts can contain untrusted transcript text, so the effective app-server config is
 /// read first and every MCP server is explicitly disabled alongside built-in and extension tools.
+/// Approval policy is inherited from the server; the TUI rejects unexpected interaction requests.
 pub(crate) async fn start_temporary_thread(
     request_handle: &AppServerRequestHandle,
     options: TemporaryStructuredThreadOptions,
 ) -> color_eyre::Result<ThreadStartResponse> {
     let TemporaryStructuredThreadOptions {
+        thread_source,
         model,
         model_provider,
         cwd,
         active_permission_profile,
-        mcp_server_names,
     } = options;
     let custom_permission_profile =
         active_permission_profile.filter(|profile| !profile.starts_with(':'));
@@ -85,7 +84,7 @@ pub(crate) async fn start_temporary_thread(
         ("features.tool_suggest".to_string(), false.into()),
         ("features.unified_exec".to_string(), false.into()),
         ("features.view_image".to_string(), false.into()),
-        ("orchestrator.skills.enabled".to_string(), false.into()),
+        ("cloud.skills.enabled".to_string(), false.into()),
         ("skills.include_instructions".to_string(), false.into()),
         (
             "tools.experimental_request_user_input.enabled".to_string(),
@@ -94,37 +93,21 @@ pub(crate) async fn start_temporary_thread(
         ("tools.update_plan.enabled".to_string(), false.into()),
         ("web_search".to_string(), "disabled".into()),
     ]);
+    if custom_permission_profile.is_none() {
+        // Managed profiles take precedence over the legacy sandbox override below.
+        config.insert(
+            "default_permissions".to_string(),
+            BUILT_IN_PERMISSION_PROFILE_READ_ONLY.into(),
+        );
+    }
     let response: ThreadStartResponse = tokio::time::timeout(STRUCTURED_TURN_TIMEOUT, async {
         // Fail closed if the remote-effective MCP configuration cannot be read.
-        let effective_config: ConfigReadResponse = request_handle
-            .request_typed(ClientRequest::ConfigRead {
-                request_id: RequestId::String(format!("temporary-config-{}", Uuid::new_v4())),
-                params: ConfigReadParams {
-                    include_layers: false,
-                    cwd: Some(cwd.clone()),
-                },
-            })
-            .await?;
-        let mut mcp_server_names = mcp_server_names
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>();
-        if let Some(effective_mcp_servers) = effective_config
-            .config
-            .additional
-            .get("mcp_servers")
-            .and_then(Value::as_object)
-        {
-            mcp_server_names.extend(effective_mcp_servers.keys().cloned());
+        let mut servers =
+            crate::config_update::read_mcp_servers(request_handle, cwd.clone()).await?;
+        for server in servers.values_mut() {
+            *server = serde_json::json!({ "enabled": false });
         }
-        config.insert(
-            "mcp_servers".to_string(),
-            Value::Object(
-                mcp_server_names
-                    .into_iter()
-                    .map(|name| (name, serde_json::json!({ "enabled": false })))
-                    .collect(),
-            ),
-        );
+        config.insert("mcp_servers".to_string(), Value::Object(servers));
 
         request_handle
             .request_typed(ClientRequest::ThreadStart {
@@ -133,14 +116,13 @@ pub(crate) async fn start_temporary_thread(
                     model: Some(model),
                     model_provider: Some(model_provider),
                     cwd: Some(cwd),
-                    approval_policy: Some(AskForApproval::Never),
                     sandbox: custom_permission_profile
                         .is_none()
                         .then_some(SandboxMode::ReadOnly),
                     permissions: custom_permission_profile.clone(),
                     runtime_workspace_roots: Some(Vec::new()),
                     ephemeral: Some(true),
-                    thread_source: Some(ThreadSource::Feature("system".to_string())),
+                    thread_source: Some(thread_source),
                     environments: Some(Vec::new()),
                     dynamic_tools: Some(Vec::new()),
                     selected_capability_roots: Some(Vec::new()),
@@ -149,6 +131,7 @@ pub(crate) async fn start_temporary_thread(
                 },
             })
             .await
+            .map_err(color_eyre::Report::from)
     })
     .await
     .map_err(|_| eyre!("temporary structured thread start timed out"))??;
@@ -207,7 +190,7 @@ pub(crate) async fn collect_structured_response(
     while let Some(notification) = notifications.recv().await {
         match notification {
             ServerNotification::ItemCompleted(completed) if completed.turn_id == turn_id => {
-                if let ThreadItem::AgentMessage { text, .. } = completed.item {
+                if let ThreadItemPayload::AgentMessage { text, .. } = completed.item.payload {
                     if text.len() > STRUCTURED_RESPONSE_MAX_BYTES {
                         return Err(eyre!(
                             "temporary structured response exceeds {STRUCTURED_RESPONSE_MAX_BYTES} bytes"

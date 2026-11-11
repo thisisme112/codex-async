@@ -13,7 +13,7 @@ pub(super) struct PendingCreditsNudge {
 }
 
 pub(super) const NUDGE_MODEL_SLUG: &str = crate::model_catalog::LUNA_MODEL;
-pub(super) const RATE_LIMIT_SWITCH_PROMPT_THRESHOLD: f64 = 90.0;
+pub(super) const RATE_LIMIT_SWITCH_PROMPT_THRESHOLD: i32 = 90;
 pub(super) const RATE_LIMIT_SWITCH_PROMPT_VIEW_ID: &str = "rate-limit-switch-prompt";
 
 const RATE_LIMIT_WARNING_THRESHOLDS: [f64; 4] = [50.0, 75.0, 90.0, 95.0];
@@ -50,10 +50,11 @@ impl RateLimitWarningState {
                 && secondary_used_percent >= RATE_LIMIT_WARNING_THRESHOLDS[self.secondary_index]
             {
                 let threshold = RATE_LIMIT_WARNING_THRESHOLDS[self.secondary_index];
-                if threshold != 50.0
-                    || (matches!(plan_type, Some(PlanType::Plus | PlanType::Team))
-                        && secondary_window_minutes
-                            .is_some_and(|minutes| is_approximate_window(minutes, 5 * 60)))
+                if threshold
+                    >= f64::from(usage_notice::warning_threshold(
+                        plan_type,
+                        secondary_window_minutes,
+                    ))
                 {
                     highest_secondary = Some(threshold);
                 }
@@ -75,10 +76,11 @@ impl RateLimitWarningState {
                 && primary_used_percent >= RATE_LIMIT_WARNING_THRESHOLDS[self.primary_index]
             {
                 let threshold = RATE_LIMIT_WARNING_THRESHOLDS[self.primary_index];
-                if threshold != 50.0
-                    || (matches!(plan_type, Some(PlanType::Plus | PlanType::Team))
-                        && primary_window_minutes
-                            .is_some_and(|minutes| is_approximate_window(minutes, 5 * 60)))
+                if threshold
+                    >= f64::from(usage_notice::warning_threshold(
+                        plan_type,
+                        primary_window_minutes,
+                    ))
                 {
                     highest_primary = Some(threshold);
                 }
@@ -137,7 +139,7 @@ pub(crate) fn fallback_limit_label(is_secondary: bool) -> &'static str {
     }
 }
 
-fn is_approximate_window(minutes: i64, expected_minutes: i64) -> bool {
+pub(super) fn is_approximate_window(minutes: i64, expected_minutes: i64) -> bool {
     let minutes = minutes as f64;
     let expected_minutes = expected_minutes as f64;
     minutes >= expected_minutes * 0.95 && minutes <= expected_minutes * 1.05
@@ -149,6 +151,10 @@ pub(super) enum RateLimitSwitchPromptState {
     Idle,
     Pending,
     Shown,
+    Recovering {
+        deadline: Instant,
+        seconds_shown: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -162,7 +168,10 @@ pub(super) fn app_server_rate_limit_error_kind(
     info: &AppServerCodexErrorInfo,
 ) -> Option<RateLimitErrorKind> {
     match info {
-        AppServerCodexErrorInfo::ServerOverloaded => Some(RateLimitErrorKind::ServerOverloaded),
+        AppServerCodexErrorInfo::ServerOverloaded
+        | AppServerCodexErrorInfo::PolicyCapacityUnavailable => {
+            Some(RateLimitErrorKind::ServerOverloaded)
+        }
         AppServerCodexErrorInfo::UsageLimitExceeded => Some(RateLimitErrorKind::UsageLimit),
         AppServerCodexErrorInfo::ResponseTooManyFailedAttempts {
             http_status_code: Some(429),
@@ -176,7 +185,7 @@ pub(super) fn is_app_server_cyber_policy_error(info: &AppServerCodexErrorInfo) -
 }
 
 #[derive(Clone, Copy)]
-enum RateLimitSnapshotSource {
+pub(super) enum RateLimitSnapshotSource {
     AccountUsage,
     RollingUpdate,
 }
@@ -252,11 +261,21 @@ impl ChatWidget {
         snapshot: Option<RateLimitSnapshot>,
         source: RateLimitSnapshotSource,
     ) {
+        let usage_notice_blocked = self.codex_rate_limit_reached_type.is_some()
+            || self.codex_spend_control_reached == Some(true);
         if let Some(mut snapshot) = snapshot {
             let limit_id = snapshot
                 .limit_id
                 .clone()
                 .unwrap_or_else(|| "codex".to_string());
+            let is_codex_limit = limit_id.eq_ignore_ascii_case("codex");
+            if is_codex_limit
+                && self
+                    .usage_notice_state
+                    .update(&snapshot, source, self.plan_type)
+            {
+                self.request_redraw();
+            }
             if matches!(source, RateLimitSnapshotSource::RollingUpdate)
                 && snapshot.credits.is_none()
             {
@@ -272,7 +291,6 @@ impl ChatWidget {
             }
             self.plan_type = snapshot.plan_type.or(self.plan_type);
 
-            let is_codex_limit = limit_id.eq_ignore_ascii_case("codex");
             if is_codex_limit
                 && (matches!(source, RateLimitSnapshotSource::AccountUsage)
                     || snapshot.spend_control_reached.is_some())
@@ -299,16 +317,34 @@ impl ChatWidget {
                     .credits
                     .as_ref()
                     .is_some_and(has_usable_workspace_credits);
-            if is_codex_limit && has_workspace_credits {
+            let used_percent = snapshot
+                .primary
+                .iter()
+                .chain(&snapshot.secondary)
+                .map(|window| window.used_percent)
+                .max();
+            let replenished = matches!(source, RateLimitSnapshotSource::AccountUsage)
+                && !self.usage_notice_state.applying_stale_read
+                && used_percent.is_some_and(|used| used < RATE_LIMIT_SWITCH_PROMPT_THRESHOLD);
+            if is_codex_limit && (has_workspace_credits || replenished) {
                 match self.rate_limit_switch_prompt {
                     RateLimitSwitchPromptState::Pending => {
                         self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Idle;
+                    }
+                    RateLimitSwitchPromptState::Shown if replenished => {
+                        let now = Instant::now();
+                        self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Recovering {
+                            deadline: now + Duration::from_secs(/*secs*/ 5),
+                            seconds_shown: 0,
+                        };
+                        self.tick_rate_limit_recovery_prompt(now);
                     }
                     RateLimitSwitchPromptState::Shown => {
                         self.bottom_pane
                             .dismiss_view_by_id(RATE_LIMIT_SWITCH_PROMPT_VIEW_ID);
                     }
-                    RateLimitSwitchPromptState::Idle => {}
+                    RateLimitSwitchPromptState::Idle
+                    | RateLimitSwitchPromptState::Recovering { .. } => {}
                 }
             }
             let should_warn_about_rate_limit_usage = is_codex_limit && !has_workspace_credits;
@@ -336,25 +372,13 @@ impl ChatWidget {
                 vec![]
             };
 
-            let high_usage = is_codex_limit
-                && (snapshot
-                    .secondary
-                    .as_ref()
-                    .map(|w| f64::from(w.used_percent) >= RATE_LIMIT_SWITCH_PROMPT_THRESHOLD)
-                    .unwrap_or(false)
-                    || snapshot
-                        .primary
-                        .as_ref()
-                        .map(|w| f64::from(w.used_percent) >= RATE_LIMIT_SWITCH_PROMPT_THRESHOLD)
-                        .unwrap_or(false));
-
-            if high_usage
-                && !has_workspace_credits
+            if used_percent.is_some_and(|used| used >= RATE_LIMIT_SWITCH_PROMPT_THRESHOLD)
+                && should_warn_about_rate_limit_usage
                 && !self.rate_limit_switch_prompt_hidden()
                 && self.current_model() != NUDGE_MODEL_SLUG
-                && !matches!(
+                && matches!(
                     self.rate_limit_switch_prompt,
-                    RateLimitSwitchPromptState::Shown
+                    RateLimitSwitchPromptState::Idle
                 )
             {
                 self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Pending;
@@ -367,15 +391,19 @@ impl ChatWidget {
                     .limit_name
                     .clone()
                     .unwrap_or_else(|| limit_id.clone());
-                let display =
-                    rate_limit_snapshot_display_for_limit(&snapshot, limit_label, Local::now());
+                let display = rate_limit_snapshot_display_for_limit(
+                    &snapshot,
+                    limit_label,
+                    Local::now(),
+                    self.clock_format,
+                );
                 self.rate_limit_snapshots_by_limit_id
                     .insert(limit_id, display);
             }
 
             if !warnings.is_empty() {
                 for warning in warnings {
-                    self.add_to_history(history_cell::new_warning_event(warning));
+                    self.add_to_history(history_cell::new_visible_warning_event(warning));
                 }
                 self.request_redraw();
             }
@@ -383,6 +411,12 @@ impl ChatWidget {
             self.rate_limit_snapshots_by_limit_id.clear();
             self.codex_rate_limit_reached_type = None;
             self.codex_spend_control_reached = None;
+        }
+        if usage_notice_blocked
+            != (self.codex_rate_limit_reached_type.is_some()
+                || self.codex_spend_control_reached == Some(true))
+        {
+            self.request_redraw();
         }
         self.refresh_status_line();
     }
@@ -415,7 +449,12 @@ impl ChatWidget {
     }
 
     pub(super) fn maybe_show_pending_rate_limit_prompt(&mut self) {
-        if self.has_applicable_backend_banner() {
+        if self.has_applicable_backend_banner()
+            || matches!(
+                self.rate_limit_switch_prompt,
+                RateLimitSwitchPromptState::Recovering { .. }
+            )
+        {
             return;
         }
         if self.rate_limit_switch_prompt_hidden()
@@ -438,6 +477,48 @@ impl ChatWidget {
         }
     }
 
+    pub(super) fn tick_rate_limit_recovery_prompt(&mut self, now: Instant) {
+        let RateLimitSwitchPromptState::Recovering {
+            deadline,
+            seconds_shown,
+        } = &mut self.rate_limit_switch_prompt
+        else {
+            return;
+        };
+        let remaining = deadline.saturating_duration_since(now);
+        if remaining.is_zero() {
+            self.bottom_pane
+                .dismiss_view_by_id(RATE_LIMIT_SWITCH_PROMPT_VIEW_ID);
+            self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Shown;
+            return;
+        }
+        let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0);
+        if *seconds_shown != seconds {
+            let unit = if seconds == 1 { "second" } else { "seconds" };
+            let params = SelectionViewParams {
+                view_id: Some(RATE_LIMIT_SWITCH_PROMPT_VIEW_ID),
+                title: Some("You’re no longer close to your usage limit.".into()),
+                subtitle: Some(format!("Dismissing in {seconds} {unit}…")),
+                items: vec![SelectionItem {
+                    name: "Dismiss".into(),
+                    dismiss_on_select: true,
+                    ..Default::default()
+                }],
+                ..SelectionViewParams::picker()
+            };
+            if !self
+                .bottom_pane
+                .replace_selection_view_if_present(RATE_LIMIT_SWITCH_PROMPT_VIEW_ID, params)
+            {
+                self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Shown;
+                return;
+            }
+            *seconds_shown = seconds;
+        }
+        self.bottom_pane
+            .request_redraw_in(remaining - Duration::from_secs(seconds - 1));
+    }
+
     fn open_rate_limit_switch_prompt(&mut self, preset: ModelPreset) {
         let switch_model = preset.model;
         let switch_model_for_events = switch_model.clone();
@@ -450,13 +531,11 @@ impl ChatWidget {
                 /*approvals_reviewer*/ None,
                 /*permission_profile*/ None,
                 /*active_permission_profile*/ None,
-                /*windows_sandbox_level*/ None,
                 Some(switch_model_for_events.clone()),
                 Some(Some(default_effort.clone())),
                 /*summary*/ None,
                 /*service_tier*/ None,
                 /*collaboration_mode*/ None,
-                /*personality*/ None,
             )));
             tx.send(AppEvent::UpdateModel(switch_model_for_events.clone()));
             tx.send(AppEvent::UpdateReasoningEffort(Some(
@@ -470,7 +549,7 @@ impl ChatWidget {
             tx.send(AppEvent::PersistRateLimitSwitchPromptHidden);
         })];
         let description = if preset.description.is_empty() {
-            Some("Uses fewer credits for upcoming turns.".to_string())
+            Some("Uses fewer credits for upcoming turns".to_string())
         } else {
             Some(preset.description)
         };
@@ -497,7 +576,7 @@ impl ChatWidget {
             SelectionItem {
                 name: "Keep current model (never show again)".to_string(),
                 description: Some(
-                    "Hide future rate limit reminders about switching models.".to_string(),
+                    "Hide future rate limit reminders about switching models".to_string(),
                 ),
                 selected_description: None,
                 is_current: false,
@@ -513,7 +592,7 @@ impl ChatWidget {
             subtitle: Some(format!("Switch to {switch_model} for lower credit usage?")),
             footer_hint: Some(standard_popup_hint_line()),
             items,
-            ..Default::default()
+            ..SelectionViewParams::picker()
         });
     }
 
@@ -547,9 +626,8 @@ impl ChatWidget {
                 ..Default::default()
             },
             SelectionItem {
-                name: "No".to_string(),
+                name: "No (default)".to_string(),
                 display_shortcut: Some(key_hint::plain(KeyCode::Char('n')).into()),
-                is_default: true,
                 dismiss_on_select: true,
                 ..Default::default()
             },

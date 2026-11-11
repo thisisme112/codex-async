@@ -8,6 +8,8 @@ async fn session_opt_in_is_required_before_sending_the_new_event() {
         let mut events = host
             .open_session(Request::new(proto::OpenSessionRequest {
                 cell_execution_limits: None,
+                output_truncation: None,
+                max_pending_delegate_calls: None,
                 completion_ready: requested,
             }))
             .await

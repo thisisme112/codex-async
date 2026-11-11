@@ -3,16 +3,19 @@
 //! Only trusted harness items establish overrides. Replay preserves startup prewarm's
 //! baseline while it is retained.
 //! Successful compaction retires the overrides and allows a fresh request baseline.
+//! Fixed-effort workers always use their selected request-level effort.
+//! Unsupported models use selected request effort without rewriting saved updates.
+//! A provider catalog can retire a request pin that is invalid for a new step.
 
 use super::session::Session;
 use super::step_context::StepContext;
 use super::step_settings::ResolvedStepSettings;
 use crate::state::ReasoningEffortPin;
-use codex_features::Feature;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::models::ConfigurationReasoning;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelOrigin;
 use codex_protocol::openai_models::ReasoningEffort;
 
 /// Sampling can establish a pin; compaction must not change live state before it succeeds.
@@ -26,7 +29,7 @@ impl Session {
     /// Establishes the selected effort in surviving history, independent of replayed settings.
     pub(crate) async fn record_reasoning_effort_override(&self, step_context: &StepContext) {
         let settings = &step_context.settings;
-        let Some(effort) = self.effort_for_configuration_update(settings).await else {
+        let Some(effort) = self.effort_for_configuration_update(settings) else {
             return;
         };
         let should_skip = {
@@ -96,21 +99,36 @@ impl Session {
         usage: RequestEffortUsage,
     ) -> Option<ReasoningEffort> {
         let selected_effort = settings.reasoning_effort().cloned();
-        if !self.enabled(Feature::ReasoningEffortOverride) {
+        if !self
+            .services
+            .model_client
+            .reasoning_effort_override_enabled(&settings.model_info)
+        {
+            if usage == RequestEffortUsage::Sampling {
+                self.state.lock().await.reasoning_effort_pin = ReasoningEffortPin::Unset;
+            }
             return selected_effort;
         }
-        if usage == RequestEffortUsage::Compaction
-            && let Some(pinned) = self
-                .state
-                .lock()
-                .await
-                .reasoning_effort_pin
-                .get(&settings.model_info.slug)
-        {
-            return Some(pinned);
-        }
-        let effort = self.effort_for_configuration_update(settings).await;
+        let effort = self.effort_for_configuration_update(settings);
         let mut state = self.state.lock().await;
+        if let Some(pinned) = state.reasoning_effort_pin.get(&settings.model_info.slug) {
+            let model = &settings.model_info;
+            let disallowed = model.origin == ModelOrigin::Provider
+                && !model.supported_reasoning_levels.is_empty()
+                && !model
+                    .supported_reasoning_levels
+                    .iter()
+                    .any(|preset| model.resolve_reasoning_effort(preset.effort.clone()) == pinned);
+            if disallowed {
+                // Check the step's captured metadata, so a refresh cannot change a running
+                // step. Failed compaction must not mutate the live request baseline.
+                if usage == RequestEffortUsage::Sampling {
+                    state.reasoning_effort_pin = ReasoningEffortPin::Unset;
+                }
+            } else if usage == RequestEffortUsage::Compaction {
+                return Some(pinned);
+            }
+        }
         let Some(effort) = effort else {
             if usage == RequestEffortUsage::Sampling {
                 state.reasoning_effort_pin = ReasoningEffortPin::Unset;
@@ -126,13 +144,14 @@ impl Session {
         })
     }
 
-    async fn effort_for_configuration_update(
+    fn effort_for_configuration_update(
         &self,
         settings: &ResolvedStepSettings,
     ) -> Option<ReasoningEffort> {
-        if !self.enabled(Feature::ReasoningEffortOverride)
-            || !settings.model_info.use_responses_lite
-            || !self.provider().await.is_openai()
+        if !self
+            .services
+            .model_client
+            .reasoning_effort_override_enabled(&settings.model_info)
         {
             return None;
         }

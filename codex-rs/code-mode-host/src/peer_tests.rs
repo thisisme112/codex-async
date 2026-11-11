@@ -9,6 +9,7 @@ use codex_code_mode_protocol::host::DelegateRequest;
 use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::HostResponse;
 use codex_code_mode_protocol::host::HostToClient;
+use codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_CALLS;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::WireResult;
@@ -20,7 +21,6 @@ use tokio::sync::oneshot::error::TryRecvError;
 use tokio_util::sync::CancellationToken;
 
 use super::HostPeer;
-use super::MAX_PENDING_DELEGATE_CALLS;
 
 fn session_id(value: &str) -> SessionId {
     SessionId::new(value).expect("session ID")
@@ -29,7 +29,7 @@ fn session_id(value: &str) -> SessionId {
 #[tokio::test]
 async fn completion_ready_before_start_cell_preserves_admission_and_closure_order() {
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel(/*buffer*/ 4);
-    let mut peer = HostPeer::new(outgoing_tx);
+    let mut peer = HostPeer::new(outgoing_tx, MAX_PENDING_DELEGATE_CALLS);
     peer.completion_ready = true;
     let peer = Arc::new(peer);
     let session_id = session_id("session-1");
@@ -138,7 +138,7 @@ async fn completion_ready_before_start_cell_preserves_admission_and_closure_orde
 #[tokio::test]
 async fn start_cell_reports_when_initial_response_is_enqueued() {
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel(/*max_capacity*/ 4);
-    let peer = Arc::new(HostPeer::new(outgoing_tx));
+    let peer = Arc::new(HostPeer::new(outgoing_tx, MAX_PENDING_DELEGATE_CALLS));
     let cell_id = CellId::new("cell-1".to_string());
     let (response_tx, response_rx) = oneshot::channel();
     let started = StartedCell::new(cell_id.clone(), response_rx);
@@ -161,6 +161,7 @@ async fn start_cell_reports_when_initial_response_is_enqueued() {
             code_mode_host_duration: None,
             cell_id: cell_id.clone(),
             content_items: Vec::new(),
+            result_buffered_for: Duration::ZERO,
             error_text: None,
         })
         .expect("initial response receiver");
@@ -184,7 +185,7 @@ async fn start_cell_reports_when_initial_response_is_enqueued() {
 #[tokio::test]
 async fn pending_delegate_limit_rejects_call_without_disconnecting() {
     let (outgoing_tx, _outgoing_rx) = mpsc::channel(/*max_capacity*/ 1);
-    let peer = Arc::new(HostPeer::new(outgoing_tx));
+    let peer = Arc::new(HostPeer::new(outgoing_tx, MAX_PENDING_DELEGATE_CALLS));
     let permits = Arc::clone(&peer.delegate_permits)
         .acquire_many_owned(MAX_PENDING_DELEGATE_CALLS as u32)
         .await

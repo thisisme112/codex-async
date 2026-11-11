@@ -51,27 +51,32 @@ struct TokenDefaultDaclInfo {
     default_dacl: *mut ACL,
 }
 
-/// Sets a permissive default DACL so sandboxed processes can create pipes/IPC objects
-/// without hitting ACCESS_DENIED when PowerShell builds pipelines.
-unsafe fn set_default_dacl(h_token: HANDLE, sids: &[*mut c_void]) -> Result<()> {
-    if sids.is_empty() {
-        return Ok(());
-    }
-    let entries: Vec<EXPLICIT_ACCESS_W> = sids
-        .iter()
-        .map(|sid| EXPLICIT_ACCESS_W {
-            grfAccessPermissions: GENERIC_ALL,
-            grfAccessMode: GRANT_ACCESS,
-            grfInheritance: 0,
-            Trustee: TRUSTEE_W {
-                pMultipleTrustee: std::ptr::null_mut(),
-                MultipleTrusteeOperation: 0,
-                TrusteeForm: TRUSTEE_IS_SID,
-                TrusteeType: TRUSTEE_IS_UNKNOWN,
-                ptstrName: *sid as *mut u16,
-            },
-        })
-        .collect();
+/// Keep child-process and IPC access within the runner's logon session.
+/// Elevated runners have distinct logon SIDs even when they use the same account.
+unsafe fn set_default_dacl(h_token: HANDLE, logon_sid: *mut c_void) -> Result<()> {
+    let owner_rights = LocalSid::from_string("S-1-3-4")?;
+    // The shared account also owns these objects. An OWNER RIGHTS ACE suppresses
+    // its implicit WRITE_DAC grant, which would otherwise let a different logon
+    // rewrite this DACL. The creating logon retains full access explicitly.
+    let entries = [
+        (logon_sid, GENERIC_ALL),
+        (
+            owner_rights.as_ptr(),
+            windows_sys::Win32::Storage::FileSystem::READ_CONTROL,
+        ),
+    ]
+    .map(|(sid, access)| EXPLICIT_ACCESS_W {
+        grfAccessPermissions: access,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: 0,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: sid as *mut u16,
+        },
+    });
     let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
     let res = SetEntriesInAclW(
         entries.len() as u32,
@@ -175,7 +180,7 @@ pub unsafe fn get_current_token_for_restriction() -> Result<HANDLE> {
         | TOKEN_ADJUST_DEFAULT
         | TOKEN_ADJUST_SESSIONID
         | TOKEN_ADJUST_PRIVILEGES;
-    let mut h: HANDLE = 0;
+    let mut h: HANDLE = std::ptr::null_mut();
     #[link(name = "advapi32")]
     unsafe extern "system" {
         fn OpenProcessToken(
@@ -193,7 +198,7 @@ pub unsafe fn get_current_token_for_restriction() -> Result<HANDLE> {
 
 /// An owned token group, including attributes such as enabled and deny-only.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct TokenGroup {
+pub struct TokenGroup {
     pub sid: Vec<u8>,
     pub attributes: u32,
 }
@@ -202,7 +207,7 @@ pub(crate) struct TokenGroup {
 ///
 /// # Safety
 /// `token` must remain a valid token handle with `TOKEN_QUERY` access during this call.
-pub(crate) unsafe fn token_groups(token: HANDLE, max_bytes: u32) -> Result<Vec<TokenGroup>> {
+pub unsafe fn token_groups(token: HANDLE, max_bytes: u32) -> Result<Vec<TokenGroup>> {
     let mut needed = 0;
     GetTokenInformation(token, TokenGroups, std::ptr::null_mut(), 0, &mut needed);
     ensure!(
@@ -316,7 +321,7 @@ pub unsafe fn get_logon_sid_bytes(h_token: HANDLE) -> Result<Vec<u8>> {
         if ok != 0 {
             let lt: TOKEN_LINKED_TOKEN =
                 std::ptr::read_unaligned(ln_buf.as_ptr() as *const TOKEN_LINKED_TOKEN);
-            if lt.linked_token != 0 {
+            if !lt.linked_token.is_null() {
                 let res = scan_token_groups_for_logon(lt.linked_token);
                 CloseHandle(lt.linked_token);
                 if let Some(v) = res {
@@ -491,7 +496,7 @@ unsafe fn create_token_with_caps_from(
     entries[logon_idx + 1].Sid = psid_everyone;
     entries[logon_idx + 1].Attributes = 0;
 
-    let mut new_token: HANDLE = 0;
+    let mut new_token: HANDLE = std::ptr::null_mut();
     let flags = DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED;
     let ok = CreateRestrictedToken(
         base_token,
@@ -508,15 +513,14 @@ unsafe fn create_token_with_caps_from(
         return Err(anyhow!("CreateRestrictedToken failed: {}", GetLastError()));
     }
 
-    // Additional restricting SIDs are identity markers, not capabilities. Deliberately exclude
-    // them from the default DACL so possessing a route identity cannot grant object access.
-    let mut dacl_sids: Vec<*mut c_void> = Vec::with_capacity(psid_capabilities.len() + 2);
-    dacl_sids.push(psid_logon);
-    dacl_sids.push(psid_everyone);
-    dacl_sids.extend_from_slice(psid_capabilities);
-    set_default_dacl(new_token, &dacl_sids)?;
-
-    enable_single_privilege(new_token, "SeChangeNotifyPrivilege")?;
+    // Filesystem and route capabilities may be shared between launches. They
+    // must not grant access to another launch's processes, threads, or IPC.
+    if let Err(error) = set_default_dacl(new_token, psid_logon)
+        .and_then(|()| enable_single_privilege(new_token, "SeChangeNotifyPrivilege"))
+    {
+        CloseHandle(new_token);
+        return Err(error);
+    }
     Ok(new_token)
 }
 

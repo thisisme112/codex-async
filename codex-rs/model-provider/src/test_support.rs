@@ -1,4 +1,4 @@
-//! Fixtures for integration tests that seed the provider's model cache.
+//! Fixtures for integration tests that seed provider credentials and model caches.
 
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
@@ -19,3 +19,7 @@ pub fn models_cache_entry(
         models,
     }
 }
+
+pub use crate::shared_state::test_support::seed_gateway_auth;
+
+pub use crate::provider::test_support::runtime_model_provider;

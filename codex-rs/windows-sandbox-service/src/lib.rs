@@ -4,6 +4,7 @@ use anyhow::Result;
 mod installation_record;
 #[cfg(windows)]
 mod ipc;
+
 #[cfg(windows)]
 mod machine_policy;
 #[cfg(windows)]
@@ -13,7 +14,11 @@ mod package_lifecycle;
 #[cfg(windows)]
 mod provisioning;
 #[cfg(windows)]
+mod registered_runtime;
+#[cfg(windows)]
 mod service;
+#[cfg(any(windows, test))]
+mod uninstall_policy;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunMode {

@@ -1,7 +1,10 @@
-//! Implements the Windows setup helper behind its shared library entrypoint.
-//! Payload validation and all provisioning modes retain the helper contract.
+//! Privileged sandbox setup shared by the setup helper and the service's ProvisionOnly path.
+//! Full and read-ACL setup remain helper entrypoints; only they may launch a read-ACL child.
+//! Command-line account provisioning cannot enter the service's admitted Core path.
 
 mod firewall;
+mod service;
+pub use service::provision_sandbox_in_process;
 mod read_acl_mutex;
 
 use crate::DirectoryOpenDisposition;
@@ -9,6 +12,7 @@ use crate::SETUP_VERSION;
 use crate::SetupErrorCode;
 use crate::SetupErrorReport;
 use crate::SetupFailure;
+use crate::SetupRuntime;
 use crate::acquire_sandbox_setup_lock;
 use crate::add_deny_write_ace;
 use crate::convert_string_sid_to_sid;
@@ -28,6 +32,8 @@ use crate::sandbox_bin_dir;
 use crate::sandbox_dir;
 use crate::sandbox_secrets_dir;
 use crate::set_local_user_flags;
+use crate::setup_acl_error::WriteAclOperation;
+use crate::setup_acl_error::record_acl_failure;
 use crate::setup_error_path;
 use crate::setup_log_writer;
 use crate::string_from_sid_bytes;
@@ -77,6 +83,7 @@ use windows_sys::Win32::Storage::FileSystem::DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_EXECUTE;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
+use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
@@ -99,6 +106,7 @@ use sandbox_users::provision_sandbox_users;
 use sandbox_users::resolve_sandbox_users_group_sid;
 use sandbox_users::sid_bytes_to_psid;
 
+// Legacy omits runtime; readers default its absence to Legacy.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct Payload {
     version: u32,
@@ -119,7 +127,11 @@ struct Payload {
     otel: Option<StatsigMetricsSettings>,
     real_user: String,
     #[serde(default)]
+    user_profile: Option<PathBuf>,
+    #[serde(default)]
     mode: SetupMode,
+    #[serde(default, skip_serializing_if = "SetupRuntime::is_legacy")]
+    runtime: SetupRuntime,
     #[serde(default)]
     refresh_only: bool,
 }
@@ -132,6 +144,16 @@ enum SetupMode {
     InteractiveProvision,
     ProvisionOnly,
     ReadAclsOnly,
+}
+
+impl SetupMode {
+    fn provisions_accounts(self, refresh_only: bool) -> bool {
+        match self {
+            Self::ProvisionOnly | Self::InteractiveProvision => true,
+            Self::Full => !refresh_only,
+            Self::ReadAclsOnly => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -194,8 +216,9 @@ fn spawn_read_acl_helper(payload: &Payload, _log: &mut dyn Write) -> Result<()> 
     let payload_json = serde_json::to_vec(&read_payload)?;
     let payload_b64 = BASE64.encode(payload_json);
     let exe = std::env::current_exe().context("locate setup helper")?;
-    Command::new(&exe)
-        .arg(payload_b64)
+    let mut command = Command::new(&exe);
+    crate::launch_environment::configure_command(&mut command, &payload_b64)?;
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -347,22 +370,23 @@ fn lock_sandbox_dir(
     let system_sid = resolve_sid("SYSTEM")?;
     let admins_sid = resolve_sid("Administrators")?;
     let real_sid = resolve_sid(real_user)?;
+    let modify = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE;
+    let (security_information, system_access) = match dacl_inheritance {
+        DaclInheritance::Inherited => (DACL_SECURITY_INFORMATION, modify),
+        // The SYSTEM helper must be able to reapply the bin policy to existing children.
+        DaclInheritance::Protected => (
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            modify | WRITE_DAC,
+        ),
+    };
     let entries = [
         (
             sandbox_group_sid.to_vec(),
             sandbox_group_mask,
             sandbox_group_access_mode,
         ),
-        (
-            system_sid,
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
-            GRANT_ACCESS,
-        ),
-        (
-            admins_sid,
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
-            GRANT_ACCESS,
-        ),
+        (system_sid, system_access, GRANT_ACCESS),
+        (admins_sid, modify, GRANT_ACCESS),
         (real_sid, real_user_mask, GRANT_ACCESS),
     ];
     unsafe {
@@ -404,12 +428,6 @@ fn lock_sandbox_dir(
                 "SetEntriesInAclW sandbox dir failed: {set}",
             ));
         }
-        let security_information = match dacl_inheritance {
-            DaclInheritance::Inherited => DACL_SECURITY_INFORMATION,
-            DaclInheritance::Protected => {
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
-            }
-        };
         let (res, api) = match directory.as_ref() {
             Some(directory) => (
                 SetSecurityInfo(
@@ -497,6 +515,16 @@ fn real_main(setup_mode: &mut Option<SetupMode>) -> Result<()> {
         )));
     }
     let payload_b64 = args.remove(1);
+    let payload_b64 = if payload_b64 == crate::launch_environment::ARG {
+        crate::environment_transport::decode(std::env::vars_os()).map_err(|err| {
+            anyhow::Error::new(SetupFailure::new(
+                SetupErrorCode::HelperRequestArgsFailed,
+                format!("failed to read payload environment: {err}"),
+            ))
+        })?
+    } else {
+        payload_b64
+    };
     let payload_json = BASE64.decode(payload_b64).map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperRequestArgsFailed,
@@ -519,6 +547,24 @@ fn real_main(setup_mode: &mut Option<SetupMode>) -> Result<()> {
             ),
         )));
     }
+    // Only this entry parses command-line JSON. Keep admission locked through
+    // the entire account-provisioning operation, including initial Full setup.
+    // The in-process adapter enters separately after authenticated service admission.
+    let _setup_guard = if payload.mode.provisions_accounts(payload.refresh_only) {
+        let guard = acquire_sandbox_setup_lock(INFINITE)?;
+        anyhow::ensure!(
+            payload.runtime == SetupRuntime::Legacy && !crate::registered_core_requested(),
+            "registered Core requires service-owned provisioning"
+        );
+        anyhow::ensure!(
+            crate::runtime_ownership::load_installation()?
+                .is_none_or(|record| record.runtime.is_none()),
+            "registered Core owns these sandbox accounts; helper provisioning is not permitted"
+        );
+        Some(guard)
+    } else {
+        None
+    };
     run_payload(&payload)
 }
 
@@ -817,6 +863,9 @@ fn lock_persistent_sandbox_dirs(payload: &Payload, sandbox_group_sid: &[u8]) -> 
 }
 
 fn lock_sandbox_bin_dir(payload: &Payload, sandbox_group_sid: &[u8]) -> Result<()> {
+    if payload.runtime == SetupRuntime::Registered {
+        return Ok(());
+    }
     // The owner's unelevated refresh must be able to reapply this protected DACL.
     lock_sandbox_dir(
         &sandbox_bin_dir(&payload.codex_home),
@@ -832,7 +881,7 @@ fn lock_sandbox_bin_dir(payload: &Payload, sandbox_group_sid: &[u8]) -> Result<(
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperSandboxLockFailed,
             format!(
-                "lock sandbox bin dir {} failed: {err}",
+                "lock sandbox bin dir {} failed: {err:#}",
                 sandbox_bin_dir(&payload.codex_home).display()
             ),
         ))
@@ -895,6 +944,50 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             log,
             &format!("applied {} deny-read ACLs", applied_deny_read_paths.len()),
         )?;
+    }
+
+    if let Some(user_profile) = payload.user_profile.as_deref()
+        && user_profile.is_absolute()
+    {
+        let mut cwd_components = payload.command_cwd.components();
+        let cwd_is_under_profile = user_profile.components().all(|profile_component| {
+            cwd_components.next().is_some_and(|cwd_component| {
+                cwd_component
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&profile_component.as_os_str().to_string_lossy())
+            })
+        });
+        if cwd_is_under_profile {
+            match unsafe {
+                ensure_allow_mask_aces_with_inheritance(
+                    user_profile,
+                    &[sandbox_group_psid],
+                    FILE_READ_ATTRIBUTES,
+                    /*inheritance*/ 0,
+                )
+            } {
+                Ok(true) => {
+                    log_line(
+                        log,
+                        &format!(
+                            "granted non-inheriting read-attributes ACE on user profile {}",
+                            user_profile.display()
+                        ),
+                    )?;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    log_line(
+                        log,
+                        &format!(
+                            "failed to grant non-inheriting read-attributes ACE on user profile {}: {err:#}; continuing setup",
+                            user_profile.display()
+                        ),
+                    )?;
+                }
+            }
+        }
     }
 
     if payload.read_roots.is_empty() {
@@ -962,18 +1055,12 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             match path_write_aces_need_refresh(root, &[sandbox_group_psid, root_cap_psid]) {
                 Ok(needs_refresh) => needs_refresh,
                 Err(e) => {
-                    refresh_errors.push(format!(
-                        "write ACE check failed on {}: {}",
-                        root.display(),
-                        e
-                    ));
-                    log_line(
-                        log,
-                        &format!(
-                            "write ACE check failed on {}: {}; continuing",
-                            root.display(),
-                            e
-                        ),
+                    record_acl_failure(
+                        &mut refresh_errors,
+                        WriteAclOperation::Check,
+                        root,
+                        &e,
+                        |message| log_line(log, message),
                     )?;
                     true
                 }
@@ -1025,10 +1112,12 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             match res {
                 Ok(_) => {}
                 Err(e) => {
-                    refresh_errors.push(format!("write ACE failed on {}: {}", root.display(), e));
-                    if log_line(
-                        log,
-                        &format!("write ACE grant failed on {}: {}", root.display(), e),
+                    if record_acl_failure(
+                        &mut refresh_errors,
+                        WriteAclOperation::Grant,
+                        &root,
+                        &e,
+                        |message| log_line(log, message),
                     )
                     .is_err()
                     {
@@ -1079,10 +1168,12 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                 }
                 Ok(false) => {}
                 Err(err) => {
-                    refresh_errors.push(format!("deny ACE failed on {}: {err}", path.display()));
-                    log_line(
-                        log,
-                        &format!("deny ACE failed on {}: {err}", path.display()),
+                    record_acl_failure(
+                        &mut refresh_errors,
+                        WriteAclOperation::Deny,
+                        path,
+                        &err,
+                        |message| log_line(log, message),
                     )?;
                 }
             }
@@ -1129,6 +1220,10 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
 mod acl_tests;
 
 #[cfg(test)]
+#[path = "setup_provisioning/registered_tests.rs"]
+mod registered_tests;
+
+#[cfg(test)]
 mod tests {
     use super::Payload;
     use super::SETUP_VERSION;
@@ -1149,7 +1244,7 @@ mod tests {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Storage::FileSystem::FILE_DELETE_CHILD;
 
-    fn payload_json() -> serde_json::Value {
+    pub(super) fn payload_json() -> serde_json::Value {
         json!({
             "version": SETUP_VERSION,
             "offline_username": "CodexSandboxOffline",

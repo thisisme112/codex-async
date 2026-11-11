@@ -45,26 +45,28 @@ should parse that JSON rather than relying on human-readable text. Lifecycle
 responses report the resolved backend, socket path, local CLI version, and
 running app-server version when applicable.
 
-Standalone-managed daemons check for updates after five minutes, then hourly by
+Eligible managed daemons check for updates after five minutes, then hourly by
 default. Edit `CODEX_HOME/app-server-daemon/settings.json` to change this:
 
 ```json
-{"remoteControlEnabled": false,
- "shutdownGraceSeconds": 60,
- "updater": {"autoUpdateEnabled": false, "updateIntervalMinutes": 120}}
+{
+  "remoteControlEnabled": false,
+  "shutdownGraceSeconds": 60,
+  "updater": { "autoUpdateEnabled": false, "updateIntervalMinutes": 120 }
+}
 ```
 
 Positive minute intervals have no configured cap. `daemon restart` applies the
 enabled state; the next updater wait reads a new interval. The preference does
 not affect an explicit `codex update` command or `daemon update`.
 
-`daemon update` checks the latest stable release once, even with automatic
-updates disabled. It requires a Codex installer-owned latest-channel standalone
-install. JSON reports `updated`, `noUpdate`, or `unsupported`, with installed
-and running versions. The updater owns scheduled and manual installs. A manual
-update restarts a running managed daemon, so active or queued work may be
-interrupted.
-Accepted updates continue if the CLI exits. Installer errors return nonzero.
+`daemon update` selects the latest stable release, even with automatic updates
+disabled. It also returns pinned or local managed packages to production update
+eligibility, preserving the automatic-update preference. Legacy installations
+migrate to the dedicated root once the published installer and release support
+migration. JSON reports `updated`, `noUpdate`, or `unsupported`, with installed
+and running versions. A running daemon restarts, so active or queued work may be
+interrupted; a stopped daemon stays stopped. Installer errors return nonzero.
 The updater uses saved network settings; CLI `-c` overrides do not reach it.
 
 For all managed app-server shutdowns, including explicit stop and restart and
@@ -90,29 +92,42 @@ $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.c
 & "$codexHome\packages\standalone\current\bin\codex.exe" app-server daemon bootstrap --remote-control
 ```
 
-`bootstrap` requires the standalone managed install. It records the daemon
-settings under `CODEX_HOME/app-server-daemon/`, starts app-server as a
+`bootstrap` can use any complete CLI package. If no daemon package is installed,
+it copies the invoking package into `CODEX_HOME/packages/app-server-daemon` and
+prints an installation message without asking for confirmation. Existing daemon
+packages are reused, including legacy installations; a broken selection is not
+silently replaced. A bare executable cannot supply a new installation.
+
+It records the daemon settings under `CODEX_HOME/app-server-daemon/`, starts app-server as a
 pidfile-backed detached process. It launches a detached updater loop when
 automatic updates are enabled, the installer selected the stable `latest`
 channel, and the managed binary supports the updater command.
 
 ## Installation and update cases
 
-The daemon uses the standalone installer (`install.sh` on Unix, `install.ps1`
-on Windows) and its managed binary under `CODEX_HOME/packages/standalone/current`:
-`bin/codex` or `bin/codex.exe`, falling back to the legacy flat layout when present.
+New daemons use `CODEX_HOME/packages/app-server-daemon/current/bin/codex`
+(`codex.exe` on Windows). The package contains the executable and its helpers.
+Daemon-only installer updates leave the user's CLI command and shell setup alone.
 
-| Situation | What starts | Does this daemon fetch new binaries? | Does a running app-server eventually move to a newer binary on its own? |
-| --- | --- | --- | --- |
-| Latest-channel installer has run; `start` or `bootstrap` is used with automatic updates enabled | Managed binary and detached updater when supported | When supported, the platform's installer runs on the configured cadence. | When supported, the running server restarts with the new binary before the updater replaces itself. |
-| Installer selected an explicit release; `bootstrap` is used | Managed binary only | No; the selected release stays pinned. | No; an explicit restart uses the selected binary. |
-| Another tool updates the managed binary | A fresh start or explicit restart uses it; a running server is reused. | Yes, when a latest-channel updater is running, on the configured cadence. | An updater that was running through the change compares binary contents on its next successful installer pass and refreshes the server first. |
+Previously launched legacy daemons retain `CODEX_HOME/packages/standalone/current`,
+including its flat binary layout when present. Starts and scheduled updates keep
+using that location. An explicit production update prepares and validates a
+compatible dedicated package before stopping the legacy updater and daemon,
+selecting the new package, and restarting only a previously running daemon.
+The old CLI package files and selection remain unchanged.
 
-### Standalone installs
+| Situation                                                                                       | What starts                                                            | Does this daemon fetch new binaries?                                      | Does a running app-server eventually move to a newer binary on its own?                                                                       |
+| ----------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Latest-channel installer has run; `start` or `bootstrap` is used with automatic updates enabled | Managed binary and detached updater when supported                     | When supported, the platform's installer runs on the configured cadence.  | When supported, the running server restarts with the new binary before the updater replaces itself.                                           |
+| Installer selected an explicit release; `bootstrap` is used                                     | Managed binary only                                                    | No; the selected release stays pinned.                                    | No; an explicit restart uses the selected binary.                                                                                             |
+| Another tool updates the managed binary                                                         | A fresh start or explicit restart uses it; a running server is reused. | Yes, when a latest-channel updater is running, on the configured cadence. | An updater that was running through the change compares binary contents on its next successful installer pass and refreshes the server first. |
 
-For installs created by either platform's standalone installer:
+### Managed packages
 
-- lifecycle commands always use the standalone managed binary path
+For dedicated and retained legacy daemon installations:
+
+- lifecycle commands use the selected daemon package, regardless of the invoking
+  CLI version; they do not implicitly replace an existing package
 - `bootstrap` is supported
 - managed `start`, `restart`, and `bootstrap` ensure a single detached pid-backed
   updater loop only when automatic updates are enabled for a stable latest-channel
@@ -156,9 +171,10 @@ so the new setting takes effect immediately.
 
 Top-level `codex remote-control start` enables and persists remote control for
 the managed daemon, overriding a saved disabled value. It starts or bootstraps
-the daemon as needed. Plain `codex remote-control` runs a separate foreground
-server and does not change daemon settings; `codex remote-control stop` stops
-the managed daemon without clearing its saved remote-control preference.
+the daemon as needed. Plain `codex remote-control` uses the managed daemon when
+eligible; `codex remote-control --no-daemon` runs a separate foreground server.
+`codex remote-control stop` stops the managed daemon without clearing its saved
+remote-control preference.
 `daemon start` and `daemon restart` use that saved preference. `daemon bootstrap`
 sets it according to `--remote-control` (disabled when omitted).
 

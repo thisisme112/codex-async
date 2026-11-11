@@ -5,10 +5,12 @@ pub(crate) mod execute_spec;
 mod interactive;
 #[cfg(test)]
 pub(crate) mod interactive_test_support;
-mod response_adapter;
-mod telemetry;
 mod worker_lifecycle;
 pub(crate) use interactive::ToolPromptOrigin;
+mod output;
+mod response_adapter;
+mod telemetry;
+mod tool_definitions;
 mod wait_handler;
 pub(crate) mod wait_spec;
 
@@ -19,6 +21,7 @@ use std::time::Duration;
 
 use codex_code_mode::CellId;
 use codex_code_mode::CodeModeNestedToolCall;
+use codex_code_mode::CodeModeOutputTruncation;
 use codex_code_mode::CodeModeSession;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::CodeModeToolKind;
@@ -48,15 +51,16 @@ use crate::tools::router::ToolCallSource;
 use crate::unified_exec::resolve_max_tokens;
 use codex_protocol::openai_models::ToolMode;
 use codex_tools::ToolName;
-use codex_utils_audio::estimate_audio_token_count;
+use codex_utils_audio::estimate_tool_audio_tokens_without_cache;
 use codex_utils_output_truncation::TruncationPolicy;
-use codex_utils_output_truncation::formatted_truncate_text_content_items_with_policy;
-use codex_utils_output_truncation::truncate_function_output_items_with_policy;
+use codex_utils_output_truncation::formatted_truncate_function_output_items_with_policy;
 
 use delegate::CodeModeCellDelegate;
 use delegate::CodeModeDispatchBroker;
 pub(crate) use execute_handler::CodeModeExecuteHandler;
+use output::CodeModeToolOutput;
 use response_adapter::into_function_call_output_content_items;
+pub(crate) use tool_definitions::prepare_code_mode_tool_definitions;
 pub(crate) use wait_handler::CodeModeWaitHandler;
 use worker_lifecycle::WorkerScope;
 
@@ -137,7 +141,14 @@ impl CodeModeService {
         Arc::clone(&self.session_provider)
     }
 
-    async fn execute(
+    fn output_truncation(&self) -> CodeModeOutputTruncation {
+        self.session
+            .get()
+            .map(|session| session.output_truncation())
+            .unwrap_or_default()
+    }
+
+    pub(crate) async fn execute(
         &self,
         mut request: codex_code_mode::ExecuteRequest,
         step_context: Arc<StepContext>,
@@ -146,6 +157,7 @@ impl CodeModeService {
         request
             .yield_time_ms
             .get_or_insert(self.default_exec_yield_time_ms);
+        let preempt = step_context.preempt.clone();
         let mut execution = self.dispatch_broker.workers.execution();
         let lease = execution
             .0
@@ -161,7 +173,11 @@ impl CodeModeService {
             Some(reservation) => completion::CompletionDelegate::wrap(delegate, reservation),
             None => delegate,
         };
-        let started = self.session().await?.execute(request, delegate).await?;
+        let started = self
+            .session()
+            .await?
+            .execute(request, delegate, preempt)
+            .await?;
         // Old providers cannot release a retained worker at commit. Keep their old scope lifetime.
         if started.completion_ready_support == codex_code_mode::CompletionReadySupport::Unsupported
         {
@@ -176,9 +192,10 @@ impl CodeModeService {
     pub(crate) async fn wait(
         &self,
         request: codex_code_mode::WaitRequest,
+        preempt: Option<CancellationToken>,
     ) -> Result<codex_code_mode::WaitOutcome, String> {
         let cell_id = request.cell_id.clone();
-        let outcome = self.session().await?.wait(request).await?;
+        let outcome = self.session().await?.wait(request, preempt).await?;
         if !matches!(
             &outcome,
             codex_code_mode::WaitOutcome::LiveCell(RuntimeResponse::Yielded { .. })
@@ -191,11 +208,11 @@ impl CodeModeService {
 
     pub(crate) async fn terminate(
         &self,
-        cell_id: CellId,
+        request: codex_code_mode::TerminateRequest,
     ) -> Result<codex_code_mode::WaitOutcome, String> {
-        self.completions.cancel_cell_commands(&cell_id);
-        self.completions.retire_cell(&cell_id);
-        self.session().await?.terminate(cell_id).await
+        self.completions.cancel_cell_commands(&request.cell_id);
+        self.completions.retire_cell(&request.cell_id);
+        self.session().await?.terminate(request).await
     }
 
     pub(crate) async fn interrupt_active_cells(&self) {
@@ -208,7 +225,7 @@ impl CodeModeService {
                 .into_iter()
                 .map(|cell_id| async move {
                     self.completions.cancel_cell_commands(&cell_id);
-                    if let Err(error) = session.terminate(cell_id.clone()).await {
+                    if let Err(error) = session.terminate(cell_id.clone().into()).await {
                         tracing::warn!(%cell_id, %error, "failed to terminate interrupted code-mode cell");
                     }
                 }),
@@ -317,51 +334,46 @@ impl CodeModeService {
     }
 }
 
-pub(super) async fn handle_runtime_response(
+fn handle_runtime_response(
     model_info: &codex_protocol::openai_models::ModelInfo,
     response: RuntimeResponse,
     max_output_tokens: Option<usize>,
+    output_truncation: CodeModeOutputTruncation,
     wall_time: Duration,
-) -> Result<FunctionToolOutput, String> {
+    experimental_show_cell_overhead: bool,
+) -> CodeModeToolOutput {
     let script_status = format_script_status(&response);
     let supports_original = can_request_original_image_detail(model_info);
+    let host_duration = response
+        .code_mode_host_duration()
+        .filter(|_| experimental_show_cell_overhead);
 
-    match response {
-        RuntimeResponse::Yielded { content_items, .. } => {
-            let mut content_items = into_function_call_output_content_items(content_items);
-            sanitize_image_detail_items(supports_original, &mut content_items);
-            content_items = truncate_code_mode_result(content_items, max_output_tokens);
-            prepend_script_status(&mut content_items, &script_status, wall_time);
-            Ok(FunctionToolOutput::from_content(content_items, Some(true)))
-        }
-        RuntimeResponse::Terminated { content_items, .. } => {
-            let mut content_items = into_function_call_output_content_items(content_items);
-            sanitize_image_detail_items(supports_original, &mut content_items);
-            content_items = truncate_code_mode_result(content_items, max_output_tokens);
-            prepend_script_status(&mut content_items, &script_status, wall_time);
-            Ok(FunctionToolOutput::from_content(content_items, Some(true)))
-        }
+    let (content_items, error_text) = match response {
+        RuntimeResponse::Yielded { content_items, .. }
+        | RuntimeResponse::Terminated { content_items, .. } => (content_items, None),
         RuntimeResponse::Result {
             content_items,
             error_text,
             ..
-        } => {
-            let mut content_items = into_function_call_output_content_items(content_items);
-            sanitize_image_detail_items(supports_original, &mut content_items);
-            let success = error_text.is_none();
-            if let Some(error_text) = error_text {
-                content_items.push(FunctionCallOutputContentItem::InputText {
-                    text: format!("Script error:\n{error_text}"),
-                });
-            }
-            content_items = truncate_code_mode_result(content_items, max_output_tokens);
-            prepend_script_status(&mut content_items, &script_status, wall_time);
-            Ok(FunctionToolOutput::from_content(
-                content_items,
-                Some(success),
-            ))
+        } => (content_items, error_text),
+    };
+    let mut content_items = into_function_call_output_content_items(content_items);
+    sanitize_image_detail_items(supports_original, &mut content_items);
+    let success = error_text.is_none();
+    if output_truncation == CodeModeOutputTruncation::Client {
+        if let Some(error_text) = error_text {
+            content_items.push(FunctionCallOutputContentItem::InputText {
+                text: format!("Script error:\n{error_text}"),
+            });
         }
+        content_items = truncate_code_mode_result(content_items, max_output_tokens);
     }
+    CodeModeToolOutput::new(
+        FunctionToolOutput::from_content(content_items, Some(success)),
+        script_status,
+        wall_time,
+        host_duration,
+    )
 }
 
 fn format_script_status(response: &RuntimeResponse) -> String {
@@ -380,32 +392,17 @@ fn format_script_status(response: &RuntimeResponse) -> String {
     }
 }
 
-fn prepend_script_status(
-    content_items: &mut Vec<FunctionCallOutputContentItem>,
-    status: &str,
-    wall_time: Duration,
-) {
-    let wall_time_seconds = ((wall_time.as_secs_f32()) * 10.0).round() / 10.0;
-    let header = format!("{status}\nWall time {wall_time_seconds:.1} seconds\nOutput:\n");
-    content_items.insert(0, FunctionCallOutputContentItem::InputText { text: header });
-}
-
 fn truncate_code_mode_result(
     items: Vec<FunctionCallOutputContentItem>,
     max_output_tokens: Option<usize>,
 ) -> Vec<FunctionCallOutputContentItem> {
     let max_output_tokens = resolve_max_tokens(max_output_tokens);
     let policy = TruncationPolicy::Tokens(max_output_tokens);
-    if items
-        .iter()
-        .all(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
-    {
-        let (truncated_items, _) =
-            formatted_truncate_text_content_items_with_policy(&items, policy);
-        return truncated_items;
-    }
-
-    truncate_function_output_items_with_policy(&items, policy, estimate_audio_token_count)
+    formatted_truncate_function_output_items_with_policy(
+        items,
+        policy,
+        estimate_tool_audio_tokens_without_cache,
+    )
 }
 
 // Submit synchronously so the recorder sees the call before the cell's dispatch gate closes.
@@ -420,6 +417,7 @@ fn submit_nested_tool(
     impl std::future::Future<Output = Result<JsonValue, FunctionCallError>> + Send + 'static,
     FunctionCallError,
 > {
+    let dispatch_started = std::time::Instant::now();
     let CodeModeNestedToolCall {
         cell_id,
         runtime_tool_call_id,
@@ -436,6 +434,9 @@ fn submit_nested_tool(
         target: "codex_otel.trace_safe",
         tracing::Level::INFO,
         event.name = "codex.code_mode.nested_tool_dispatched",
+        tool_name = tool_name.name.as_str(),
+        tool_namespace = call_trace::namespace(&tool_name),
+        tool_source = "code_mode",
         conversation.id = %thread_id,
         turn_id = turn_id.as_str(),
         cell.id = telemetry::trace_id(cell_id.as_str()),
@@ -456,6 +457,7 @@ fn submit_nested_tool(
                 &tool_name,
                 &call_id,
                 call_trace::Source::CodeMode,
+                dispatch_started.elapsed(),
             );
             return Err(FunctionCallError::RespondToModel(error));
         }
@@ -466,6 +468,7 @@ fn submit_nested_tool(
         call_id,
         payload,
         encrypted_function_args: None,
+        native_call: None,
     };
     session
         .services
@@ -484,6 +487,7 @@ fn submit_nested_tool(
             runtime_tool_call_id,
         },
         cancellation_token,
+        Arc::default(),
     );
     Ok(async move { Ok(result.await?.code_mode_result()) })
 }
@@ -564,6 +568,7 @@ mod tests {
             Vec::new(),
             ToolMode::CodeModeOnly,
             BTreeMap::new(),
+            /*exec_definitions*/ None,
             /*tool_namespaces_info*/ None,
             &[],
         ));
@@ -634,9 +639,10 @@ mod tests {
 
     #[test]
     fn over_budget_audio_output_is_omitted() {
-        let items = vec![FunctionCallOutputContentItem::InputAudio {
-            audio_url: format!("data:audio/wav;base64,{}", "A".repeat(100)),
-        }];
+        let items = vec![FunctionCallOutputContentItem::inline_audio(format!(
+            "data:audio/wav;base64,{}",
+            "A".repeat(100)
+        ))];
 
         assert_eq!(
             truncate_code_mode_result(items, Some(5)),

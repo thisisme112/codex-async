@@ -5,10 +5,14 @@ use anyhow::Result;
 use codex_core::TurnInputRequest;
 use codex_core::config::Constrained;
 use codex_core::context::ContextualUserFragment;
+use codex_core::context::GuardianContextMode;
 use codex_core::context::InternalContextSource;
 use codex_core::context::InternalModelContextFragment;
+use codex_core::context::UserGoalUpdate;
 use codex_features::Feature;
+use codex_history::RolloutItem;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::models::ImageReference;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GuardianAssessmentStatus;
@@ -18,13 +22,14 @@ use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
+use codex_protocol_test_support::ContentItemTestExt;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_sandbox;
 use core_test_support::skip_if_wine_exec;
 use core_test_support::streaming_sse::StreamingSseChunk;
 use core_test_support::streaming_sse::start_streaming_sse_server;
-use core_test_support::test_codex::local_selections;
+use core_test_support::test_codex::local_requests;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
@@ -40,13 +45,20 @@ use tokio::sync::oneshot;
 enum PendingReviewChange {
     UserInstruction,
     VerifiedAnswer,
+    Compaction,
 }
 
-#[test_case(PendingReviewChange::UserInstruction; "new user instruction")]
-#[test_case(PendingReviewChange::VerifiedAnswer; "verified answer")]
+#[test_case(PendingReviewChange::UserInstruction, GuardianContextMode::ThreadOwned, GuardianAssessmentStatus::Denied; "new user instruction")]
+#[test_case(PendingReviewChange::VerifiedAnswer, GuardianContextMode::ThreadOwned, GuardianAssessmentStatus::Denied; "verified answer")]
+#[test_case(PendingReviewChange::UserInstruction, GuardianContextMode::Legacy, GuardianAssessmentStatus::Denied; "migration user instruction")]
+#[test_case(PendingReviewChange::VerifiedAnswer, GuardianContextMode::Legacy, GuardianAssessmentStatus::Denied; "migration verified answer")]
+#[test_case(PendingReviewChange::Compaction, GuardianContextMode::Legacy, GuardianAssessmentStatus::Aborted; "compaction promotes policy")]
+#[test_case(PendingReviewChange::Compaction, GuardianContextMode::ThreadOwned, GuardianAssessmentStatus::Approved; "ordinary compaction preserves review")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guardian_revalidates_owning_session_before_allow(
     change: PendingReviewChange,
+    review_mode: GuardianContextMode,
+    expected_status: GuardianAssessmentStatus,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
@@ -111,13 +123,36 @@ async fn guardian_revalidates_owning_session_before_allow(
         vec![StreamingSseChunk { gate: None, body: parent_followup }],
         vec![StreamingSseChunk {
             gate: None,
-            body: responses::sse(vec![responses::ev_completed("user-change")]),
+            body: match change {
+                PendingReviewChange::Compaction => responses::sse(vec![
+                    json!({"type": "response.output_item.done", "item": {
+                        "type": "compaction", "id": "compacted", "encrypted_content": "known producer"
+                    }}),
+                    responses::ev_completed("compacted"),
+                ]),
+                PendingReviewChange::UserInstruction | PendingReviewChange::VerifiedAnswer => {
+                    responses::sse(vec![responses::ev_completed("user-change")])
+                }
+            },
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: responses::sse(vec![
+                responses::ev_assistant_message(
+                    "refreshed-review",
+                    r#"{"risk_level":"low","user_authorization":"low","outcome":"deny","rationale":"The user now says not to run the command."}"#,
+                ),
+                responses::ev_completed("refreshed-review"),
+            ]),
         }],
     ]).await;
     let base_url = format!("{}/v1", streaming_server.uri());
     let server = responses::start_mock_server().await;
-    let test = test_codex()
-        .with_model("test-gpt-5.1-codex")
+    let mut test = test_codex()
+        .with_model_info_override("test-gpt-5.1-codex", |model| {
+            model.comp_hash = Some("compatible".to_owned());
+            model.auto_review_model_override = Some(model.slug.clone());
+        })
         .with_config(move |config| {
             config.model_provider.base_url = Some(base_url);
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
@@ -126,7 +161,6 @@ async fn guardian_revalidates_owning_session_before_allow(
                 .set_legacy_sandbox_policy(SandboxPolicy::new_workspace_write_policy())
                 .expect("set sandbox policy");
             for feature in [
-                Feature::GuardianThreadContext,
                 Feature::CodeMode,
                 Feature::CodeModeInterrupt,
                 Feature::DefaultModeRequestUserInput,
@@ -140,6 +174,28 @@ async fn guardian_revalidates_owning_session_before_allow(
         .with_code_mode_host_program(codex_utils_cargo_bin::cargo_bin("codex-code-mode-host")?)
         .build_with_auto_env(&server)
         .await?;
+    if review_mode == GuardianContextMode::Legacy {
+        test.codex.ensure_rollout_materialized().await;
+        test.codex = super::guardian_checkpoint_migration::resume(
+            &test,
+            &test.codex,
+            vec![RolloutItem::Compacted(Box::new(serde_json::from_value(
+                json!({
+                    "message": "old checkpoint",
+                    "replacement_history": [{
+                        "type": "compaction", "id": "old", "encrypted_content": "unknown producer"
+                    }]
+                }),
+            )?))],
+        )
+        .await?;
+    }
+    assert_eq!(
+        GuardianContextMode::from_history(
+            test.codex.conversation_history_snapshot().await.as_ref()
+        ),
+        review_mode,
+    );
     test.codex
         .start_or_steer_turn(
             TurnInputRequest::user_input(vec![UserInput::Text {
@@ -147,7 +203,7 @@ async fn guardian_revalidates_owning_session_before_allow(
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(test.config.cwd.clone())),
+                environments: Some(local_requests(test.config.cwd.clone())),
                 ..Default::default()
             }),
         )
@@ -166,7 +222,6 @@ async fn guardian_revalidates_owning_session_before_allow(
         review.pointer("/client_metadata/x-openai-subagent"),
         Some(&json!("guardian"))
     );
-    let before = test.codex.guardian_authorization_version().await;
     parent_completion_tx
         .send(())
         .expect("release parent completion");
@@ -197,20 +252,51 @@ async fn guardian_revalidates_owning_session_before_allow(
     if matches!(change, PendingReviewChange::UserInstruction) {
         test.submit_text_turn("Do not run the command.").await?;
     }
-    assert_ne!(before, test.codex.guardian_authorization_version().await);
+    let mut completed_status = None;
+    if matches!(change, PendingReviewChange::Compaction) {
+        test.codex.submit(Op::Compact).await?;
+        loop {
+            match test.codex.next_event().await?.msg {
+                EventMsg::GuardianAssessment(assessment)
+                    if assessment.status != GuardianAssessmentStatus::InProgress =>
+                {
+                    completed_status = Some(assessment.status)
+                }
+                EventMsg::TurnComplete(_) => break,
+                EventMsg::Error(error) => panic!("compaction failed: {error:?}"),
+                _ => {}
+            }
+        }
+    }
+
     review_completion_tx
         .send(())
         .expect("release Guardian response");
-    let status = wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::GuardianAssessment(assessment)
-            if assessment.status != GuardianAssessmentStatus::InProgress =>
-        {
-            Some(assessment.status)
+    let status = match completed_status {
+        Some(status) => status,
+        None => {
+            wait_for_event_match(&test.codex, |event| match event {
+                EventMsg::GuardianAssessment(assessment)
+                    if assessment.status != GuardianAssessmentStatus::InProgress =>
+                {
+                    Some(assessment.status)
+                }
+                _ => None,
+            })
+            .await
         }
-        _ => None,
-    })
-    .await;
-    assert_eq!(status, GuardianAssessmentStatus::Aborted);
+    };
+    assert_eq!(status, expected_status);
+    if expected_status == GuardianAssessmentStatus::Denied {
+        let requests = streaming_server.requests().await;
+        let refreshed: Value =
+            serde_json::from_slice(requests.last().expect("fresh Guardian request"))?;
+        assert_eq!(
+            refreshed.pointer("/client_metadata/x-openai-subagent"),
+            Some(&json!("guardian"))
+        );
+        assert!(refreshed.to_string().contains("Do not run the command."));
+    }
     test.codex.shutdown_and_wait().await?;
     streaming_server.shutdown().await;
     Ok(())
@@ -242,10 +328,20 @@ async fn guardian_authorization_revision_survives_compaction_not_user_input() ->
         InternalContextSource::from_static("goal"),
         "Inspecting the deployment.",
     );
-    let notification_text = internal_context.render();
+    let notification_text = internal_context.render().expect_text();
     test.codex
         .inject_response_items(vec![ContextualUserFragment::into(internal_context)])
         .await?;
+    assert_eq!(test.codex.guardian_authorization_version().await, expected);
+
+    // An explicit user goal edit invalidates cached authorization, unlike its continuation.
+    test.codex
+        .record_user_goal_update(UserGoalUpdate::Set {
+            objective: Some("Do not deploy; inspect only.".to_owned()),
+            status: None,
+        })
+        .await?;
+    expected.user_message_revision += 1;
     assert_eq!(test.codex.guardian_authorization_version().await, expected);
 
     // The same text submitted by the user must invalidate, even if it looks internal.
@@ -266,7 +362,9 @@ async fn guardian_authorization_revision_survives_compaction_not_user_input() ->
     .await;
     test.codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Image {
-            image_url: "data:image/png;base64,not-an-image".to_owned(),
+            image: ImageReference::Inline {
+                image_url: "data:image/png;base64,not-an-image".to_owned(),
+            },
             detail: None,
         }]))
         .await?;

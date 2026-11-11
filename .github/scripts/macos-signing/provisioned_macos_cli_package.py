@@ -13,10 +13,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 BUNDLE_ID = "com.openai.codex.cli"
+# Existing login-keychain ACLs identify the CLI by its code-signing identifier.
+# Keep this stable independently of the bundle and provisioned App ID.
+CODE_SIGNING_ID = "codex"
 APP = Path("CodexCLI.app")
 EXECUTABLE = APP / "Contents/MacOS/codex"
 SIGNING = Path(__file__).resolve().parent
-HELPERS = ("bin/codex-code-mode-host", "codex-path/rg", "codex-resources/zsh/bin/zsh")
+HELPERS = ("bin/codex-code-mode-host", "bin/codex-exec-server", "codex-path/rg")
 LAUNCHER = """#!/bin/sh
 set -eu
 entry="$0"
@@ -138,8 +141,9 @@ def prepare(package, reports, configuration: ProfileConfiguration):
         plistlib.dumps(
             {
                 "CFBundleIdentifier": BUNDLE_ID,
+                "CFBundleDisplayName": "ChatGPT",
                 "CFBundleExecutable": "codex",
-                "CFBundleName": "Codex CLI",
+                "CFBundleName": "ChatGPT",
                 "CFBundlePackageType": "APPL",
                 "CFBundleVersion": "1",
             }
@@ -156,6 +160,13 @@ def prepare(package, reports, configuration: ProfileConfiguration):
 def verify(package, reports, expected_target, configuration: ProfileConfiguration):
     """Check profile and certificate pins; the signing driver verifies code."""
     load_profile(configuration)
+    info = plistlib.loads((package / APP / "Contents/Info.plist").read_bytes())
+    if (
+        info.get("CFBundleIdentifier") != BUNDLE_ID
+        or info.get("CFBundleExecutable") != EXECUTABLE.name
+        or info.get("CFBundlePackageType") != "APPL"
+    ):
+        raise ValueError("Unexpected provisioned CLI bundle identity or executable")
     if (
         package / APP / "Contents/embedded.provisionprofile"
     ).read_bytes() != configuration.profile.read_bytes():
@@ -177,15 +188,20 @@ def verify(package, reports, expected_target, configuration: ProfileConfiguratio
         binary = package / relative
         target = package / APP if relative == EXECUTABLE else binary
         prefix = reports / f"{binary.name}-cert-"
-        subprocess.run(
-            ["codesign", "-d", f"--extract-certificates={prefix}", str(target)],
-            check=True,
-        )
-        if (
-            hashlib.sha256(Path(f"{prefix}0").read_bytes()).hexdigest()
-            != configuration.certificate_sha256
-        ):
-            raise ValueError(f"Unexpected signing certificate: {relative}")
+        verify_certificate(target, prefix, configuration)
+
+
+def verify_certificate(target, prefix, configuration: ProfileConfiguration):
+    """Require the independently approved leaf certificate for each signed executable."""
+    subprocess.run(
+        ["codesign", "-d", f"--extract-certificates={prefix}", str(target)],
+        check=True,
+    )
+    if (
+        hashlib.sha256(Path(f"{prefix}0").read_bytes()).hexdigest()
+        != configuration.certificate_sha256
+    ):
+        raise ValueError(f"Unexpected signing certificate: {target}")
 
 
 def parse_profile_args(parser, configuration: ProfileConfiguration | None):

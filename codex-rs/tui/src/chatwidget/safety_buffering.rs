@@ -114,6 +114,7 @@ impl ChatWidget {
         } = notification;
         if matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages))
             || !self.turn_lifecycle.agent_turn_running
+            || self.safety_recourse.is_some()
             || self.turn_lifecycle.last_turn_id.as_deref() != Some(turn_id.as_str())
             || self
                 .safety_buffering
@@ -232,7 +233,7 @@ impl ChatWidget {
             footer_note: Some(Line::from(SAFETY_BUFFERING_FOOTER).dim()),
             footer_hint: Some(Line::default()),
             items,
-            ..Default::default()
+            ..SelectionViewParams::picker()
         });
     }
 
@@ -289,7 +290,7 @@ impl ChatWidget {
                     ..Default::default()
                 },
             ],
-            ..Default::default()
+            ..SelectionViewParams::confirmation()
         });
     }
 }

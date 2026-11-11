@@ -3,15 +3,53 @@
 
 use super::*;
 use crate::bottom_pane::QuestionSubmission;
+use crate::tui::MouseCapture;
 use codex_protocol::items::AsyncUserInputQuestion;
 
 impl ChatWidget {
+    pub(crate) fn mouse_capture(&self, owned_screen: bool) -> MouseCapture {
+        if owned_screen
+            && !self.bottom_pane.has_active_modal()
+            && self
+                .bottom_pane
+                .questions
+                .as_ref()
+                .is_some_and(|q| q.expanded)
+        {
+            MouseCapture::Disabled
+        } else {
+            MouseCapture::Inherit
+        }
+    }
+
+    pub(super) fn take_question_drafts(&mut self) -> Option<Vec<String>> {
+        if matches!(
+            self.pending_notification,
+            Some(Notification::AsyncQuestion { .. })
+        ) {
+            self.pending_notification = None;
+        }
+        self.bottom_pane.take_question_drafts()
+    }
+
     pub(super) fn add_async_questions(
         &mut self,
         message_id: &str,
         questions: &[AsyncUserInputQuestion],
     ) {
+        let previous_count = self.bottom_pane.question_editor().unanswered_count();
         self.bottom_pane.push_async_questions(message_id, questions);
+        let added_count = self.bottom_pane.question_editor().unanswered_count() - previous_count;
+        if added_count > 0 {
+            let title = match questions {
+                [question] if !question.title.trim().is_empty() => {
+                    truncate_text(question.title.trim(), /*max_graphemes*/ 30)
+                }
+                _ if added_count == 1 => "Question requested".to_string(),
+                _ => format!("{added_count} questions requested"),
+            };
+            self.notify(Notification::AsyncQuestion { title });
+        }
         self.refresh_pending_input_preview();
     }
 
@@ -111,7 +149,7 @@ impl ChatWidget {
                 }
                 let main = self.bottom_pane.composer_draft_snapshot();
                 let accepted = if queued
-                    || self.input_queue.suppress_queue_autosend
+                    || self.input_queue.submissions_paused()
                     || self.is_plan_streaming_in_tui()
                     || self.input_queue.user_turn_pending_start
                         && !self.turn_lifecycle.agent_turn_running

@@ -1,79 +1,87 @@
-//! Applies extension-owned reviewer settings to host configuration and builds context.
-//! Managed constraints, live network rules and policy prompt construction stay in the host.
+//! Resolves reviewer models and adds policy context and live network state to reviewer configuration.
+//! Both prewarming and reviews finish this setup before context preparation and reuse checks.
+//! A missing default reviewer gets one shared catalog refresh per parent session.
+//! Refresh work survives cancelled waiters and precedes checkpoint compatibility decisions.
+//! Async classification shares reviewer eligibility and the parent session's catalog.
 
-use std::collections::HashMap;
+use codex_protocol::openai_models::CatalogModel;
+use std::sync::Arc;
 
+use codex_features::Feature;
+use codex_guardian_reviewer::reviewer_instructions;
+use codex_login::AuthManager;
+use codex_models_manager::manager::RefreshStrategy;
+use codex_models_manager::model_info::with_config_overrides;
+use codex_prompts::ResolvedModelMessages;
 use codex_protocol::models::BaseInstructionsProvenance;
-use codex_protocol::openai_models::ModelMessages;
-use tracing::warn;
+use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ReasoningEffort;
+use futures::FutureExt;
+use futures::future::BoxFuture;
+use futures::future::Shared;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::config::Config;
-use crate::config::Constrained;
 use crate::config::NetworkProxySpec;
-use crate::config::TokenBudgetConfig;
+use crate::context::ContextualUserFragment;
+use crate::context::GuardianConversationHistory;
 
-use super::prompt::BUNDLED_GUARDIAN_POLICY_TEMPLATE;
-use super::prompt::guardian_policy_prompt_with_config_and_template;
+struct GuardianModelCatalogRefresh(Shared<BoxFuture<'static, ()>>);
 
-/// Builds the existing read-only reviewer configuration with its policy and live network rules.
+/// Adds the captured model, policy prompt and live network rules before reuse selection.
 pub fn build_guardian_review_session_config(
-    parent_config: &Config,
+    mut guardian_config: Config,
     live_network_config: Option<codex_network_proxy::NetworkProxyConfig>,
     active_model: &str,
     reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
     reasoning_summary: codex_protocol::config_types::ReasoningSummary,
     personality: Option<codex_protocol::config_types::Personality>,
-    model_messages: Option<&ModelMessages>,
+    model_messages: ResolvedModelMessages<'_>,
 ) -> anyhow::Result<Config> {
-    let mut guardian_config = parent_config.clone();
-    let overrides = codex_guardian_reviewer::reviewer_config_overrides(
-        parent_config.permissions.permission_profile(),
-        active_model,
-        reasoning_effort,
-    );
-    guardian_config.model = Some(overrides.model);
-    guardian_config.model_reasoning_effort = overrides.reasoning_effort;
+    guardian_config.model = Some(active_model.to_owned());
+    guardian_config.model_reasoning_effort = reasoning_effort;
     guardian_config.model_reasoning_summary = Some(reasoning_summary);
     guardian_config.personality = personality;
-    guardian_config.model_provider.request_max_retries = Some(overrides.request_max_retries);
-    guardian_config.model_provider.stream_max_retries = Some(overrides.stream_max_retries);
-    guardian_config.include_skill_instructions = overrides.include_skill_instructions;
-    guardian_config.memories.use_memories = overrides.use_memories;
-    guardian_config.memories.dedicated_tools = overrides.dedicated_memory_tools;
-    if !overrides.inherit_token_budget {
-        // An explicit disabled config prevents model defaults from reactivating it.
-        guardian_config.token_budget_startup_config = None;
-        guardian_config.token_budget = Some(TokenBudgetConfig::default());
-    }
-    let catalog_auto_review = model_messages.and_then(|messages| messages.auto_review.as_ref());
-    let tenant_policy_config = parent_config.resolve_guardian_policy(model_messages);
-    let policy_template = catalog_auto_review
-        .and_then(|messages| messages.policy_template.as_deref())
-        .unwrap_or(BUNDLED_GUARDIAN_POLICY_TEMPLATE);
-    guardian_config.base_instructions = Some(guardian_policy_prompt_with_config_and_template(
-        tenant_policy_config,
+    let conversation_history = (guardian_config
+        .features
+        .enabled(Feature::GuardianConversationHistoryTools)
+        && guardian_config.features.enabled(Feature::Apps))
+    .then(|| {
+        GuardianConversationHistory {
+            prompt: guardian_config
+                .guardian_conversation_history_prompt
+                .as_deref(),
+        }
+        .render()
+        .into_text()
+        .unwrap_or_default()
+    });
+    // The model catalog can come from user configuration. Managed rules need a trusted
+    // template with policy slots unless the host explicitly supplies its own template.
+    let requirements = guardian_config.config_layer_stack.requirements_toml();
+    let needs_trusted_template = requirements
+        .guardian_policy_config
+        .iter()
+        .chain(&guardian_config.guardian_extra_policy)
+        .any(|policy| !policy.trim().is_empty());
+    let policy_template = match guardian_config.guardian_policy_template.as_deref() {
+        None if needs_trusted_template => Some(
+            ResolvedModelMessages::bundled()
+                .auto_review()
+                .policy_template,
+        ),
+        template => template,
+    };
+    let instructions = reviewer_instructions(
+        guardian_config.guardian_transcript_mode,
+        guardian_config.resolve_guardian_policy(model_messages),
+        guardian_config.guardian_extra_policy.as_deref(),
         policy_template,
-    ));
+        model_messages,
+        conversation_history.as_deref(),
+    );
+    guardian_config.base_instructions = Some(instructions);
     guardian_config.base_instructions_provenance = Some(BaseInstructionsProvenance::Custom);
-    guardian_config.notify = overrides.notify;
-    guardian_config.developer_instructions = overrides.developer_instructions;
-    guardian_config.permissions.approval_policy =
-        Constrained::allow_only(overrides.approval_policy);
-    guardian_config
-        .permissions
-        .set_permission_profile(overrides.permission_profile)
-        .map_err(|err| {
-            anyhow::anyhow!("guardian review session could not set permission profile: {err}")
-        })?;
-    guardian_config.include_apps_instructions = overrides.include_apps_instructions;
-    if !overrides.inherit_mcp_servers {
-        guardian_config
-            .mcp_servers
-            .set(HashMap::new())
-            .map_err(|err| {
-                anyhow::anyhow!("guardian review session could not clear MCP servers: {err}")
-            })?;
-    }
     if let Some(live_network_config) = live_network_config
         && guardian_config.permissions.network.is_some()
     {
@@ -89,19 +97,145 @@ pub fn build_guardian_review_session_config(
             guardian_config.permissions.permission_profile(),
         )?);
     }
-    for feature in overrides.disabled_features {
-        guardian_config.features.disable(feature).map_err(|err| {
-            anyhow::anyhow!(
-                "guardian review session could not disable `features.{}`: {err}",
-                feature.key()
-            )
-        })?;
-        if guardian_config.features.enabled(feature) {
-            warn!(
-                "guardian review session could not disable `features.{}`; continuing with the feature enabled",
-                feature.key()
-            );
-        }
-    }
     Ok(guardian_config)
+}
+
+/// Retries a missing default reviewer once before retaining the parent fallback.
+pub(crate) async fn resolve_review_model(
+    session: &crate::session::session::Session,
+    context: &super::GuardianReviewContext,
+) -> (codex_guardian_reviewer::ReviewModel, Arc<CatalogModel>) {
+    let turn = context.turn();
+    // Check before resolving: a refresh that finishes during the lookup still
+    // requires a reread, but later calls only need one catalog resolution.
+    let refresh_completed = session
+        .services
+        .session_extension_data
+        .get::<GuardianModelCatalogRefresh>()
+        .is_some_and(|refresh| refresh.0.peek().is_some());
+    let resolved = resolve_review_model_from_catalog(session, context).await;
+    let (review_model, _) = &resolved;
+    if !refresh_completed
+        && review_model.default_review_model_id == "codex-auto-review"
+        && !review_model.model_overridden
+        && !review_model.catalog_contains_auto_review
+        && turn.config.model_catalog.is_none()
+        && turn.provider.info().model_catalog_url.is_none()
+        && !super::is_basic_session_source(&turn.session_source)
+    {
+        // The session retains the task through waiter cancellation. Dropping the
+        // session aborts unfinished work; a failed fetch still completes the attempt.
+        let refresh = session.services.session_extension_data.get_or_init(|| {
+            let manager = Arc::clone(&session.services.models_manager);
+            let http_client_factory = turn.config.http_client_factory();
+            let task = AbortOnDropHandle::new(tokio::spawn(async move {
+                manager
+                    .list_models(RefreshStrategy::Online, http_client_factory)
+                    .await;
+            }));
+            GuardianModelCatalogRefresh(
+                async move {
+                    let _ = task.await;
+                }
+                .boxed()
+                .shared(),
+            )
+        });
+        refresh.0.clone().await;
+        return resolve_review_model_from_catalog(session, context).await;
+    }
+    resolved
+}
+
+async fn resolve_review_model_from_catalog(
+    session: &crate::session::session::Session,
+    context: &super::GuardianReviewContext,
+) -> (codex_guardian_reviewer::ReviewModel, Arc<CatalogModel>) {
+    let turn = context.turn();
+    let (review_model, model_info) = resolve_catalog_review_model(
+        session,
+        &turn.config,
+        &context.model_info,
+        context.reasoning_effort.as_ref(),
+        turn.provider.approval_review_preferred_model(),
+    )
+    .await;
+    (
+        review_model,
+        model_info.map_or_else(|| Arc::clone(&context.model_info), Arc::new),
+    )
+}
+
+/// Resolves async classification policy against the reviewed thread's catalog.
+/// A missing eligible reviewer retains the captured parent metadata, as synchronous review does.
+pub async fn guardian_policy_model(
+    thread: &crate::CodexThread,
+    config: &Config,
+    parent_model: Arc<ModelInfo>,
+) -> Arc<ModelInfo> {
+    #[expect(clippy::expect_used, reason = "Required thread startup invariant")]
+    let auth = thread
+        .thread_extension_data()
+        .get::<codex_model_provider::ProviderAuthContext>()
+        .expect("Core installs provider auth before starting Guardian");
+    let provider = auth.model_provider(config.model_provider.clone());
+    let (_, model_info) = resolve_catalog_review_model(
+        &thread.session,
+        config,
+        &parent_model,
+        config.model_reasoning_effort.as_ref(),
+        provider.approval_review_preferred_model(),
+    )
+    .await;
+    model_info.map_or(parent_model, |model| model.model)
+}
+
+async fn resolve_catalog_review_model(
+    session: &crate::session::session::Session,
+    config: &Config,
+    parent_model: &ModelInfo,
+    reasoning_effort: Option<&ReasoningEffort>,
+    default_review_model_id: &str,
+) -> (codex_guardian_reviewer::ReviewModel, Option<CatalogModel>) {
+    // Keep a successful refresh even if writing it to the disk cache failed.
+    let models_manager = &session.services.models_manager;
+    let mut catalog = models_manager
+        .model_catalog_with_origins(RefreshStrategy::InMemory, config.http_client_factory())
+        .await;
+    let uses_codex_backend = models_manager
+        .auth_manager()
+        .is_some_and(AuthManager::current_auth_uses_codex_backend);
+    catalog.retain(|entry| {
+        (uses_codex_backend || entry.supported_in_api)
+            && (parent_model.auto_review_model_override.is_some()
+                || matches!(
+                    entry.origin,
+                    codex_models_manager::ModelOrigin::Provider
+                        | codex_models_manager::ModelOrigin::ExplicitConfig
+                ))
+    });
+    let (review_model, reviewer) = codex_guardian_reviewer::select_review_model(
+        parent_model,
+        reasoning_effort,
+        default_review_model_id,
+        catalog,
+    );
+    let guardian_model_info = if review_model.model_overridden {
+        // Explicit names can resolve through aliases or synthetic metadata.
+        Some(
+            models_manager
+                .get_model_info(&review_model.model, &config.to_models_manager_config())
+                .await,
+        )
+    } else {
+        reviewer.map(|entry| CatalogModel {
+            model: with_config_overrides(
+                Arc::unwrap_or_clone(entry.model),
+                &config.to_models_manager_config(),
+            )
+            .into(),
+            origin: entry.origin,
+        })
+    };
+    (review_model, guardian_model_info)
 }

@@ -92,6 +92,7 @@ use codex_app_server_protocol::ThreadDeleteParams;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadInjectItemsParams;
 use codex_app_server_protocol::ThreadItemsListParams;
+use codex_app_server_protocol::ThreadItemsReadParams;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadMemoryModeSetParams;
@@ -166,7 +167,14 @@ pub struct TestAppServer {
 }
 
 pub const DEFAULT_CLIENT_NAME: &str = "codex-app-server-tests";
-pub const DISABLE_PLUGIN_STARTUP_TASKS_ARG: &str = "--disable-plugin-startup-tasks-for-tests";
+const DISABLE_PLUGIN_STARTUP_TASKS_ARG: &str = "--disable-plugin-startup-tasks-for-tests";
+pub const DEFAULT_APP_SERVER_TEST_ARGS: [&str; 5] = [
+    DISABLE_PLUGIN_STARTUP_TASKS_ARG,
+    "-c",
+    "features.tool_suggest=false",
+    "-c",
+    "features.recommended_plugins=false",
+];
 const DISABLE_MANAGED_CONFIG_ENV_VAR: &str = "CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG";
 #[cfg(windows)]
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
@@ -182,8 +190,9 @@ impl TestAppServer {
             environment: TestAppServerEnvironment::Auto,
             program: None,
             env_overrides: Vec::new(),
-            args: vec![DISABLE_PLUGIN_STARTUP_TASKS_ARG.to_string()],
+            args: DEFAULT_APP_SERVER_TEST_ARGS.map(str::to_owned).into(),
             exec_server_delay: None,
+            mock_chatgpt_backend: false,
         }
     }
 
@@ -242,12 +251,30 @@ impl TestAppServer {
         })
     }
 
-    /// Waits for a JSON stderr event whose structured `event.name` field matches.
+    /// Waits up to `timeout` for a JSON stderr event whose structured `event.name` field matches.
     pub async fn wait_for_json_log_event(
         &self,
         event_name: &str,
+        timeout: Duration,
     ) -> anyhow::Result<serde_json::Value> {
-        self.json_logs.wait_for_event(event_name).await
+        self.wait_for_matching_json_log_event(
+            &format!("named `{event_name}`"),
+            |event| event["fields"]["event.name"].as_str() == Some(event_name),
+            timeout,
+        )
+        .await
+    }
+
+    /// Waits for a JSON stderr event matching a predicate, including its request span.
+    pub async fn wait_for_matching_json_log_event(
+        &self,
+        description: &str,
+        predicate: impl Fn(&serde_json::Value) -> bool,
+        timeout: Duration,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.json_logs
+            .wait_for_event(description, predicate, timeout)
+            .await
     }
 
     async fn new_with_program_env_and_args(
@@ -719,6 +746,15 @@ impl TestAppServer {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("thread/items/list", params).await
+    }
+
+    /// Send a `thread/items/read` JSON-RPC request.
+    pub async fn send_thread_items_read_request(
+        &mut self,
+        params: ThreadItemsReadParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("thread/items/read", params).await
     }
 
     /// Send a `model/list` JSON-RPC request.
@@ -1622,7 +1658,7 @@ impl TestAppServer {
         .await
     }
 
-    async fn send_jsonrpc_message(&mut self, message: JSONRPCMessage) -> anyhow::Result<()> {
+    pub async fn send_jsonrpc_message(&mut self, message: JSONRPCMessage) -> anyhow::Result<()> {
         eprintln!("writing message to stdin: {message:?}");
         let Some(stdin) = self.stdin.as_mut() else {
             anyhow::bail!("mcp stdin closed");
@@ -1856,6 +1892,7 @@ pub struct TestAppServerBuilder {
     env_overrides: Vec<(String, Option<String>)>,
     args: Vec<String>,
     exec_server_delay: Option<Duration>,
+    mock_chatgpt_backend: bool,
 }
 
 enum TestAppServerEnvironment {
@@ -1864,6 +1901,11 @@ enum TestAppServerEnvironment {
 }
 
 impl TestAppServerBuilder {
+    pub fn with_mock_chatgpt_backend(mut self) -> Self {
+        self.mock_chatgpt_backend = true;
+        self
+    }
+
     /// Uses this existing CODEX_HOME instead of a temporary one.
     pub fn with_codex_home(mut self, codex_home: &Path) -> Self {
         self.codex_home = Some(codex_home.to_path_buf());
@@ -1934,7 +1976,8 @@ impl TestAppServerBuilder {
 
     /// Builds a server and completes its standard initialization handshake.
     pub async fn build_initialized(self) -> anyhow::Result<TestAppServer> {
-        self.build_initialized_with_timeout(DEFAULT_REQUEST_TIMEOUT)
+        // The first handshake includes cold subprocess startup on the CI runner.
+        self.build_initialized_with_timeout(Duration::from_secs(60))
             .await
     }
 
@@ -1958,6 +2001,7 @@ impl TestAppServerBuilder {
             mut env_overrides,
             args,
             exec_server_delay,
+            mock_chatgpt_backend,
         } = self;
         let (codex_home, owned_codex_home) = match codex_home {
             Some(codex_home) => (codex_home, None),
@@ -1969,7 +2013,9 @@ impl TestAppServerBuilder {
                 )
             }
         };
-        let attribution_settings_server = if codex_home.join("auth.json").is_file() {
+        let attribution_settings_server = if mock_chatgpt_backend
+            || codex_home.join("auth.json").is_file()
+        {
             let config_path = codex_home.join("config.toml");
             let config = std::fs::read_to_string(&config_path)?;
             if config
@@ -1979,6 +2025,12 @@ impl TestAppServerBuilder {
                 None
             } else {
                 let settings_server = MockServer::start().await;
+                crate::mount_workspace_routing(&settings_server).await;
+                Mock::given(method("GET"))
+                    .and(path("/backend-api/wham/config/bundle"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                    .mount(&settings_server)
+                    .await;
                 Mock::given(method("GET"))
                     .and(path("/backend-api/wham/settings/user"))
                     .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2105,7 +2157,7 @@ impl TestAppServerBuilder {
                 (&code_mode_host_program, &staged_host),
             ] {
                 std::fs::hard_link(source, destination)
-                    .or_else(|_| std::fs::copy(source, destination).map(|_| ()))
+                    .or_else(|_| codex_utils_cargo_bin::copy_executable(source, destination))
                     .with_context(|| format!("stage executable {}", source.display()))?;
             }
             program = staged_program;

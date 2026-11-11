@@ -44,7 +44,6 @@ pub struct ModelProviderCapabilitiesReadParams {}
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ModelProviderCapabilitiesReadResponse {
-    pub namespace_tools: bool,
     pub image_generation: bool,
     pub web_search: bool,
 }
@@ -53,6 +52,9 @@ pub struct ModelProviderCapabilitiesReadResponse {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ModelListParams {
+    /// List models for this configured provider instead of the app-server default.
+    #[ts(optional = nullable)]
+    pub model_provider: Option<String>,
     /// Opaque pagination cursor returned by a previous call.
     #[ts(optional = nullable)]
     pub cursor: Option<String>,
@@ -131,6 +133,7 @@ pub struct Model {
     pub default_reasoning_effort: ReasoningEffort,
     #[serde(default = "default_input_modalities")]
     pub input_modalities: Vec<InputModality>,
+    /// @deprecated Always false; models no longer support personality selection.
     #[serde(default)]
     pub supports_personality: bool,
     /// Multi-agent runtime declared by this model, when available.

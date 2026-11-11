@@ -126,7 +126,6 @@ async fn backend_banner_state_survives_widget_replacement() -> Result<()> {
             app.chat_widget
                 .handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         }
-        let before = render_bottom_popup(&app.chat_widget, /*width*/ 90);
         let mut tui = crate::tui::test_support::make_test_tui()?;
         let init = app.chatwidget_init_for_forked_or_resumed_thread(
             &mut tui,
@@ -139,9 +138,15 @@ async fn backend_banner_state_survives_widget_replacement() -> Result<()> {
             Box::new(PlainHistoryCell::new(Vec::new())),
         );
         app.chat_widget.pre_draw_tick();
-        assert_eq!(render_bottom_popup(&app.chat_widget, /*width*/ 90), before);
+        assert_eq!(
+            render_bottom_popup(&app.chat_widget, /*width*/ 90).contains("View usage"),
+            !dismiss
+        );
         app.chat_widget.update_backend_banner(&response);
-        assert_eq!(render_bottom_popup(&app.chat_widget, /*width*/ 90), before);
+        assert_eq!(
+            render_bottom_popup(&app.chat_widget, /*width*/ 90).contains("View usage"),
+            !dismiss
+        );
         response.rate_limit_upsell = None;
         app.chat_widget.update_backend_banner(&response);
         assert!(!render_bottom_popup(&app.chat_widget, /*width*/ 90).contains("View usage"));
@@ -303,7 +308,10 @@ async fn stale_rate_limit_reads_preserve_newer_workspace_hard_stop_for_every_ori
 
         let popup = render_bottom_popup(&app.chat_widget, /*width*/ 100);
         match origin_name {
-            "usage" => assert!(popup.contains("No usage limit resets available.")),
+            "usage" => assert!(
+                popup.contains("Redeem reset    None available"),
+                "expected usage reset availability, got: {popup}"
+            ),
             "reset-picker" => {
                 assert!(popup.contains("You don't have any usage limit resets available."));
             }

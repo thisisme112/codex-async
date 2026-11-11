@@ -75,6 +75,7 @@ pub(crate) async fn sibling_cell_attempt(turn: Arc<TurnContext>, source: &str) {
             &'a self,
             request: ExecuteRequest,
             delegate: Arc<dyn CodeModeSessionDelegate>,
+            _preempt: Option<tokio_util::sync::CancellationToken>,
         ) -> CodeModeSessionResultFuture<'a, StartedCell> {
             Box::pin(async move {
                 if request.source == "fail" {
@@ -92,10 +93,17 @@ pub(crate) async fn sibling_cell_attempt(turn: Arc<TurnContext>, source: &str) {
                 }))
             })
         }
-        fn wait<'a>(&'a self, _: WaitRequest) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
+        fn wait<'a>(
+            &'a self,
+            _: WaitRequest,
+            _: Option<tokio_util::sync::CancellationToken>,
+        ) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
             unreachable!()
         }
-        fn terminate<'a>(&'a self, _: CellId) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
+        fn terminate<'a>(
+            &'a self,
+            _: TerminateRequest,
+        ) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
             unreachable!()
         }
         fn shutdown<'a>(&'a self) -> CodeModeSessionResultFuture<'a, ()> {

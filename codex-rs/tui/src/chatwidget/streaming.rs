@@ -4,6 +4,14 @@
 //! cells, commit ticks, and interrupt deferral.
 
 use super::*;
+use crate::app_event::CapturedSideDisplay;
+use crate::app_event::CapturedSideStream;
+use crate::app_event::CapturedSideWork;
+use crate::markdown_render::ListSpacing;
+
+fn streamed_message_matches_completed(streamed: &str, completed: &str) -> bool {
+    streamed == completed || streamed.strip_suffix('\n') == Some(completed)
+}
 
 fn latest_summary_line(text: &str) -> Option<String> {
     text.lines().rev().find_map(|line| {
@@ -33,7 +41,6 @@ impl ChatWidget {
             return;
         }
         self.status_state.reasoning_item_id = Some(id);
-        self.status_state.reasoning_recovered_after_refresh = false;
         self.reasoning_buffer.clear();
         self.reasoning_summary_parts.clear();
         self.restore_reasoning_status_header();
@@ -60,24 +67,57 @@ impl ChatWidget {
         }
     }
 
-    pub(super) fn flush_answer_stream_with_separator(&mut self) {
-        self.flush_answer_stream(/*completed_message*/ None);
+    /// Preserve received answer and plan source before ordinary turn termination.
+    pub(super) fn flush_answer_and_plan_streams(&mut self) {
+        self.flush_answer_stream_with_separator();
+        if let Some(mut controller) = self.plan_stream_controller.take() {
+            self.clear_active_stream_tail();
+            let (cell, source) = controller.finalize();
+            if let Some(cell) = cell {
+                self.add_boxed_history(cell);
+            }
+            if let Some(source) = source {
+                self.note_stream_consolidation_queued();
+                self.app_event_tx
+                    .send(AppEvent::ConsolidateProposedPlan(source));
+            }
+            self.request_pending_usage_output_insertion_after_stream_shutdown();
+        }
     }
 
-    fn flush_answer_stream(&mut self, completed_message: Option<&str>) {
+    pub(super) fn flush_answer_stream_with_separator(&mut self) {
+        self.flush_answer_stream(/*completed_message*/ None, /*phase*/ None);
+    }
+
+    fn flush_answer_stream(
+        &mut self,
+        completed_message: Option<&str>,
+        phase: Option<MessagePhase>,
+    ) {
         let had_stream_controller = self.stream_controller.is_some();
         if let Some(mut controller) = self.stream_controller.take() {
-            let had_live_tail = controller.has_live_tail();
+            let needs_scrollback_reflow = controller.needs_scrollback_reflow();
             self.clear_active_stream_tail();
+            let interrupted_item = self
+                .transcript
+                .active_streamed_agent_message
+                .take()
+                .filter(|_| completed_message.is_none());
+            if let Some(item) = &interrupted_item {
+                self.transcript.last_flushed_agent_message = Some(item.clone());
+            }
             let (cell, streamed_source) = controller.finalize();
-            let completed_message_differs = completed_message.is_some_and(|completed| {
+            let completed_display = completed_message.map(|source| {
+                parse_assistant_markdown(source, self.config.cwd.as_path()).visible_markdown
+            });
+            let completed_message_differs = completed_display.as_deref().is_some_and(|completed| {
                 let Some(streamed) = streamed_source.as_deref() else {
                     return true;
                 };
                 // Stream finalization supplies one trailing newline when the last delta omitted it.
-                streamed != completed && streamed.strip_suffix('\n') != Some(completed)
+                !streamed_message_matches_completed(streamed, completed)
             });
-            let scrollback_reflow = if had_live_tail || completed_message_differs {
+            let scrollback_reflow = if needs_scrollback_reflow || completed_message_differs {
                 crate::app_event::ConsolidationScrollbackReflow::Required
             } else {
                 crate::app_event::ConsolidationScrollbackReflow::IfResizeReflowRan
@@ -98,10 +138,9 @@ impl ChatWidget {
                 };
             // Consolidate the run of streaming AgentMessageCells into a single AgentMarkdownCell
             // that can re-render from source on resize.
-            let source = completed_message.map(str::to_owned).or_else(|| {
-                streamed_source.map(|source| {
-                    parse_assistant_markdown(&source, self.config.cwd.as_path()).visible_markdown
-                })
+            let copy_source = completed_message.map(str::to_owned).or(streamed_source);
+            let source = copy_source.as_deref().map(|source| {
+                parse_assistant_markdown(source, self.config.cwd.as_path()).visible_markdown
             });
             if let Some(source) = source {
                 let inline_visualization_context = self.thread_id.and_then(|thread_id| {
@@ -112,7 +151,10 @@ impl ChatWidget {
                 });
                 self.note_stream_consolidation_queued();
                 self.app_event_tx.send(AppEvent::ConsolidateAgentMessage {
+                    phase,
+                    interrupted_item,
                     source,
+                    copy_source,
                     cwd: self.config.cwd.to_path_buf(),
                     inline_visualization_context,
                     scrollback_reflow,
@@ -126,6 +168,10 @@ impl ChatWidget {
         }
         if had_stream_controller {
             self.request_pending_usage_output_insertion_after_stream_shutdown();
+        }
+        if completed_message.is_some() {
+            self.transcript.active_streamed_agent_message = None;
+            self.transcript.last_flushed_agent_message = None;
         }
     }
 
@@ -165,16 +211,94 @@ impl ChatWidget {
         self.status_state.pending_status_indicator_restore = false;
     }
 
-    pub(super) fn finalize_completed_assistant_message(&mut self, message: Option<&str>) {
-        if self.stream_controller.is_none()
-            && let Some(message) = message
-            && !message.is_empty()
-        {
-            self.handle_streaming_delta(message.to_string());
+    /// Capture at handoff, while links and visualization directives still have the outgoing cwd.
+    pub(crate) fn take_side_display(
+        &mut self,
+        width: u16,
+    ) -> (Option<CapturedSideStream>, CapturedSideDisplay) {
+        self.flush_completed_tool_activity();
+        let visualizations = self.thread_id.and_then(|id| {
+            crate::inline_visualization::InlineVisualizationContext::from_config(&self.config, id)
+        });
+        let stream = if let Some(controller) = &self.stream_controller {
+            let source = controller.source_snapshot();
+            let markdown = parse_assistant_markdown(&source, self.config.cwd.as_path());
+            let cell = history_cell::AgentMarkdownCell::from_parsed_message(
+                markdown.visible_markdown,
+                source,
+                &self.config.cwd,
+                visualizations.clone(),
+                &[],
+            );
+            Some(CapturedSideStream::Answer {
+                cell: Arc::new(cell),
+                item: self.transcript.active_streamed_agent_message.clone(),
+            })
+        } else if self.plan_stream_controller.is_some() {
+            Some(CapturedSideStream::Plan(Arc::new(
+                history_cell::new_proposed_plan(
+                    self.transcript.plan_delta_buffer.clone(),
+                    &self.config.cwd,
+                ),
+            )))
+        } else {
+            None
+        };
+        let active = self
+            .transcript
+            .take_active_cell()
+            .filter(|cell| match &stream {
+                Some(CapturedSideStream::Answer { .. }) => {
+                    !cell.as_any().is::<history_cell::StreamingAgentTailCell>()
+                }
+                Some(CapturedSideStream::Plan(_)) => {
+                    !cell.as_any().is::<history_cell::StreamingPlanTailCell>()
+                }
+                None => true,
+            });
+        let display = CapturedSideDisplay {
+            rendered_completion_turn_ids: self.turn_lifecycle.rendered_completion_turn_ids.clone(),
+            active,
+            last_completed_agent_message: self.transcript.last_completed_agent_message.clone(),
+            auxiliary: self
+                .active_cell_transcript_hyperlink_lines(width)
+                .unwrap_or_default(),
+            draft: {
+                let snapshot = self.bottom_pane.composer_recovery_snapshot();
+                let mut draft = Box::new(crate::bottom_pane::TextArea::new());
+                draft.set_text_with_elements(&snapshot.text, &snapshot.text_elements);
+                draft
+            },
+            status: self.status_line_text(),
+            work: self
+                .last_turn_id()
+                .filter(|_| self.is_agent_turn_running())
+                .map(|turn_id| {
+                    CapturedSideWork::new(
+                        turn_id.to_owned(),
+                        self.new_status_indicator(),
+                        self.bottom_pane.status_elapsed().unwrap_or_default(),
+                    )
+                }),
+            cwd: self.config.cwd.clone(),
+            visualizations,
+        };
+        (stream, display)
+    }
+
+    pub(super) fn finalize_completed_assistant_message(
+        &mut self,
+        message: &str,
+        phase: Option<MessagePhase>,
+    ) {
+        if self.stream_controller.is_none() && !message.is_empty() {
+            let displayed =
+                parse_assistant_markdown(message, self.config.cwd.as_path()).visible_markdown;
+            self.handle_streaming_delta(displayed);
         }
         // Item completion is authoritative. Use it for consolidation so any
         // deltas dropped by a saturated transport cannot truncate the transcript.
-        self.flush_answer_stream(message);
+        self.flush_answer_stream(Some(message), phase);
         self.handle_stream_finished();
         self.request_redraw();
     }
@@ -196,11 +320,20 @@ impl ChatWidget {
             // Before starting a plan stream, flush any active exec cell group.
             self.flush_unified_exec_wait_streak();
             self.flush_active_cell();
-            self.plan_stream_controller = Some(PlanStreamController::new(
-                self.current_stream_width(/*reserved_cols*/ 4),
-                &self.config.cwd,
-                self.history_render_mode(),
-            ));
+            self.plan_stream_controller = Some(
+                PlanStreamController::new(
+                    self.current_stream_width(/*reserved_cols*/ 4),
+                    &self.config.cwd,
+                    self.history_render_mode(),
+                )
+                .with_list_spacing(
+                    if self.local_settings.transcript_mode.is_owned() {
+                        ListSpacing::Compact
+                    } else {
+                        ListSpacing::AfterMultiline
+                    },
+                ),
+            );
         }
         let changed = self
             .plan_stream_controller
@@ -237,10 +370,10 @@ impl ChatWidget {
         self.transcript.saw_plan_item_this_turn = true;
         let (finalized_streamed_cell, consolidated_plan_source) =
             if let Some(mut controller) = self.plan_stream_controller.take() {
-                let had_live_tail = controller.has_live_tail();
+                let source_only = controller.has_live_tail() && controller.tail_starts_stream();
                 self.clear_active_stream_tail();
                 let (cell, source) = controller.finalize();
-                if had_live_tail {
+                if source_only {
                     (None, source)
                 } else {
                     (cell, source)
@@ -268,6 +401,26 @@ impl ChatWidget {
             self.status_state.pending_status_indicator_restore = true;
             self.maybe_restore_status_indicator_after_stream_idle();
             self.request_pending_usage_output_insertion_after_stream_shutdown();
+        }
+    }
+
+    pub(super) fn replace_reasoning_parts(
+        &mut self,
+        mut summary: Vec<String>,
+        content: Vec<String>,
+    ) {
+        if self.config.show_raw_agent_reasoning {
+            summary.extend(content);
+        }
+        // Empty completions follow some streamed items. Preserve their deltas.
+        if summary.iter().all(String::is_empty) {
+            return;
+        }
+        self.reasoning_buffer.clear();
+        self.reasoning_summary_parts.clear();
+        for part in summary {
+            self.on_reasoning_section_break();
+            self.on_agent_reasoning_delta(part);
         }
     }
 
@@ -330,14 +483,25 @@ impl ChatWidget {
             .or(self.reasoning_header.take());
         if !self.reasoning_summary_parts.is_empty() {
             let reasoning_parts = std::mem::take(&mut self.reasoning_summary_parts);
-            let cell = history_cell::new_reasoning_summary_block(reasoning_parts, &self.config.cwd);
-            self.add_boxed_history(cell);
+            let mut cell =
+                history_cell::new_reasoning_summary_block(reasoning_parts, &self.config.cwd);
+            if let Some(id) = &self.status_state.reasoning_item_id {
+                cell.set_source_item_id(id.clone());
+            }
+            let cell: Box<dyn HistoryCell> = cell;
+            let result = match self.transcript.active_cell.as_mut() {
+                Some(active) => active.append_reasoning(cell),
+                None => Err(cell),
+            };
+            match result {
+                Ok(()) => self.bump_active_cell_revision(),
+                Err(cell) => self.add_boxed_history(cell),
+            }
         }
         self.reasoning_buffer.clear();
         // Keep the last useful summary through tools and later empty items.
         self.status_state.reasoning_item_id = None;
         self.status_state.reasoning_resume_turn_id = None;
-        self.status_state.reasoning_recovered_after_refresh = false;
         self.reasoning_summary_parts.clear();
         self.request_redraw();
     }
@@ -376,6 +540,9 @@ impl ChatWidget {
         if !from_replay && let Some(questions) = &item.questions {
             self.add_async_questions(&item.id, questions);
         }
+        if self.transcript.has_replayed_cloud_text(turn_id, &item.id) {
+            return;
+        }
         self.transcript.last_completed_agent_message = Some((turn_id.to_string(), item.id.clone()));
         let mut message = String::new();
         for content in &item.content {
@@ -384,7 +551,21 @@ impl ChatWidget {
             }
         }
         let parsed = parse_assistant_markdown(&message, self.config.cwd.as_path());
-        if from_replay && self.stream_controller.is_none() && !parsed.visible_markdown.is_empty() {
+        let questions = item.questions.as_deref().unwrap_or_default();
+        let interrupted = self
+            .transcript
+            .last_flushed_agent_message
+            .take()
+            .filter(|item| Some(item) == self.transcript.last_completed_agent_message.as_ref());
+        if interrupted.is_some() {
+            // Commit any resumed stream fragment before replacing all fragments with
+            // the authoritative message. Markdown references can span interruptions.
+            self.flush_answer_stream_with_separator();
+        }
+        if (from_replay || !questions.is_empty() || interrupted.is_some())
+            && self.stream_controller.is_none()
+            && !parsed.visible_markdown.is_empty()
+        {
             self.prepare_assistant_message();
             self.mark_safety_buffering_agent_message_started();
             self.bottom_pane.hide_status_indicator();
@@ -394,18 +575,33 @@ impl ChatWidget {
                     thread_id,
                 )
             });
-            self.add_to_history(
-                history_cell::AgentMarkdownCell::new_with_inline_visualizations(
-                    parsed.visible_markdown.clone(),
-                    self.config.cwd.as_path(),
-                    context,
-                ),
-            );
+            let cell = history_cell::AgentMarkdownCell::from_parsed_message(
+                parsed.visible_markdown.clone(),
+                message.clone(),
+                self.config.cwd.as_path(),
+                context,
+                questions,
+            )
+            .with_phase(item.phase.clone());
+            if let Some(item) = interrupted {
+                self.app_event_tx
+                    .send(AppEvent::CorrectFlushedAgentMessage { item, cell });
+            } else {
+                self.add_to_history(cell);
+            }
+            if self.transcript.recording_finished_cloud_text
+                && let Some(seen) = &mut self.transcript.replayed_cloud_text
+            {
+                seen.entry(turn_id.to_owned())
+                    .or_default()
+                    .insert(item.id.clone());
+            }
             self.handle_stream_finished();
             self.request_redraw();
         } else {
-            self.finalize_completed_assistant_message(Some(parsed.visible_markdown.as_str()));
+            self.finalize_completed_assistant_message(&message, item.phase.clone());
         }
+        self.transcript.last_flushed_agent_message = None;
         if !parsed.visible_markdown.is_empty() {
             self.transcript
                 .record_agent_markdown(parsed.visible_markdown.clone(), message);
@@ -436,7 +632,7 @@ impl ChatWidget {
                 Some(MessagePhase::FinalAnswer) | None => {
                     !self.input_queue.pending_steers.is_empty()
                 }
-                Some(MessagePhase::Commentary) => true,
+                Some(MessagePhase::Commentary | MessagePhase::PartialAnswer) => true,
             };
         self.maybe_restore_status_indicator_after_stream_idle();
     }
@@ -459,11 +655,10 @@ impl ChatWidget {
 
     /// Runs a commit tick for the current stream queue snapshot.
     ///
-    /// `scope` controls whether this call may commit in smooth mode or only when catch-up
-    /// is currently active. While lines are actively streaming we hide the status row to avoid
-    /// duplicate "in progress" affordances. Restoration is gated separately so we only re-show
+    /// `scope` selects paced, catch-up, or replay draining. While lines are actively streaming
+    /// we hide the status row to avoid duplicate "in progress" affordances. We only re-show
     /// the row after commentary completion once stream queues are idle.
-    pub(super) fn run_commit_tick_with_scope(&mut self, scope: CommitTickScope) {
+    pub(crate) fn run_commit_tick_with_scope(&mut self, scope: CommitTickScope) {
         let now = Instant::now();
         let outcome = run_commit_tick(
             &mut self.adaptive_chunking,
@@ -493,6 +688,12 @@ impl ChatWidget {
     pub(super) fn flush_interrupt_queue(&mut self) {
         let mut mgr = std::mem::take(&mut self.interrupts);
         mgr.flush_all(self);
+        self.interrupts = mgr;
+    }
+
+    pub(super) fn flush_interrupt_activity(&mut self) {
+        let mut mgr = std::mem::take(&mut self.interrupts);
+        mgr.flush_activity(self);
         self.interrupts = mgr;
     }
 
@@ -536,12 +737,21 @@ impl ChatWidget {
                     thread_id,
                 )
             });
-            self.stream_controller = Some(StreamController::new_with_inline_visualizations(
-                self.current_stream_width(/*reserved_cols*/ 2),
-                &self.config.cwd,
-                self.history_render_mode(),
-                inline_visualization_context,
-            ));
+            self.stream_controller = Some(
+                StreamController::new_with_inline_visualizations(
+                    self.current_stream_width(/*reserved_cols*/ 2),
+                    &self.config.cwd,
+                    self.history_render_mode(),
+                    inline_visualization_context,
+                )
+                .with_list_spacing(
+                    if self.local_settings.transcript_mode.is_owned() {
+                        ListSpacing::Compact
+                    } else {
+                        ListSpacing::AfterMultiline
+                    },
+                ),
+            );
         }
         let changed = self
             .stream_controller

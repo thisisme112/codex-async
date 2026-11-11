@@ -71,16 +71,10 @@ pub(super) fn apply_to_config(
             }
         }
     }
-    if let Some(requirement) = requirements.windows_sandbox_private_desktop.as_ref() {
-        apply_exact_requirement(
-            "windows.sandbox_private_desktop",
-            &mut config
-                .windows
-                .get_or_insert_default()
-                .sandbox_private_desktop,
-            Some(requirement),
-            startup_warnings,
-        );
+    if let Some(Sourced { value, source }) = requirements.otel.as_deref() {
+        let conflict =
+            codex_config::apply_otel_requirements(config.otel.get_or_insert_default(), value);
+        push_structured_requirement_override_warning("otel", conflict, source, startup_warnings);
     }
 }
 

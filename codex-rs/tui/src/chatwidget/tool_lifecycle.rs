@@ -4,6 +4,7 @@
 //! events as transcript cells.
 
 use super::*;
+use crate::thread_transcript::tools::McpHistory;
 use codex_utils_path_uri::LegacyAppPathString;
 
 impl ChatWidget {
@@ -11,12 +12,9 @@ impl ChatWidget {
         self.add_to_history(history_cell::new_patch_event(changes, &self.config.cwd));
     }
 
-    pub(super) fn on_view_image_tool_call(&mut self, path: LegacyAppPathString) {
+    pub(super) fn on_view_image_tool_call(&mut self, id: String, path: LegacyAppPathString) {
         self.flush_answer_stream_with_separator();
-        self.add_to_history(history_cell::new_view_image_tool_call(
-            path,
-            &self.config.cwd,
-        ));
+        self.add_to_history(history_cell::new_view_image_tool_call(id, path));
         self.request_redraw();
     }
 
@@ -44,7 +42,7 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    pub(super) fn on_file_change_completed(&mut self, item: ThreadItem) {
+    pub(super) fn on_file_change_completed(&mut self, item: ThreadItemPayload) {
         self.defer_or_handle(
             item,
             InterruptManager::push_item_completed,
@@ -52,7 +50,7 @@ impl ChatWidget {
         );
     }
 
-    pub(super) fn on_mcp_tool_call_started(&mut self, item: ThreadItem) {
+    pub(super) fn on_mcp_tool_call_started(&mut self, item: ThreadItemPayload) {
         self.defer_or_handle(
             item,
             InterruptManager::push_item_started,
@@ -60,7 +58,7 @@ impl ChatWidget {
         );
     }
 
-    pub(super) fn on_mcp_tool_call_completed(&mut self, item: ThreadItem) {
+    pub(super) fn on_mcp_tool_call_completed(&mut self, item: ThreadItemPayload) {
         self.defer_or_handle(
             item,
             InterruptManager::push_item_completed,
@@ -74,7 +72,7 @@ impl ChatWidget {
         self.transcript.active_cell = Some(Box::new(history_cell::new_active_web_search_call(
             call_id,
             String::new(),
-            self.local_settings.tui.animations,
+            self.local_settings.tui.animations && self.local_settings.tui.effects.progress,
         )));
         self.bump_active_cell_revision();
         self.request_redraw();
@@ -107,14 +105,14 @@ impl ChatWidget {
         }
     }
 
-    pub(super) fn on_collab_event(&mut self, cell: PlainHistoryCell) {
+    pub(super) fn on_collab_event(&mut self, cell: impl HistoryCell + 'static) {
         self.flush_answer_stream_with_separator();
         self.add_to_history(cell);
         self.request_redraw();
     }
 
-    pub(super) fn on_collab_agent_tool_call(&mut self, item: ThreadItem) {
-        let ThreadItem::CollabAgentToolCall {
+    pub(super) fn on_collab_agent_tool_call(&mut self, item: ThreadItemPayload) {
+        let ThreadItemPayload::CollabAgentToolCall {
             id, tool, status, ..
         } = &item
         else {
@@ -144,14 +142,29 @@ impl ChatWidget {
         }
     }
 
-    pub(super) fn on_sub_agent_activity(&mut self, item: ThreadItem) {
+    pub(super) fn on_sub_agent_activity(&mut self, item: ThreadItemPayload) {
+        // Background agents can finish while the parent answer is still streaming.
+        // Keep that stream intact until its authoritative message completion.
+        // After the turn stops, leftover prompts must not hold up late activity.
+        if !self.turn_lifecycle.agent_turn_running && self.stream_controller.is_none() {
+            self.handle_sub_agent_activity_now(item);
+        } else {
+            self.defer_or_handle(
+                item,
+                InterruptManager::push_item_completed,
+                Self::handle_sub_agent_activity_now,
+            );
+        }
+    }
+
+    fn handle_sub_agent_activity_now(&mut self, item: ThreadItemPayload) {
         if let Some(cell) = multi_agents::sub_agent_activity_history_cell(&item) {
             self.on_collab_event(cell);
         }
     }
 
-    pub(crate) fn handle_file_change_completed_now(&mut self, item: ThreadItem) {
-        let ThreadItem::FileChange { status, .. } = item else {
+    pub(crate) fn handle_file_change_completed_now(&mut self, item: ThreadItemPayload) {
+        let ThreadItemPayload::FileChange { status, .. } = item else {
             return;
         };
         // If the patch was successful, just let the "Edited" block stand.
@@ -161,8 +174,8 @@ impl ChatWidget {
         }
     }
 
-    pub(crate) fn handle_mcp_tool_call_started_now(&mut self, item: ThreadItem) {
-        let ThreadItem::McpToolCall {
+    pub(crate) fn handle_mcp_tool_call_started_now(&mut self, item: ThreadItemPayload) {
+        let ThreadItemPayload::McpToolCall {
             id,
             server,
             tool,
@@ -182,7 +195,7 @@ impl ChatWidget {
             let call = history_cell::new_active_mcp_tool_call(
                 id,
                 invocation,
-                self.local_settings.tui.animations,
+                self.local_settings.tui.animations && self.local_settings.tui.effects.progress,
             );
             self.update_computer_activity(|cell| cell.start(call));
             self.bump_active_cell_revision();
@@ -193,54 +206,30 @@ impl ChatWidget {
         self.transcript.active_cell = Some(Box::new(history_cell::new_active_mcp_tool_call(
             id,
             invocation,
-            self.local_settings.tui.animations,
+            self.local_settings.tui.animations && self.local_settings.tui.effects.progress,
         )));
         self.bump_active_cell_revision();
         self.request_redraw();
     }
 
-    pub(crate) fn handle_mcp_tool_call_completed_now(&mut self, item: ThreadItem) {
+    pub(crate) fn handle_mcp_tool_call_completed_now(&mut self, item: ThreadItemPayload) {
         self.flush_answer_stream_with_separator();
 
-        let ThreadItem::McpToolCall {
+        let Some(McpHistory {
             id,
-            server,
-            tool,
-            status,
-            arguments,
+            invocation,
+            duration,
             result,
-            error,
-            duration_ms,
-            ..
-        } = item
+        }) = McpHistory::from_item(item)
         else {
             return;
-        };
-        let invocation = McpInvocation {
-            server,
-            tool,
-            arguments: Some(arguments),
-        };
-        let duration = Duration::from_millis(duration_ms.unwrap_or_default().max(0) as u64);
-        let result = match (result, error) {
-            (_, Some(error)) => Err(error.message),
-            (Some(result), None) => {
-                let result = *result;
-                Ok(codex_protocol::mcp::CallToolResult {
-                    content: result.content,
-                    structured_content: result.structured_content,
-                    is_error: Some(status == codex_app_server_protocol::McpToolCallStatus::Failed),
-                    meta: None,
-                })
-            }
-            (None, None) => Err("MCP tool call completed without a result".to_string()),
         };
 
         if invocation.is_computer_activity() {
             let call = history_cell::new_active_mcp_tool_call(
                 id,
                 invocation,
-                self.local_settings.tui.animations,
+                self.local_settings.tui.animations && self.local_settings.tui.effects.progress,
             );
             self.update_computer_activity(|cell| cell.complete(call, duration, result));
             self.bump_active_cell_revision();
@@ -248,7 +237,7 @@ impl ChatWidget {
             return;
         }
 
-        let extra_cell = match self
+        match self
             .transcript
             .active_cell
             .as_mut()
@@ -260,18 +249,31 @@ impl ChatWidget {
                 let mut cell = history_cell::new_active_mcp_tool_call(
                     id,
                     invocation,
-                    self.local_settings.tui.animations,
+                    self.local_settings.tui.animations && self.local_settings.tui.effects.progress,
                 );
-                let extra_cell = cell.complete(duration, result);
+                cell.complete(duration, result);
                 self.transcript.active_cell = Some(Box::new(cell));
-                extra_cell
             }
         };
 
         self.flush_active_cell();
-        if let Some(extra) = extra_cell {
-            self.add_boxed_history(extra);
-        }
+    }
+
+    /// Preserve pending calls and timers, returning the revisions before and after hydration.
+    pub(crate) fn prepend_active_computer_history(
+        &mut self,
+        older: &dyn HistoryCell,
+        turns: &[Turn],
+    ) -> Option<(u64, u64)> {
+        let previous_revision = self.transcript.active_cell_revision;
+        let active = self.transcript.active_cell.as_mut().and_then(|cell| {
+            cell.as_any_mut()
+                .downcast_mut::<history_cell::ComputerActivityCell>()
+        })?;
+        let older = crate::thread_transcript::older_computer_group(older, active, turns)?;
+        active.prepend(older);
+        self.bump_active_cell_revision();
+        Some((previous_revision, self.transcript.active_cell_revision))
     }
 
     /// Reuse only adjacent computer calls; all other active cells form a transcript boundary.
@@ -292,25 +294,38 @@ impl ChatWidget {
         }
     }
 
-    pub(crate) fn handle_queued_item_started_now(&mut self, item: ThreadItem) {
+    pub(crate) fn handle_queued_item_started_now(&mut self, item: ThreadItemPayload) {
         match item {
-            item @ ThreadItem::CommandExecution { .. } => {
+            item @ ThreadItemPayload::CommandExecution { .. } => {
                 self.handle_command_execution_started_now(item);
             }
-            item @ ThreadItem::McpToolCall { .. } => {
+            item @ ThreadItemPayload::McpToolCall { .. } => {
                 self.handle_mcp_tool_call_started_now(item);
+            }
+            item @ ThreadItemPayload::DynamicToolCall { .. } => {
+                self.handle_dynamic_tool_item_now(item)
             }
             _ => {}
         }
     }
 
-    pub(crate) fn handle_queued_item_completed_now(&mut self, item: ThreadItem) {
+    pub(crate) fn handle_queued_item_completed_now(&mut self, item: ThreadItemPayload) {
         match item {
-            item @ ThreadItem::CommandExecution { .. } => {
+            item @ ThreadItemPayload::CommandExecution { .. } => {
                 self.handle_command_execution_completed_now(item);
             }
-            item @ ThreadItem::FileChange { .. } => self.handle_file_change_completed_now(item),
-            item @ ThreadItem::McpToolCall { .. } => self.handle_mcp_tool_call_completed_now(item),
+            item @ ThreadItemPayload::FileChange { .. } => {
+                self.handle_file_change_completed_now(item)
+            }
+            item @ ThreadItemPayload::McpToolCall { .. } => {
+                self.handle_mcp_tool_call_completed_now(item)
+            }
+            item @ ThreadItemPayload::DynamicToolCall { .. } => {
+                self.handle_dynamic_tool_item_now(item)
+            }
+            item @ ThreadItemPayload::SubAgentActivity { .. } => {
+                self.handle_sub_agent_activity_now(item)
+            }
             _ => {}
         }
     }

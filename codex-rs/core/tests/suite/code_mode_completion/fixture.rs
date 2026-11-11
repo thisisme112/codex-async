@@ -52,6 +52,7 @@ impl CodeModeSession for ControlledSession {
         &'a self,
         _request: ExecuteRequest,
         delegate: Arc<dyn CodeModeSessionDelegate>,
+        _preempt: Option<tokio_util::sync::CancellationToken>,
     ) -> CodeModeSessionResultFuture<'a, StartedCell> {
         Box::pin(async move {
             *self.delegate.lock().expect("delegate lock") = Some(delegate);
@@ -66,7 +67,11 @@ impl CodeModeSession for ControlledSession {
         })
     }
 
-    fn wait<'a>(&'a self, _request: WaitRequest) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
+    fn wait<'a>(
+        &'a self,
+        _request: WaitRequest,
+        _preempt: Option<tokio_util::sync::CancellationToken>,
+    ) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
         Box::pin(async move {
             if let Some(result) = self.result.lock().expect("result lock").take() {
                 // Delay cleanup until shutdown: Core must retire a known claim itself.
@@ -77,7 +82,10 @@ impl CodeModeSession for ControlledSession {
         })
     }
 
-    fn terminate<'a>(&'a self, _cell_id: CellId) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
+    fn terminate<'a>(
+        &'a self,
+        _request: TerminateRequest,
+    ) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
         Box::pin(async move {
             if let Some(delegate) = self.delegate.lock().expect("delegate lock").take() {
                 delegate.cell_closed(&cell_id());

@@ -4,7 +4,7 @@
 
 可用分支为 **async-main**。最初的官方 `main` 保留为 fork 创建时的参考快照，日常请使用默认分支 `async-main`。
 
-当前首次预检查发现 **39 个文件冲突**，已保留可用版本；记录见 [UPSTREAM_STATUS.md](UPSTREAM_STATUS.md)。需要先完成一次接口适配，之后每次兼容更新才会自动推进。
+已在适配分支处理首次官方更新的 39 个文件冲突，正在验证新的执行与协议接口；记录见 [UPSTREAM_STATUS.md](UPSTREAM_STATUS.md)。每次合并仍须通过测试和构建后才能推进可用分支。
 
 ## 自动同步
 
@@ -16,7 +16,7 @@
 
 官方的 `.github/workflows/` 入口不随源代码合并，本仓库只运行自己的同步工作流，避免触发官方整套 CI。官方其他源代码、构建脚本、测试和本地 action 均保留。`upstream/source` 是排除这些工作流入口后的官方源代码快照，提交历史仍关联真实官方提交。
 
-同步检查只需要很少资源；有新改动且可以合并时才进行完整验证。使用公开仓库的标准 Ubuntu runner，构建并发 1、最多两核心；不使用付费大型 runner，也不上传大型编译缓存或二进制。合并检查与验证任务只有只读权限，最后的发布任务才有仓库写权限。没有额外 PAT。
+同步检查只需要很少资源；有新改动且可以合并时才进行完整验证。使用公开仓库的标准 Ubuntu runner，GitHub 构建并发 2、最多两核心；本地验证默认并发 1；不使用付费大型 runner，也不上传大型编译缓存或二进制。合并检查与验证任务只有只读权限，最后的发布任务才有仓库写权限。没有额外 PAT。
 
 GitHub 有时会暂停长期无活动仓库的定时工作流，可在 Actions 页面恢复。
 
@@ -30,7 +30,7 @@ python3 scripts/async_fork/sync.py check
 python3 scripts/async_fork/sync.py prepare --output /tmp/codex-async-sync
 ```
 
-`prepare` 不更新可用分支。`promote` 只用于已完成编译和测试的候选版本，不应绕过验证手工调用。手动 Actions 运行时勾选 `check_only` 可以只检查合并情况，不编译、不发布。
+`prepare` 不更新可用分支。`promote` 只用于已完成编译和测试的候选版本，不应绕过验证手工调用。手动 Actions 运行时勾选 `check_only` 可以只检查合并情况，不编译、不发布。需要验证手工处理冲突的分支时，选择该分支并勾选 `verify_only`，保持 `check_only` 不勾选；此模式编译和测试选中提交，但不会自动发布。
 
 ## 构建与使用
 

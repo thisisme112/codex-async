@@ -115,26 +115,18 @@ def test_root_fmt_recipes_use_shared_formatter_driver() -> None:
     )
     actual = {
         "working_directory": lines[0],
-        "fmt_comment": next(line for line in reversed(lines[:fmt_index]) if line.startswith("#")),
         "fmt_commands": [
             line.strip()
             for line in lines[fmt_index + 1 : fmt_check_index]
             if line.strip() and not line.startswith("#")
         ],
-        "fmt_check_comment": next(
-            line for line in reversed(lines[:fmt_check_index]) if line.startswith("#")
-        ),
         "fmt_check_commands": [
             line.strip() for line in lines[fmt_check_index + 1 : next_recipe_index] if line.strip()
         ],
     }
     expected = {
         "working_directory": 'set working-directory := "codex-rs"',
-        "fmt_comment": (
-            "# Format the justfile, Rust, Bazel/Starlark, Python SDK code, and Python scripts."
-        ),
         "fmt_commands": ["@{{ python }} ../scripts/format.py"],
-        "fmt_check_comment": "# Check formatting without modifying files.",
         "fmt_check_commands": ["@{{ python }} ../scripts/format.py --check"],
     }
 
@@ -508,13 +500,12 @@ def test_python_codegen_schema_annotation_adds_stable_variant_titles() -> None:
         "GranularAskForApproval",
     ]
 
-    reasoning_summary_titles = [
-        variant.get("title") for variant in definitions["ReasoningSummary"]["oneOf"]
-    ]
-    assert reasoning_summary_titles == [
-        "ReasoningSummaryValue",
-        "NoneReasoningSummary",
-    ]
+    from openai_codex.generated.v2_all import ReasoningSummary
+
+    reasoning_values, disabled = definitions["ReasoningSummary"]["oneOf"]
+    assert reasoning_values["title"] == "ReasoningSummaryValue"
+    assert disabled["enum"] == ["none"]
+    assert ReasoningSummary.model_validate("none").root == "none"
 
 
 def test_generate_v2_all_uses_titles_for_generated_names() -> None:
@@ -534,6 +525,82 @@ def test_generated_chatgpt_account_email_is_required_nullable() -> None:
 
     with pytest.raises(ValidationError):
         ChatgptAccount.model_validate({"planType": "pro", "type": "chatgpt"})
+
+
+@pytest.mark.parametrize("link_id", ["link_calendar", None])
+def test_generated_resource_read_target_requires_explicit_account(link_id: str | None) -> None:
+    from openai_codex.generated.v2_all import McpResourceReadTarget
+
+    payload = {"connectorId": "calendar", "linkId": link_id}
+    target = McpResourceReadTarget.model_validate(payload)
+    assert target.model_dump(by_alias=True) == payload
+
+    with pytest.raises(ValidationError):
+        McpResourceReadTarget.model_validate({"connectorId": "calendar"})
+
+
+def test_generated_inline_image_class_names_remain_stable() -> None:
+    """Keep the existing Python class names when image references expand."""
+    from openai_codex.generated.v2_all import (
+        ImageUserInput,
+        InputImageContentItem,
+        InputImageFunctionCallOutputContentItem,
+    )
+
+    assert ImageUserInput.__name__ == "ImageUserInput"
+    assert InputImageContentItem.__name__ == "InputImageContentItem"
+    assert (
+        InputImageFunctionCallOutputContentItem.__name__
+        == "InputImageFunctionCallOutputContentItem"
+    )
+
+
+def test_generated_audio_inputs_preserve_inline_and_file_shapes() -> None:
+    """Existing audio imports still work, and file references round-trip through the unions."""
+    from openai_codex.generated.v2_all import (
+        AudioUserInput,
+        ContentItem,
+        FileIdUserInput1,
+        InputAudioContentItem,
+        InputAudioFunctionCallOutputContentItem,
+        UserInput,
+    )
+
+    audio_url = "data:audio/wav;base64,YXVkaW8="
+    for model, wire in [
+        (InputAudioFunctionCallOutputContentItem, {"type": "input_audio", "audio_url": audio_url}),
+        (AudioUserInput, {"type": "audio", "url": audio_url}),
+        (InputAudioContentItem, {"type": "input_audio", "audio_url": audio_url}),
+        (UserInput, {"type": "audio", "fileId": "file_audio"}),
+        (FileIdUserInput1, {"type": "audio", "fileId": "file_audio"}),
+        (ContentItem, {"type": "input_audio", "file_id": "file_audio"}),
+    ]:
+        audio = model.model_validate(wire)
+        assert audio.model_dump(by_alias=True, exclude_unset=True, mode="json") == wire
+
+
+def test_generated_image_generation_thread_item_alias_remains_available() -> None:
+    """Existing SDK callers can still construct and validate inline image-generation items."""
+    from openai_codex.generated.v2_all import (
+        ImageGenerationThreadItem,
+        ResultThreadItem,
+    )
+
+    item = ImageGenerationThreadItem.model_validate(
+        {
+            "failure": None,
+            "id": "image_1",
+            "result": "aW1hZ2U=",
+            "revisedPrompt": None,
+            "savedPath": None,
+            "status": "completed",
+            "transparentBackground": None,
+            "type": "imageGeneration",
+        }
+    )
+
+    assert ImageGenerationThreadItem is ResultThreadItem
+    assert isinstance(item, ResultThreadItem)
 
 
 def test_runtime_package_template_has_no_checked_in_binaries() -> None:
@@ -864,7 +931,10 @@ def test_stage_runtime_release_can_pin_wheel_platform_tag(tmp_path: Path) -> Non
     assert 'platform-tag = "manylinux_2_17_x86_64"' in pyproject
 
 
-def test_stage_runtime_release_rejects_incomplete_package_layout(tmp_path: Path) -> None:
+@pytest.mark.parametrize("source_name", ["codex-package.tar.gz", "codex-package"])
+def test_stage_runtime_release_rejects_incomplete_package_layout(
+    tmp_path: Path, source_name: str
+) -> None:
     script = _load_update_script_module()
     package_dir = tmp_path / "codex-package"
     (package_dir / "bin").mkdir(parents=True)
@@ -872,7 +942,69 @@ def test_stage_runtime_release_rejects_incomplete_package_layout(tmp_path: Path)
     _write_package_archive(package_dir, package_archive)
 
     with pytest.raises(RuntimeError, match="Missing Codex package layout entries"):
-        script.stage_python_runtime_package(tmp_path / "runtime-stage", "1.2.3", package_archive)
+        script.stage_python_runtime_package(
+            tmp_path / "runtime-stage", "1.2.3", tmp_path / source_name
+        )
+
+
+def test_stage_runtime_directory_matches_archive(tmp_path: Path) -> None:
+    script = _load_update_script_module()
+    package_dir = _write_fake_codex_package(tmp_path / "codex-package", script)
+    (package_dir / "bin" / script.runtime_binary_name()).chmod(0o755)
+    package_archive = tmp_path / "codex-package.tar.gz"
+    _write_package_archive(package_dir, package_archive)
+
+    staged_trees = []
+    for name, source in [("archive", package_archive), ("directory", package_dir)]:
+        staged = script.stage_python_runtime_package(
+            tmp_path / name, "1.2.3", source, platform_tag="win_amd64"
+        )
+        staged_trees.append(
+            {
+                path.relative_to(staged): (path.read_bytes(), path.stat().st_mode & 0o777)
+                for path in staged.rglob("*")
+                if path.is_file()
+            }
+        )
+
+    assert staged_trees[0] == staged_trees[1]
+    (script.staged_runtime_package_root(tmp_path / "directory") / "codex-package.json").unlink()
+    assert (package_dir / "codex-package.json").is_file()
+
+
+@pytest.mark.parametrize("entry_kind", ["file-link", "directory-link", "fifo"])
+def test_stage_runtime_directory_rejects_non_regular_entries(
+    tmp_path: Path, entry_kind: str
+) -> None:
+    script = _load_update_script_module()
+    package_dir = _write_fake_codex_package(tmp_path / "codex-package", script)
+    entry = package_dir / "codex-resources" / "invalid"
+    if entry_kind == "fifo":
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("FIFOs are not available on this platform")
+        os.mkfifo(entry)
+    else:
+        target = package_dir / ("codex-package.json" if entry_kind == "file-link" else "bin")
+        try:
+            entry.symlink_to(target, target_is_directory=target.is_dir())
+        except OSError:
+            pytest.skip("Symlinks are not available on this platform")
+
+    with pytest.raises(RuntimeError, match="Expected a regular Codex package entry"):
+        script.stage_python_runtime_package(tmp_path / "runtime-stage", "1.2.3", package_dir)
+
+
+@pytest.mark.parametrize("staging_path", ["codex-package", "codex-package/stage", "."])
+def test_stage_runtime_directory_rejects_overlapping_staging(
+    tmp_path: Path, staging_path: str
+) -> None:
+    script = _load_update_script_module()
+    package_dir = _write_fake_codex_package(tmp_path / "codex-package", script)
+
+    with pytest.raises(RuntimeError, match="directories must not overlap"):
+        script.stage_python_runtime_package(tmp_path / staging_path, "1.2.3", package_dir)
+
+    assert (package_dir / "codex-package.json").is_file()
 
 
 def test_runtime_package_layout_is_included_by_wheel_config(
@@ -1111,15 +1243,18 @@ def test_sdk_beta_can_use_a_supported_runtime(
     )
 
 
-def test_stage_runtime_stages_package_without_type_generation(tmp_path: Path) -> None:
+@pytest.mark.parametrize("source_name", ["codex-package.tar.gz", "codex-package"])
+def test_stage_runtime_stages_package_without_type_generation(
+    tmp_path: Path, source_name: str
+) -> None:
     script = _load_update_script_module()
-    package_archive = _write_fake_codex_package_archive(tmp_path, script)
+    _write_fake_codex_package_archive(tmp_path, script)
     calls: list[str] = []
     args = script.parse_args(
         [
             "stage-runtime",
             str(tmp_path / "runtime-stage"),
-            str(package_archive),
+            str(tmp_path / source_name),
             "--codex-version",
             "rust-v0.116.0-alpha.1",
             "--platform-tag",
@@ -1152,7 +1287,7 @@ def test_stage_runtime_stages_package_without_type_generation(tmp_path: Path) ->
 
     script.run_command(args, ops)
 
-    assert calls == ["stage_runtime:0.116.0a1:manylinux_2_17_x86_64:codex-package.tar.gz"]
+    assert calls == [f"stage_runtime:0.116.0a1:manylinux_2_17_x86_64:{source_name}"]
 
 
 def test_default_runtime_is_resolved_from_installed_runtime_package(

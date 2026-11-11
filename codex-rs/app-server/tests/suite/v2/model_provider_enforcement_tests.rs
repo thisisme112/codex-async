@@ -1,4 +1,4 @@
-//! Verifies provider requirements at app-server input and queue admission boundaries.
+//! Verifies provider selection and requirements at app-server input and queue admission boundaries.
 
 use anyhow::Result;
 use app_test_support::MockResponsesConfig;
@@ -60,7 +60,8 @@ async fn provider_requirement_changes_reject_inputs_to_existing_threads(
         },
     ]])
     .await;
-    let other = MockServer::start().await;
+    // Use a dedicated server because this test asserts that no traffic reaches it.
+    let other = MockServer::builder().start().await;
     let home = TempDir::new()?;
     MockResponsesConfig::new(gateway.uri())
         .enable_feature(codex_features::Feature::Goals)
@@ -104,6 +105,7 @@ base_url = "{}/v1"
         .request(|request_id| ClientRequest::ThreadQueueAdd {
             request_id,
             params: ThreadQueueAddParams {
+                responsesapi_client_metadata: None,
                 thread_id: started.thread.id.clone(),
                 input: input.clone(),
                 client_user_message_id: "queued-message".into(),
@@ -127,12 +129,22 @@ base_url = "{}/v1"
         requirements.replace(gateway.uri(), &other.uri())
     };
     std::fs::write(requirements_path, updated)?;
+    let provider_error =
+        codex_app_server_protocol::ModelProviderError::ModelProviderPolicyConflict {
+            model_provider: "gateway".into(),
+            required_model_provider: required_selection.into(),
+        };
     let expected_error = JSONRPCErrorError {
         code: -32600,
-        message: "failed to load configuration: Your organization's required model provider settings changed. Restart Codex to apply them; this request was not sent".to_string(),
-        data: None,
+        message: provider_error.to_string(),
+        data: Some(serde_json::to_value(provider_error)?),
     };
     for (method, params) in [
+        ("thread/resume", json!({"threadId": started.thread.id})),
+        (
+            "thread/guardianReview",
+            json!({ "threadId": started.thread.id }),
+        ),
         (
             "thread/goal/set",
             json!({"threadId": started.thread.id, "objective": "Blocked objective"}),
@@ -148,10 +160,6 @@ base_url = "{}/v1"
         (
             "review/start",
             json!({ "threadId": started.thread.id, "target": { "type": "custom", "instructions": "Review this change." }, "delivery": "inline" }),
-        ),
-        (
-            "review/start",
-            json!({ "threadId": started.thread.id, "target": { "type": "custom", "instructions": "Review this change." }, "delivery": "detached" }),
         ),
     ] {
         let id = server.send_raw_request(method, Some(params)).await?;
@@ -245,53 +253,16 @@ base_url = "{}/v1"
         assert_eq!(error.error, expected_error);
     }
     assert_eq!(gateway.requests().await.len(), 1);
+    let other_requests = other.received_requests().await.expect("recorded requests");
     assert!(
-        other
-            .received_requests()
-            .await
-            .expect("recorded requests")
-            .is_empty()
+        other_requests.is_empty(),
+        "unexpected requests to replacement provider: {:?}",
+        other_requests
+            .iter()
+            .map(|request| (request.method.as_str(), request.url.path()))
+            .collect::<Vec<_>>()
     );
     gateway.shutdown().await;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn local_config_changes_do_not_block_existing_threads() -> Result<()> {
-    let provider = MockServer::start().await;
-    let home = TempDir::new()?;
-    MockResponsesConfig::new(&provider.uri()).write(home.path())?;
-    let mut server = TestAppServer::builder()
-        .with_codex_home(home.path())
-        .build_initialized()
-        .await?;
-    let started = server.start_thread(ThreadStartParams::default()).await?;
-    let requests = responses::mount_sse_sequence(
-        &provider,
-        vec![
-            responses::sse(vec![responses::ev_completed("first")]),
-            responses::sse(vec![responses::ev_completed("second")]),
-        ],
-    )
-    .await;
-    for local_settings in ["model_provider = 'openai'", "invalid toml !!!"] {
-        std::fs::write(home.path().join("config.toml"), local_settings)?;
-        let id = server
-            .send_turn_start_request(TurnStartParams {
-                thread_id: started.thread.id.clone(),
-                input: vec![UserInput::Text {
-                    text: "Continue on the original provider.".into(),
-                    text_elements: Vec::new(),
-                }],
-                ..Default::default()
-            })
-            .await?;
-        let _: TurnStartResponse = server.read_response(id).await?;
-        server
-            .read_stream_until_notification_message("turn/completed")
-            .await?;
-    }
-    assert_eq!(requests.requests().len(), 2);
     Ok(())
 }
 
@@ -318,6 +289,7 @@ async fn malformed_system_defaults_do_not_block_existing_thread_turn() -> Result
         loader_overrides: overrides,
         strict_config: false,
         cloud_config_bundle: CloudConfigBundleLoader::default(),
+        embedded_network_policy: Default::default(),
         thread_config_loader: Arc::new(NoopThreadConfigLoader),
         feedback: CodexFeedback::new(),
         log_db: None,

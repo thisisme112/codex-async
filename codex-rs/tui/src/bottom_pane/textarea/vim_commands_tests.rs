@@ -7,7 +7,6 @@ use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use pretty_assertions::assert_eq;
-use tokio::time::Instant;
 
 fn vim_textarea(text: &str, cursor: usize) -> TextArea {
     let mut textarea = TextArea::new();
@@ -28,12 +27,7 @@ fn keys(textarea: &mut TextArea, keys: &str) {
             ch => KeyCode::Char(ch),
         };
         let event = KeyEvent::new(code, KeyModifiers::NONE);
-        match matcher.advance(
-            event,
-            &keymap.chords,
-            textarea.keymap_contexts(),
-            Instant::now(),
-        ) {
+        match matcher.advance(event, &keymap.chords, textarea.keymap_contexts()) {
             KeyChordMatch::PassThrough => textarea.input(event),
             KeyChordMatch::Completed(event) => textarea.input(event),
             KeyChordMatch::Pending(_) | KeyChordMatch::Cancelled | KeyChordMatch::Ignored => {}
@@ -824,4 +818,12 @@ fn search_skips_atomic_elements_and_partial_graphemes() {
     assert_eq!(area.cursor(), "[photo.png]".len());
     keys(&mut area, "/e\u{301}\n");
     assert_eq!(area.cursor(), "[photo.png]é ".len());
+}
+
+#[test]
+fn yank_capture_debug_redacts_register_contents() {
+    let mut textarea = vim_textarea("private-register-marker", /*cursor*/ 0);
+    keys(&mut textarea, "y$");
+    let action = VimAction::Yank(std::sync::Arc::new(textarea.register_snapshot()));
+    assert!(!format!("{action:?}").contains("private-register-marker"));
 }

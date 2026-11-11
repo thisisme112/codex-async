@@ -1,3 +1,4 @@
+use super::helpers::drain_insert_history_transcript;
 use super::*;
 use pretty_assertions::assert_eq;
 
@@ -206,7 +207,7 @@ async fn auto_review_denials_popup_lists_stored_auto_review_denials() {
 
     chat.open_auto_review_denials_popup();
 
-    let popup = render_bottom_popup(&chat, /*width*/ 120);
+    let popup = render_bottom_popup(&chat, /*width*/ 40);
     assert_chatwidget_snapshot!("auto_review_denials_popup", popup);
 }
 
@@ -232,6 +233,21 @@ async fn approving_recent_denial_emits_structured_core_op_once() {
     assert_matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_)));
 
     chat.approve_recent_auto_review_denial(thread_id, "auto-review-recent-1".to_string());
+    assert_matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_)));
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn prompt_revert_discards_recent_denial_actions() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    chat.on_guardian_assessment(auto_review_denial_event());
+    chat.reset_after_prompt_revert(/*rollout_path*/ None, &[]);
+    drain_insert_history(&mut rx);
+
+    chat.approve_recent_auto_review_denial(thread_id, "auto-review-recent-1".to_string());
+
     assert_matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_)));
     assert!(rx.try_recv().is_err());
 }
@@ -292,7 +308,7 @@ async fn guardian_denied_exec_renders_warning_and_denied_request() {
     let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
     term.set_viewport_area(viewport);
 
-    for lines in drain_insert_history(&mut rx) {
+    for lines in drain_insert_history_transcript(&mut rx) {
         crate::insert_history::insert_history_lines(&mut term, lines)
             .expect("Failed to insert history lines in test");
     }
@@ -304,7 +320,7 @@ async fn guardian_denied_exec_renders_warning_and_denied_request() {
 
     assert_chatwidget_snapshot!(
         "guardian_denied_exec_renders_warning_and_denied_request",
-        normalize_snapshot_paths(term.backend().vt100().screen().contents())
+        normalize_working_snapshot(term.backend().vt100().screen().contents())
     );
 }
 
@@ -446,7 +462,7 @@ async fn guardian_approved_request_permissions_clears_status_without_history() {
 
     assert_chatwidget_snapshot!(
         "guardian_approved_request_permissions_clears_status_without_history",
-        normalize_snapshot_paths(term.backend().vt100().screen().contents())
+        normalize_working_snapshot(term.backend().vt100().screen().contents())
     );
 }
 
@@ -508,7 +524,7 @@ async fn guardian_timed_out_exec_renders_warning_and_timed_out_request() {
     let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
     term.set_viewport_area(viewport);
 
-    for lines in drain_insert_history(&mut rx) {
+    for lines in drain_insert_history_transcript(&mut rx) {
         crate::insert_history::insert_history_lines(&mut term, lines)
             .expect("Failed to insert history lines in test");
     }
@@ -520,7 +536,7 @@ async fn guardian_timed_out_exec_renders_warning_and_timed_out_request() {
 
     assert_chatwidget_snapshot!(
         "guardian_timed_out_exec_renders_warning_and_timed_out_request",
-        normalize_snapshot_paths(term.backend().vt100().screen().contents())
+        normalize_working_snapshot(term.backend().vt100().screen().contents())
     );
 }
 
@@ -639,7 +655,7 @@ async fn app_server_guardian_review_denied_renders_denied_request_snapshot() {
 
     assert_chatwidget_snapshot!(
         "app_server_guardian_review_denied_renders_denied_request",
-        normalize_snapshot_paths(term.backend().vt100().screen().contents())
+        normalize_working_snapshot(term.backend().vt100().screen().contents())
     );
 }
 
@@ -720,7 +736,7 @@ async fn app_server_guardian_review_timed_out_renders_timed_out_request_snapshot
 
     assert_chatwidget_snapshot!(
         "app_server_guardian_review_timed_out_renders_timed_out_request",
-        normalize_snapshot_paths(term.backend().vt100().screen().contents())
+        normalize_working_snapshot(term.backend().vt100().screen().contents())
     );
 }
 
@@ -786,7 +802,6 @@ async fn guardian_parallel_reviews_keep_remaining_review_visible_after_denial() 
 async fn guardian_cleanup_drops_stale_reviews_and_restores_mcp_status() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    chat.set_mcp_startup_expected_servers(["alpha".to_string()]);
     handle_turn_started(&mut chat, "turn-1");
     chat.on_mcp_server_status_updated(McpServerStatusUpdatedNotification {
         thread_id: None,

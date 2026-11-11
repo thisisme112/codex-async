@@ -80,6 +80,7 @@ impl codex_code_mode::CodeModeSession for MissingCellCodeModeSession {
         &'a self,
         _request: codex_code_mode::ExecuteRequest,
         _delegate: Arc<dyn codex_code_mode::CodeModeSessionDelegate>,
+        _preempt: Option<CancellationToken>,
     ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::StartedCell> {
         Box::pin(async { Err("test session cannot execute cells".to_string()) })
     }
@@ -87,18 +88,21 @@ impl codex_code_mode::CodeModeSession for MissingCellCodeModeSession {
     fn wait<'a>(
         &'a self,
         request: codex_code_mode::WaitRequest,
+        _preempt: Option<CancellationToken>,
     ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::WaitOutcome> {
-        self.terminate(request.cell_id)
+        self.terminate(request.cell_id.into())
     }
 
     fn terminate<'a>(
         &'a self,
-        cell_id: codex_code_mode::CellId,
+        request: codex_code_mode::TerminateRequest,
     ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::WaitOutcome> {
         Box::pin(async move {
+            let cell_id = request.cell_id;
             Ok(codex_code_mode::WaitOutcome::MissingCell(
                 codex_code_mode::RuntimeResponse::Result {
                     code_mode_host_duration: None,
+                    result_buffered_for: std::time::Duration::ZERO,
                     error_text: Some(format!("exec cell {cell_id} not found")),
                     cell_id,
                     content_items: Vec::new(),
@@ -131,7 +135,7 @@ async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> a
     let turn = Arc::new(turn);
 
     registry
-        .dispatch_any_with_terminal_outcome(
+        .dispatch_any_with_state(
             test_invocation(
                 Arc::clone(&session),
                 Arc::clone(&turn),
@@ -140,11 +144,11 @@ async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> a
                 ToolCallSource::Direct,
                 "{}",
             ),
-            /*terminal_outcome_reached*/ None,
+            /*call_state*/ None,
         )
         .await?;
     registry
-        .dispatch_any_with_terminal_outcome(
+        .dispatch_any_with_state(
             test_invocation(
                 session,
                 turn,
@@ -156,7 +160,7 @@ async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> a
                 },
                 "{}",
             ),
-            /*terminal_outcome_reached*/ None,
+            /*call_state*/ None,
         )
         .await?;
 
@@ -216,7 +220,7 @@ async fn dispatch_lifecycle_trace_records_unsupported_tool_failures() -> anyhow:
     let turn = Arc::new(turn);
 
     let result = registry
-        .dispatch_any_with_terminal_outcome(
+        .dispatch_any_with_state(
             test_invocation(
                 session,
                 turn,
@@ -225,7 +229,7 @@ async fn dispatch_lifecycle_trace_records_unsupported_tool_failures() -> anyhow:
                 ToolCallSource::Direct,
                 "{}",
             ),
-            /*terminal_outcome_reached*/ None,
+            /*call_state*/ None,
         )
         .await;
 
@@ -245,24 +249,24 @@ async fn dispatch_lifecycle_trace_records_incompatible_payload_failures() -> any
     attach_test_trace(&mut session, &turn, temp.path())?;
 
     let registry = ToolRegistry::with_handler_for_test(Arc::new(TestHandler {
-        tool_name: codex_tools::ToolName::plain("test_tool"),
+        tool_name: codex_tools::ToolName::plain(codex_code_mode::PUBLIC_TOOL_NAME),
     }));
     let session = Arc::new(session);
     let turn = Arc::new(turn);
 
     let result = registry
-        .dispatch_any_with_terminal_outcome(
+        .dispatch_any_with_state(
             test_invocation_with_payload(
                 session,
                 turn,
                 "incompatible-call",
-                codex_tools::ToolName::plain("test_tool"),
+                codex_tools::ToolName::plain(codex_code_mode::PUBLIC_TOOL_NAME),
                 ToolCallSource::Direct,
                 ToolPayload::Custom {
                     input: "{}".to_string(),
                 },
             ),
-            /*terminal_outcome_reached*/ None,
+            /*call_state*/ None,
         )
         .await;
 
@@ -271,6 +275,7 @@ async fn dispatch_lifecycle_trace_records_incompatible_payload_failures() -> any
     let tool_call = &replayed.tool_calls["incompatible-call"];
     assert_eq!(tool_call.execution.status, ExecutionStatus::Failed);
     assert!(tool_call.raw_result_payload_id.is_some());
+    assert!(replayed.code_cells.is_empty());
 
     Ok(())
 }
@@ -287,7 +292,9 @@ async fn missing_code_mode_wait_traces_only_the_wait_tool_call() -> anyhow::Resu
     );
     attach_test_trace(&mut session, &turn, temp.path())?;
 
-    let registry = ToolRegistry::with_handler_for_test(Arc::new(CodeModeWaitHandler));
+    let registry = ToolRegistry::with_handler_for_test(Arc::new(CodeModeWaitHandler::new(
+        /*description_override*/ None, /*parameters_override*/ None,
+    )));
     let session = Arc::new(session);
     let turn = Arc::new(turn);
 
@@ -308,7 +315,7 @@ async fn missing_code_mode_wait_traces_only_the_wait_tool_call() -> anyhow::Resu
     );
 
     registry
-        .dispatch_any_with_terminal_outcome(invocation, /*terminal_outcome_reached*/ None)
+        .dispatch_any_with_state(invocation, /*call_state*/ None)
         .await?;
 
     let replayed = codex_rollout_trace::replay_bundle(single_bundle_dir(temp.path())?)?;
@@ -361,6 +368,8 @@ fn test_invocation_with_payload(
         tool_name,
         source,
         payload,
+        native_call: None,
+        environments: Default::default(),
     }
 }
 

@@ -3,14 +3,34 @@
 use super::LocalThreadStore;
 use crate::AddThreadAttachmentOutcome;
 use crate::AddThreadAttachmentParams;
+use crate::ListThreadAttachmentThreadsParams;
 use crate::ListThreadAttachmentsParams;
 use crate::RemoveThreadAttachmentOutcome;
 use crate::RemoveThreadAttachmentParams;
+use crate::ThreadAttachmentOwnerPage;
 use crate::ThreadAttachmentPage;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 use codex_protocol::ThreadId;
 use codex_rollout::StateDbHandle;
+
+pub(super) async fn copy_thread_attachments(
+    store: &LocalThreadStore,
+    source_thread_id: ThreadId,
+    destination_thread_id: ThreadId,
+) -> ThreadStoreResult<()> {
+    let state_db = state_db(store, "copy_thread_attachments")?;
+    let _lifecycle_reservation = store
+        .live_writer_locks
+        .reserve_lifecycle(destination_thread_id)
+        .await;
+    // Reference-backed forks already reserve their source. Do not recursively acquire that
+    // reservation: a queued deletion could deadlock it. SQLite serializes the source snapshot.
+    state_db
+        .copy_thread_attachments(source_thread_id, destination_thread_id)
+        .await
+        .map_err(|error| attachment_error("copy", Some(destination_thread_id), error))
+}
 
 pub(super) async fn add_thread_attachment(
     store: &LocalThreadStore,
@@ -41,6 +61,23 @@ pub(super) async fn list_thread_attachments(
         .list_thread_attachments(params.thread_id, params.cursor.as_deref(), params.limit)
         .await
         .map_err(|error| attachment_error("list", /*thread_id*/ None, error))
+}
+
+pub(super) async fn list_thread_attachment_threads(
+    store: &LocalThreadStore,
+    params: ListThreadAttachmentThreadsParams,
+) -> ThreadStoreResult<ThreadAttachmentOwnerPage> {
+    let state_db = state_db(store, "thread/attachmentOwner/list")?;
+    state_db
+        .list_thread_attachment_threads(
+            &params.attachment_type,
+            &params.identity_key,
+            params.archive_filter,
+            params.cursor.as_deref(),
+            params.limit,
+        )
+        .await
+        .map_err(|error| attachment_error("list owners of", /*thread_id*/ None, error))
 }
 
 pub(super) async fn remove_thread_attachment(

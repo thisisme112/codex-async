@@ -3,7 +3,7 @@
 use codex_app_server_protocol::CodexErrorInfo;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use std::collections::HashSet;
 
 use super::ThreadBufferedEvent;
@@ -24,19 +24,6 @@ pub(super) fn snapshot_has_pending_interactive_request(snapshot: &ThreadEventSna
                 )
         )
     })
-}
-
-pub(super) fn event_is_notice(event: &ThreadBufferedEvent) -> bool {
-    matches!(
-        event,
-        ThreadBufferedEvent::Notification(notification)
-            if matches!(
-                notification.as_ref(),
-                ServerNotification::Warning(_)
-                    | ServerNotification::GuardianWarning(_)
-                    | ServerNotification::ConfigWarning(_)
-            )
-    )
 }
 
 /// A later turn resolves an earlier precaution; replay must preserve restored input.
@@ -80,7 +67,7 @@ pub(super) fn omit_completed_agent_deltas(events: &mut Vec<ThreadBufferedEvent>)
         if let ThreadBufferedEvent::Notification(notification) = event {
             match notification.as_ref() {
                 ServerNotification::ItemCompleted(notification) => {
-                    if let ThreadItem::AgentMessage { id, .. } = &notification.item {
+                    if let ThreadItemPayload::AgentMessage { id, .. } = &notification.item.payload {
                         completed.insert((
                             notification.thread_id.clone(),
                             notification.turn_id.clone(),

@@ -35,6 +35,40 @@ pub fn to_wide<S: AsRef<OsStr>>(s: S) -> Vec<u16> {
     v
 }
 
+/// Resolve a named Windows user without consulting environment variables.
+///
+/// # Safety
+/// `sid` must point to a valid SID for the duration of this call.
+pub unsafe fn account_name_from_sid(sid: *mut std::ffi::c_void) -> Result<String> {
+    use windows_sys::Win32::Security as security;
+    let mut name = [0_u16; 256];
+    let mut domain = [0_u16; 256];
+    let mut name_length = name.len() as u32;
+    let mut domain_length = domain.len() as u32;
+    let mut account_type: security::SID_NAME_USE = 0;
+    if unsafe {
+        security::LookupAccountSidW(
+            std::ptr::null(),
+            sid,
+            name.as_mut_ptr(),
+            &mut name_length,
+            domain.as_mut_ptr(),
+            &mut domain_length,
+            &mut account_type,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("resolve Windows account name");
+    }
+    anyhow::ensure!(
+        account_type == security::SidTypeUser && domain_length > 0,
+        "SID is not a named Windows user"
+    );
+    let name = String::from_utf16(&name[..name_length as usize])?;
+    let domain = String::from_utf16(&domain[..domain_length as usize])?;
+    Ok(format!("{domain}\\{name}"))
+}
+
 /// Quote a single Windows command-line argument following the rules used by
 /// CommandLineToArgvW/CRT so that spaces, quotes, and backslashes are preserved.
 /// Reference behavior matches Rust std::process::Command on Windows.
@@ -80,6 +114,9 @@ pub fn quote_windows_arg(arg: &str) -> String {
 /// Build a Windows command line for CreateProcess-style APIs.
 #[cfg(target_os = "windows")]
 pub fn argv_to_command_line(argv: &[String]) -> String {
+    if let Some(command_line) = crate::cmd_script_command_line(argv) {
+        return command_line;
+    }
     argv.iter()
         .map(|arg| quote_windows_arg(arg))
         .collect::<Vec<_>>()
@@ -296,7 +333,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn argv_to_command_line_quotes_each_argument_independently() {
+    fn argv_to_command_line_preserves_quoted_executable_in_cmd_script() {
         let argv = vec![
             "cmd.exe".to_string(),
             "/c".to_string(),
@@ -306,7 +343,7 @@ mod tests {
 
         assert_eq!(
             argv_to_command_line(&argv),
-            "cmd.exe /c \"\\\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\\\" -NoProfile -EncodedCommand abc==\""
+            r#""cmd.exe" /s /c ""C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile -EncodedCommand abc==""#
         );
     }
 

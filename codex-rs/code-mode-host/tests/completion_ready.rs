@@ -100,6 +100,7 @@ async fn completion_contract_across_providers() {
                             "await yield_control(); store('committed', 7); text('done'); {ending}"
                         )),
                         Arc::new(Delegate { enabled, events }),
+                        /*preempt*/ None,
                     )
                     .await
                     .unwrap();
@@ -123,10 +124,14 @@ async fn completion_contract_across_providers() {
                 // Readiness did not claim the result or trigger cleanup.
                 assert!(receiver.try_recv().is_err());
                 let response: RuntimeResponse = session
-                    .wait(WaitRequest {
-                        cell_id: id.clone(),
-                        yield_time_ms: 1_000,
-                    })
+                    .wait(
+                        WaitRequest {
+                            cell_id: id.clone(),
+                            yield_time_ms: 1_000,
+                            max_output_tokens: None,
+                        },
+                        /*preempt*/ None,
+                    )
                     .await
                     .unwrap()
                     .into();
@@ -148,10 +153,14 @@ async fn completion_contract_across_providers() {
                 assert_eq!(next(&mut receiver).await, Event::Closed(id.clone()));
                 assert!(matches!(
                     session
-                        .wait(WaitRequest {
-                            cell_id: id,
-                            yield_time_ms: 1
-                        })
+                        .wait(
+                            WaitRequest {
+                                cell_id: id,
+                                yield_time_ms: 1,
+                                max_output_tokens: None,
+                            },
+                            /*preempt*/ None
+                        )
                         .await
                         .unwrap(),
                     WaitOutcome::MissingCell(_)
@@ -160,6 +169,7 @@ async fn completion_contract_across_providers() {
                     .execute(
                         request("text(load('committed'));"),
                         Arc::new(NoopCodeModeSessionDelegate),
+                        /*preempt*/ None,
                     )
                     .await
                     .unwrap();
@@ -185,6 +195,7 @@ async fn completion_contract_across_providers() {
                         enabled: true,
                         events,
                     }),
+                    /*preempt*/ None,
                 )
                 .await
                 .unwrap();
@@ -197,7 +208,7 @@ async fn completion_contract_across_providers() {
                 session.shutdown().await.unwrap();
             } else {
                 assert!(matches!(
-                    session.terminate(id.clone()).await.unwrap(),
+                    session.terminate(id.clone().into()).await.unwrap(),
                     WaitOutcome::LiveCell(RuntimeResponse::Terminated { .. })
                 ));
             }

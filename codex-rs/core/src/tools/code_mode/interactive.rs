@@ -117,7 +117,8 @@ impl Session {
         R: Future<Output = T>,
     {
         loop {
-            let (turn, settings, strict) = self.review_context_for_cell_prompt(origin).await?;
+            let (turn, settings, _environments, strict) =
+                self.review_context_for_cell_prompt(origin).await?;
             if origin == ToolPromptOrigin::Direct {
                 return Some(origin.scope(review(turn, settings, strict)).await);
             }

@@ -151,6 +151,7 @@ async fn file_system_operations_can_reject_symlinks_in_any_path_component(
     symlink(&real, &directory_link)?;
     let file_link = tmp_path.join("file-link");
     symlink(&existing, &file_link)?;
+    assert!(codex_exec_server::BoundOutput::open(&directory_link.join("existing.txt")).is_err());
 
     let no_follow_read = ReadFileOptions {
         follow_symlinks: false,
@@ -588,7 +589,7 @@ async fn remote_read_file_materializes_environment_workspace_roots() -> Result<(
         access: FileSystemAccessMode::Read,
         missing_path_behavior: None,
     }]);
-    let mut sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
+    let mut sandbox = FileSystemSandboxContext::from_permission_profile(
         PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),
         PathUri::from_host_native_path(tmp.path())?,
     );
@@ -632,7 +633,7 @@ async fn remote_read_file_preserves_empty_workspace_roots() -> Result<()> {
         access: FileSystemAccessMode::Read,
         missing_path_behavior: None,
     }]);
-    let mut sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
+    let mut sandbox = FileSystemSandboxContext::from_permission_profile(
         PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),
         PathUri::from_host_native_path(tmp.path())?,
     );

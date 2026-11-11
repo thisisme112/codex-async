@@ -2,6 +2,8 @@
 //!
 //! Project-level documentation is primarily stored in files named `AGENTS.md`.
 //! Additional fallback filenames can be configured via `project_doc_fallback_filenames`.
+//! Fallback entries containing path syntax for the executor's OS are ignored
+//! before any filesystem probes use them.
 //! We include the concatenation of all files found along the path from the
 //! project root to the current working directory as follows:
 //!
@@ -30,6 +32,7 @@ use codex_file_system::FileSystemSandboxContext;
 use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
 use std::io;
@@ -45,30 +48,36 @@ pub const LOCAL_AGENTS_MD_FILENAME: &str = "AGENTS.override.md";
 /// concatenated with the following separator.
 const AGENTS_MD_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
 
+const PROJECT_DOC_BUDGET_GUIDANCE: &str = "Trim your project instructions to fit the budget. If you need to keep them all, increase `project_doc_max_bytes`.";
+
 // Metadata probes are cheap and the exec-server transport already bounds total in-flight calls.
 // This covers typical project hierarchies in one remote round trip without monopolizing that
 // transport when independent startup discovery runs concurrently.
 const MAX_CONCURRENT_ANCESTOR_PROBES: usize = 256;
 
-/// Loads project AGENTS.md content and combines it with host-provided user
-/// instructions.
+/// Loads repository instructions across the selected environments.
 pub(crate) async fn load_project_instructions(
     config: &Config,
-    user_instructions: Option<Instructions>,
     environments: &TurnEnvironmentSnapshot,
-) -> io::Result<Option<LoadedAgentsMd>> {
-    let mut loaded = LoadedAgentsMd::from_user_instructions(user_instructions);
-    if config.active_project.is_untrusted() {
-        return Ok((!loaded.is_empty()).then_some(loaded));
+    warnings: &mut Vec<String>,
+) -> io::Result<LoadedAgentsMd> {
+    let mut loaded = LoadedAgentsMd::default();
+    if config.active_project.is_untrusted() || config.project_doc_max_bytes == 0 {
+        return Ok(loaded);
     }
 
     let mut remaining = config.project_doc_max_bytes;
     for turn_environment in environments.turn_environments() {
         if remaining == 0 {
+            warnings.push(format!(
+                "The {}-byte project instruction budget was exhausted before checking environment `{}` or any later environments. {PROJECT_DOC_BUDGET_GUIDANCE}",
+                config.project_doc_max_bytes,
+                turn_environment.selection.environment_id
+            ));
             break;
         }
 
-        let filesystem = turn_environment.environment.get_filesystem();
+        let filesystem = turn_environment.environment().get_filesystem();
         let sandbox = (!turn_environment
             .permission_profile()
             .file_system_sandbox_policy()
@@ -81,6 +90,7 @@ pub(crate) async fn load_project_instructions(
             turn_environment.cwd(),
             remaining,
             sandbox.as_ref(),
+            warnings,
         )
         .await
         {
@@ -109,7 +119,7 @@ pub(crate) async fn load_project_instructions(
         }
     }
 
-    Ok((!loaded.is_empty()).then_some(loaded))
+    Ok(loaded)
 }
 
 /// Attempt to locate and load AGENTS.md documentation.
@@ -126,21 +136,19 @@ async fn read_agents_md(
     cwd: &PathUri,
     max_total: usize,
     sandbox: Option<&FileSystemSandboxContext>,
+    warnings: &mut Vec<String>,
 ) -> io::Result<Option<LoadedAgentsMd>> {
-    if max_total == 0 {
-        return Ok(None);
-    }
-
     let paths = agents_md_paths(config, cwd, fs, sandbox).await?;
-    if paths.is_empty() {
-        return Ok(None);
-    }
-
-    let mut remaining: u64 = max_total as u64;
+    let mut remaining = max_total;
     let mut loaded = LoadedAgentsMd::default();
 
     for p in paths {
         if remaining == 0 {
+            warnings.push(format!(
+                "Skipped project instructions in environment `{environment_id}` starting at `{}` because the {}-byte budget was exhausted. {PROJECT_DOC_BUDGET_GUIDANCE}",
+                p.inferred_native_path_string(),
+                config.project_doc_max_bytes
+            ));
             break;
         }
 
@@ -149,12 +157,14 @@ async fn read_agents_md(
             Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
             Err(err) => return Err(err),
         };
-        let size = data.len() as u64;
+        let size = data.len();
         if size > remaining {
-            data.truncate(remaining as usize);
-        }
-
-        if size > remaining {
+            data.truncate(remaining);
+            warnings.push(format!(
+                "Loaded only {remaining} of {size} bytes from `{}` in environment `{environment_id}` under the {}-byte project instruction budget. {PROJECT_DOC_BUDGET_GUIDANCE}",
+                p.inferred_native_path_string(),
+                config.project_doc_max_bytes
+            ));
             tracing::warn!(
                 path = %p,
                 remaining_bytes = remaining,
@@ -172,7 +182,7 @@ async fn read_agents_md(
                     cwd: cwd.clone(),
                 },
             });
-            remaining = remaining.saturating_sub(data.len() as u64);
+            remaining -= data.len();
         }
     }
 
@@ -236,7 +246,7 @@ async fn agents_md_paths(
         vec![dir]
     };
 
-    let candidate_filenames = candidate_filenames(config);
+    let candidate_filenames = candidate_filenames(config, cwd);
     let candidate_filenames = &candidate_filenames;
     let mut results = futures::stream::iter(search_dirs)
         .map(|directory| async move {
@@ -266,13 +276,23 @@ async fn agents_md_paths(
     Ok(found)
 }
 
-fn candidate_filenames(config: &Config) -> Vec<&str> {
+fn candidate_filenames<'a>(config: &'a Config, cwd: &PathUri) -> Vec<&'a str> {
     let mut names: Vec<&str> = Vec::with_capacity(2 + config.project_doc_fallback_filenames.len());
     names.push(LOCAL_AGENTS_MD_FILENAME);
     names.push(DEFAULT_AGENTS_MD_FILENAME);
     for candidate in &config.project_doc_fallback_filenames {
         let candidate = candidate.as_str();
         if candidate.is_empty() {
+            continue;
+        }
+        // Use the executor's path convention, not the host's: resolving a Windows
+        // network path can send ambient credentials even during metadata probes.
+        if matches!(candidate, "." | "..")
+            || candidate.contains(['/', '\0'])
+            || cwd.infer_path_convention() == Some(PathConvention::Windows)
+                && candidate.contains(['\\', ':'])
+        {
+            tracing::warn!("ignoring project_doc_fallback_filenames entry that is not a filename");
             continue;
         }
         if !names.contains(&candidate) {
@@ -287,10 +307,10 @@ fn candidate_filenames(config: &Config) -> Vec<&str> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LoadedAgentsMd {
     /// Account- or home-scoped instructions supplied by the host.
-    user_instructions: Option<Instructions>,
+    pub(crate) user_instructions: Option<Instructions>,
 
     /// Thread-scoped instructions supplied by the host.
-    thread_instructions: Option<Instructions>,
+    pub(crate) thread_instructions: Option<Instructions>,
 
     /// Ordered instructions and their provenance.
     entries: Vec<InstructionEntry>,
@@ -307,15 +327,6 @@ impl LoadedAgentsMd {
                 text: contents,
                 source: Some(path),
             }),
-            thread_instructions: None,
-            entries: Vec::new(),
-        }
-    }
-
-    fn from_user_instructions(user_instructions: Option<Instructions>) -> Self {
-        Self {
-            user_instructions: user_instructions
-                .filter(|instructions| !instructions.text.trim().is_empty()),
             thread_instructions: None,
             entries: Vec::new(),
         }

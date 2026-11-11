@@ -37,9 +37,8 @@ pub const PIPE_ACCESS_INBOUND: u32 = 0x0000_0001;
 /// PIPE_ACCESS_OUTBOUND (win32 constant), not exposed in windows-sys 0.52.
 pub const PIPE_ACCESS_OUTBOUND: u32 = 0x0000_0002;
 
-/// Resolves the elevated command runner path, preferring the copied helper under
-/// `.sandbox-bin` and falling back to the legacy sibling lookup when needed.
-pub fn find_runner_exe(codex_home: &Path, log_dir: Option<&Path>) -> PathBuf {
+/// Resolve the installed runner for registered Core; otherwise use the legacy copy path.
+pub fn find_runner_exe(codex_home: &Path, log_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
     resolve_command_runner(codex_home, log_dir)
 }
 
@@ -93,7 +92,7 @@ pub fn create_named_pipe(name: &str, access: u32, sandbox_username: &str) -> io:
     unsafe {
         LocalFree(sd as HLOCAL);
     }
-    if h == 0 || h == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+    if h.is_null() || h == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
         return Err(io::Error::from_raw_os_error(unsafe {
             GetLastError() as i32
         }));

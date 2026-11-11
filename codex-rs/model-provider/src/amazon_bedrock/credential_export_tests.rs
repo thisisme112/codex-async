@@ -17,6 +17,7 @@ use super::super::AmazonBedrockModelProvider;
 use super::super::AwsAuthRecovery;
 use super::*;
 
+const MAX_CREDENTIAL_OUTPUT_BYTES: usize = 64 * 1024;
 const SECRET: &str = "credential-export-secret";
 const VALID_OUTPUT: &[u8] = br#"{"AccessKeyId":"exported","SecretAccessKey":"credential-export-secret","SessionToken":"credential-export-secret"}"#;
 
@@ -183,10 +184,7 @@ fn credential_output_formats_expiration_and_sanitized_errors() {
 
 #[tokio::test]
 async fn credential_export_process_errors_are_bounded_and_sanitized() -> io::Result<()> {
-    let oversized = format!(
-        "{SECRET}{}",
-        "x".repeat(MAX_CREDENTIAL_OUTPUT_BYTES as usize)
-    );
+    let oversized = format!("{SECRET}{}", "x".repeat(MAX_CREDENTIAL_OUTPUT_BYTES));
     for (mode, output, timeout_ms, expected_kind) in [
         ("missing", VALID_OUTPUT, 5_000, io::ErrorKind::NotFound),
         ("relative", VALID_OUTPUT, 5_000, io::ErrorKind::InvalidInput),
@@ -239,7 +237,7 @@ async fn credential_export_process_errors_are_bounded_and_sanitized() -> io::Res
 #[tokio::test]
 async fn credential_export_reuses_cache_and_coalesces_refreshes() -> io::Result<()> {
     let mut output = VALID_OUTPUT.to_vec();
-    output.resize(MAX_CREDENTIAL_OUTPUT_BYTES as usize, b' ');
+    output.resize(MAX_CREDENTIAL_OUTPUT_BYTES, b' ');
     let (directory, exporter) = exporter_fixture(&output, "success")?;
     let original = AwsAccessKeys {
         access_key_id: "exported".to_string(),
@@ -277,6 +275,37 @@ async fn credential_export_reuses_cache_and_coalesces_refreshes() -> io::Result<
     );
     let exporter = Arc::new(exporter);
     provider.credential_export = Some(exporter.clone());
+    let controller = codex_http_client::NetworkPolicyController::default();
+    let policy = controller.policy();
+    provider.http_client_factory = provider
+        .http_client_factory
+        .clone()
+        .with_network_policy(policy.clone());
+    controller.publish(
+        policy.revision(),
+        codex_http_client::DestinationPolicy::Restricted {
+            allowed_hosts: Default::default(),
+        },
+    );
+    let denied = provider
+        .recover_from_unauthorized()
+        .await
+        .expect_err("restricted recovery must not launch the exporter");
+    assert_eq!(denied.retry_delay(/*retry_count*/ 1), None);
+    assert_eq!(
+        denied.to_string(),
+        "Fatal error: this SDK transport is disabled by application network restrictions"
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("invocations"))?
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["invoked", "invoked"]
+    );
+    controller.publish(
+        policy.revision(),
+        codex_http_client::DestinationPolicy::Unrestricted,
+    );
     {
         let first = provider.recover_from_unauthorized();
         let second = provider.recover_from_unauthorized();
@@ -324,10 +353,11 @@ async fn credential_export_reuses_cache_and_coalesces_refreshes() -> io::Result<
     }
     let (credentials, refresh) = tokio::join!(credentials, refresh);
     assert_eq!(credentials?, rotated);
-    assert!(
-        !refresh
+    assert_eq!(
+        refresh
             .expect_err("queued login recovery must still run")
-            .is_retryable()
+            .retry_delay(/*retry_count*/ 1),
+        None
     );
     assert!(exporter.cached.lock().await.is_none());
 

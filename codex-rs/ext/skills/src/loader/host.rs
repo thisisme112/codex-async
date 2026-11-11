@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use codex_exec_server::ExecutorFileSystem;
+use codex_exec_server::EnvironmentAccess;
+use codex_exec_server::EnvironmentAccessExt;
+use codex_exec_server::EnvironmentAccessKey;
 use codex_exec_server::GetMetadataOptions;
 use codex_exec_server::ReadFileOptions;
 use codex_protocol::protocol::SkillScope;
@@ -35,10 +37,10 @@ use super::metadata::validate_len;
 use super::namespace::SkillNamespaceResolver;
 
 /// A resolved host skill root ready for filesystem discovery.
-pub(crate) struct HostSkillRoot {
+pub(crate) struct HostSkillRoot<'a> {
     pub(crate) path: AbsolutePathBuf,
     pub(crate) scope: SkillScope,
-    pub(crate) file_system: Arc<dyn ExecutorFileSystem>,
+    pub(crate) file_system: &'a dyn EnvironmentAccess,
     plugin: Option<PluginSkillRootContext>,
 }
 
@@ -49,11 +51,11 @@ struct PluginSkillRootContext {
     discovery_mode: SkillDiscoveryMode,
 }
 
-impl HostSkillRoot {
+impl<'a> HostSkillRoot<'a> {
     pub(crate) fn host(
         path: AbsolutePathBuf,
         scope: SkillScope,
-        file_system: Arc<dyn ExecutorFileSystem>,
+        file_system: &'a dyn EnvironmentAccess,
     ) -> Self {
         Self {
             path,
@@ -63,7 +65,7 @@ impl HostSkillRoot {
         }
     }
 
-    pub(crate) fn plugin(root: PluginSkillRoot, file_system: Arc<dyn ExecutorFileSystem>) -> Self {
+    pub(crate) fn plugin(root: PluginSkillRoot, file_system: &'a dyn EnvironmentAccess) -> Self {
         Self {
             path: root.path,
             scope: SkillScope::User,
@@ -114,9 +116,9 @@ impl HostSkillRoot {
 pub(crate) struct HostSkillRootSnapshot {
     pub(crate) root: AbsolutePathBuf,
     pub(crate) skills: Vec<SkillMetadata>,
-    pub(crate) skill_discovery_path_by_path: Arc<HashMap<AbsolutePathBuf, AbsolutePathBuf>>,
+    pub(crate) skill_discovery_path_by_path: Arc<HashMap<PathUri, PathUri>>,
     pub(crate) errors: Vec<SkillError>,
-    pub(crate) file_system: Arc<dyn ExecutorFileSystem>,
+    pub(crate) file_system: EnvironmentAccessKey,
     pub(crate) is_agent_plugin: bool,
 }
 
@@ -126,10 +128,9 @@ struct ResolvedDiscoveredSkill {
     path_uri: PathUri,
 }
 
-pub(crate) async fn load_host_skill_root(root: HostSkillRoot) -> HostSkillRootSnapshot {
+pub(crate) async fn load_host_skill_root(root: HostSkillRoot<'_>) -> HostSkillRootSnapshot {
     let is_agent_plugin = root.discovery_mode() == SkillDiscoveryMode::DirectChildren;
-    let canonical_root =
-        canonicalize_for_skill_identity(root.file_system.as_ref(), &root.path).await;
+    let canonical_root = canonicalize_for_skill_identity(root.file_system, &root.path).await;
     let (skills, skill_discovery_path_by_path, errors) =
         load_skills_under_root(&root, &canonical_root).await;
     HostSkillRootSnapshot {
@@ -137,20 +138,20 @@ pub(crate) async fn load_host_skill_root(root: HostSkillRoot) -> HostSkillRootSn
         skills,
         skill_discovery_path_by_path,
         errors,
-        file_system: root.file_system,
+        file_system: root.file_system.cache_key(),
         is_agent_plugin,
     }
 }
 
 async fn load_skills_under_root(
-    skill_root: &HostSkillRoot,
+    skill_root: &HostSkillRoot<'_>,
     root: &AbsolutePathBuf,
 ) -> (
     Vec<SkillMetadata>,
-    Arc<HashMap<AbsolutePathBuf, AbsolutePathBuf>>,
+    Arc<HashMap<PathUri, PathUri>>,
     Vec<SkillError>,
 ) {
-    let file_system = skill_root.file_system.as_ref();
+    let file_system = skill_root.file_system;
     let plugin_identity = skill_root.plugin_identity();
     let plugin_root = match skill_root.plugin_root() {
         Some(plugin_root) => Some(canonicalize_for_skill_identity(file_system, plugin_root).await),
@@ -166,6 +167,7 @@ async fn load_skills_under_root(
         plugin_roots,
         mut namespace_roots,
         warnings,
+        error,
     } = discover_skills(
         file_system,
         &PathUri::from_abs_path(root),
@@ -179,6 +181,16 @@ async fn load_skills_under_root(
     for warning in warnings {
         error!("{warning}");
     }
+    if let Some(message) = error {
+        return (
+            Vec::new(),
+            Arc::default(),
+            vec![SkillError {
+                path: root.clone(),
+                message,
+            }],
+        );
+    }
     if skills.is_empty() {
         return (Vec::new(), Arc::default(), Vec::new());
     }
@@ -187,10 +199,7 @@ async fn load_skills_under_root(
     let resolved_plugin_root = plugin_root.as_ref();
     let resolved_skills = futures::stream::iter(skills)
         .map(|skill| async move {
-            let path_uri = match file_system
-                .canonicalize(&skill.path, /*sandbox*/ None)
-                .await
-            {
+            let path_uri = match file_system.canonicalize(&skill.path).await {
                 Ok(path) => path,
                 Err(error) if discovery_mode == SkillDiscoveryMode::DirectChildren => {
                     error!(
@@ -222,11 +231,7 @@ async fn load_skills_under_root(
                     return None;
                 }
                 match file_system
-                    .get_metadata(
-                        &path_uri,
-                        GetMetadataOptions::default(),
-                        /*sandbox*/ None,
-                    )
+                    .get_metadata(&path_uri, GetMetadataOptions::default())
                     .await
                 {
                     Ok(metadata) if metadata.is_file => {}
@@ -320,8 +325,10 @@ async fn load_skills_under_root(
         });
         match result {
             Ok(skill) => {
-                skill_discovery_path_by_path
-                    .insert(skill.path_to_skills_md.clone(), discovery_path);
+                skill_discovery_path_by_path.insert(
+                    skill.path_to_skills_md.clone(),
+                    PathUri::from_abs_path(&discovery_path),
+                );
                 loaded_skills.push(skill);
             }
             Err(message) if skill_root.scope != SkillScope::System => {
@@ -338,7 +345,7 @@ async fn load_skills_under_root(
 }
 
 async fn parse_skill_file(
-    file_system: &dyn ExecutorFileSystem,
+    file_system: &dyn EnvironmentAccess,
     skill: &DiscoveredSkill,
     path: &AbsolutePathBuf,
     path_uri: &PathUri,
@@ -357,7 +364,7 @@ async fn parse_skill_file(
     }
     .unwrap_or(SkillMetadataDiscovery::Absent);
     let (contents, loaded_metadata) = tokio::join!(
-        file_system.read_file_text(path_uri, ReadFileOptions::default(), /*sandbox*/ None,),
+        file_system.read_file_text(path_uri, ReadFileOptions::default(),),
         load_host_skill_metadata(file_system, path, &metadata, plugin_root),
     );
     let contents = contents.map_err(|error| format!("failed to read file: {error}"))?;
@@ -380,7 +387,7 @@ async fn parse_skill_file(
         interface,
         dependencies,
         policy,
-        path_to_skills_md: path.clone(),
+        path_to_skills_md: path_uri.clone(),
         scope,
         plugin_id: plugin_identity.map(|identity| identity.plugin_id.clone()),
         remote_plugin_id: plugin_identity.and_then(|identity| identity.remote_plugin_id.clone()),
@@ -399,13 +406,13 @@ fn default_skill_name(path: &AbsolutePathBuf) -> String {
         .unwrap_or_else(|| "skill".to_string())
 }
 
-async fn canonicalize_for_skill_identity(
-    file_system: &dyn ExecutorFileSystem,
+pub(crate) async fn canonicalize_for_skill_identity(
+    file_system: &dyn EnvironmentAccess,
     path: &AbsolutePathBuf,
 ) -> AbsolutePathBuf {
     let path_uri = PathUri::from_abs_path(path);
     file_system
-        .canonicalize(&path_uri, /*sandbox*/ None)
+        .canonicalize(&path_uri)
         .await
         .and_then(|path| path.to_abs_path())
         .unwrap_or_else(|_| path.clone())

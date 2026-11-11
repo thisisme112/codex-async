@@ -1,5 +1,12 @@
-//! PID reservations serialize detached launches; creation times protect stale-record cleanup.
+//! PID reservations serialize detached launches; process identities protect stale-record cleanup.
+//! PID probes explicitly unlock so concurrent forks cannot retain their transient reservations.
 
+#[path = "pid_identity.rs"]
+mod identity;
+
+#[cfg(any(unix, windows))]
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::io::SeekFrom;
 use std::path::Path;
 use std::path::PathBuf;
@@ -30,6 +37,7 @@ const STDERR_LOG_TAIL_BYTES: u64 = 4096;
 #[derive(Debug)]
 #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 pub(crate) struct PidBackend {
+    pub(super) feature_overrides: BTreeMap<String, bool>,
     codex_bin: PathBuf,
     pid_file: PathBuf,
     lock_file: PathBuf,
@@ -40,7 +48,11 @@ pub(crate) struct PidBackend {
 #[serde(rename_all = "camelCase")]
 struct PidRecord {
     pid: u32,
+    // Keep the legacy timestamp for older CLI/updater versions reading this record.
     process_start_time: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "linuxProcessIdentity")]
+    process_identity: Option<identity::ProcessIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     executable_identity: Option<ExecutableIdentity>,
 }
@@ -71,17 +83,26 @@ enum PidFileState {
     Running(PidRecord),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 enum PidCommandKind {
     AppServer { remote_control_enabled: bool },
-    UpdateLoop,
+    UpdateLoop { restore_release: Option<String> },
 }
 
 impl PidBackend {
     pub(crate) async fn running_executable_identity(&self) -> Result<Option<ExecutableIdentity>> {
         match self.read_pid_file_state().await? {
             PidFileState::Running(record) if self.record_is_active(&record).await? => {
+                // Updaters can exec a different release without changing PID. Only the
+                // updater itself can reliably identify its executable after a handoff.
+                if matches!(self.command_kind, PidCommandKind::UpdateLoop { .. })
+                    && record.pid == std::process::id()
+                {
+                    return crate::managed_install::executable_identity(&std::env::current_exe()?)
+                        .await
+                        .map(Some);
+                }
                 Ok(record.executable_identity)
             }
             _ => Ok(None),
@@ -91,6 +112,7 @@ impl PidBackend {
     pub(crate) fn new(codex_bin: PathBuf, pid_file: PathBuf, remote_control_enabled: bool) -> Self {
         let lock_file = pid_file.with_extension("pid.lock");
         Self {
+            feature_overrides: BTreeMap::new(),
             codex_bin,
             pid_file,
             lock_file,
@@ -100,13 +122,18 @@ impl PidBackend {
         }
     }
 
-    pub(crate) fn new_update_loop(codex_bin: PathBuf, pid_file: PathBuf) -> Self {
+    pub(crate) fn new_update_loop(
+        codex_bin: PathBuf,
+        pid_file: PathBuf,
+        restore_release: Option<String>,
+    ) -> Self {
         let lock_file = pid_file.with_extension("pid.lock");
         Self {
+            feature_overrides: BTreeMap::new(),
             codex_bin,
             pid_file,
             lock_file,
-            command_kind: PidCommandKind::UpdateLoop,
+            command_kind: PidCommandKind::UpdateLoop { restore_release },
         }
     }
 
@@ -155,6 +182,7 @@ impl PidBackend {
             }
 
             let pid = record.pid;
+            crate::diagnostics::event("shutdown_requested", serde_json::json!({ "pid": pid }));
             let started_at = tokio::time::Instant::now();
             let force_after = Duration::from_secs(grace_seconds.into());
             let deadline = started_at + force_after + STOP_FORCE_TIMEOUT;
@@ -183,7 +211,7 @@ impl PidBackend {
                             tracing::warn!(%pid, %err, "managed app-server shutdown request failed; waiting for force deadline");
                         }
                     }
-                    PidCommandKind::UpdateLoop => {
+                    PidCommandKind::UpdateLoop { .. } => {
                         fs::write(self.pid_file.with_extension("shutdown"), pid.to_string())
                             .await
                             .context("failed to request updater shutdown")?;
@@ -210,6 +238,7 @@ impl PidBackend {
                     break;
                 }
                 if !forced && started_at.elapsed() >= force_after {
+                    crate::diagnostics::event("shutdown_forced", serde_json::json!({ "pid": pid }));
                     #[cfg(unix)]
                     self.force_terminate_process(pid)?;
                     #[cfg(windows)]
@@ -336,31 +365,64 @@ impl PidBackend {
     #[cfg(any(unix, windows))]
     async fn open_stderr_log(&self) -> Result<fs::File> {
         let stderr_log_file = stderr_log_file_for_pid_file(&self.pid_file);
-        fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&stderr_log_file)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to open stderr log for pid-managed app server {}",
-                    stderr_log_file.display()
-                )
-            })
+        super::stderr_log::preserve(&stderr_log_file).await;
+        let result = async {
+            fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&stderr_log_file)
+                .await?;
+            // The updater predecessor can still write after a Windows handoff
+            // truncates this file. Append handles prevent stale offsets and gaps.
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&stderr_log_file)
+                .await
+        }
+        .await;
+        result.with_context(|| {
+            format!(
+                "failed to open stderr log for pid-managed app server {}",
+                stderr_log_file.display()
+            )
+        })
     }
 
     #[cfg(any(unix, windows))]
-    fn command_args(&self) -> Vec<&'static str> {
-        match self.command_kind {
+    fn command_args(&self) -> Vec<Cow<'_, str>> {
+        let mut args = match &self.command_kind {
             PidCommandKind::AppServer {
                 remote_control_enabled: true,
-            } => vec!["app-server", "--remote-control", "--listen", "unix://"],
+            } => vec![
+                "app-server".into(),
+                "--remote-control".into(),
+                "--listen".into(),
+                "unix://".into(),
+            ],
             PidCommandKind::AppServer {
                 remote_control_enabled: false,
-            } => vec!["app-server", "--listen", "unix://"],
-            PidCommandKind::UpdateLoop => vec!["app-server", "daemon", "pid-update-loop"],
+            } => vec!["app-server".into(), "--listen".into(), "unix://".into()],
+            PidCommandKind::UpdateLoop { restore_release } => {
+                let mut args = vec![
+                    "app-server".into(),
+                    "daemon".into(),
+                    "pid-update-loop".into(),
+                ];
+                if let Some(release) = restore_release {
+                    args.extend(["--restore-release".into(), release.as_str().into()]);
+                }
+                args
+            }
+        };
+        if matches!(self.command_kind, PidCommandKind::AppServer { .. }) {
+            // Match first-party clients' default while preserving explicit analytics opt-outs.
+            args.push("--analytics-default-enabled".into());
+            for (name, enabled) in &self.feature_overrides {
+                args.extend(["-c".into(), format!("features.{name}={enabled}").into()]);
+            }
         }
+        args
     }
 
     #[cfg(any(unix, windows))]
@@ -372,7 +434,7 @@ impl PidBackend {
             PidCommandKind::AppServer {
                 remote_control_enabled: true,
             }
-            | PidCommandKind::UpdateLoop => None,
+            | PidCommandKind::UpdateLoop { .. } => None,
         }
     }
 
@@ -380,9 +442,9 @@ impl PidBackend {
         match self.command_kind {
             PidCommandKind::AppServer { .. } => terminate_process(pid),
             #[cfg(unix)]
-            PidCommandKind::UpdateLoop => terminate_process_group(pid),
+            PidCommandKind::UpdateLoop { .. } => terminate_process_group(pid),
             #[cfg(not(unix))]
-            PidCommandKind::UpdateLoop => terminate_process(pid),
+            PidCommandKind::UpdateLoop { .. } => terminate_process(pid),
         }
     }
 
@@ -390,12 +452,26 @@ impl PidBackend {
     fn force_terminate_process(&self, pid: u32) -> Result<()> {
         match self.command_kind {
             PidCommandKind::AppServer { .. } => force_terminate_process(pid),
-            PidCommandKind::UpdateLoop => force_terminate_process_group(pid),
+            PidCommandKind::UpdateLoop { .. } => force_terminate_process_group(pid),
         }
     }
 
     async fn record_is_active(&self, record: &PidRecord) -> Result<bool> {
         process_matches_record(record).await
+    }
+}
+
+/// Wait for a published process to exit without modifying its PID reservation.
+pub(crate) async fn wait_for_process_exit(pid_file: &Path) {
+    loop {
+        // A missing or empty record can belong to a launch still publishing its PID.
+        if let Ok(contents) = fs::read(pid_file).await
+            && let Ok(record) = serde_json::from_slice::<PidRecord>(&contents)
+            && matches!(process_matches_record(&record).await, Ok(false))
+        {
+            return;
+        }
+        sleep(crate::START_POLL_INTERVAL).await;
     }
 }
 
@@ -539,20 +615,37 @@ async fn process_matches_record(record: &PidRecord) -> Result<bool> {
         return Ok(false);
     }
 
-    match read_process_details(record.pid).await {
-        Ok((state, start_time)) => {
+    let details = async {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(expected) = &record.process_identity {
+            return expected.matches_process(record.pid).await;
+        }
+        let (state, start_time) = read_process_details(record.pid).await?;
+        let matches = start_time == record.process_start_time;
+        let is_zombie = state.starts_with('Z');
+        if !matches && !is_zombie {
+            bail!(
+                "cannot verify pid-managed process {}: legacy start time changed; PID record retained. \
+                 Retry with the locale and timezone used to start the daemon. If the system clock \
+                 changed, stop the original process before restarting the daemon",
+                record.pid
+            );
+        }
+        Ok((is_zombie, matches))
+    }
+    .await;
+    match details {
+        Ok((is_zombie, matches)) => {
             // An unreaped zombie still passes kill(pid, 0) and retains its start
             // time, but it can no longer run the app-server or updater.
-            if state.starts_with('Z') {
-                if start_time == record.process_start_time
-                    && let Ok(raw_pid) = libc::pid_t::try_from(record.pid)
-                {
+            if is_zombie {
+                if matches && let Ok(raw_pid) = libc::pid_t::try_from(record.pid) {
                     // Re-exec can lose the Child handle without changing parenthood.
                     unsafe { libc::waitpid(raw_pid, std::ptr::null_mut(), libc::WNOHANG) };
                 }
                 return Ok(false);
             }
-            Ok(start_time == record.process_start_time)
+            Ok(matches)
         }
         Err(_err) if !process_exists(record.pid) => Ok(false),
         Err(err) => Err(err),
@@ -611,7 +704,26 @@ async fn reservation_lock_is_active(path: &Path) -> Result<bool> {
                 .with_context(|| format!("failed to inspect pid lock file {}", path.display()));
         }
     };
-    Ok(!try_lock_file(&file)?)
+    probe_reservation_lock(file)
+}
+
+#[cfg(any(unix, windows))]
+fn probe_reservation_lock(file: fs::File) -> Result<bool> {
+    if !try_lock_file(&file)? {
+        return Ok(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+
+        // A concurrent fork can inherit this descriptor before it closes. Release the
+        // probe's lock explicitly so the child cannot look like a live reservation.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to unlock pid reservation probe");
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -638,9 +750,36 @@ async fn inspect_empty_pid_reservation(
             });
         }
     };
+    inspect_empty_pid_reservation_with_file(pid_path, file).await
+}
+
+#[cfg(unix)]
+struct EmptyPidProbeLock(fs::File);
+
+#[cfg(unix)]
+impl Drop for EmptyPidProbeLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+
+        // Closing alone leaves the lock held by any concurrent fork. Release it
+        // on every exit, including errors and cancellation while inspecting the PID.
+        if unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(%error, "failed to unlock empty pid reservation probe");
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+async fn inspect_empty_pid_reservation_with_file(
+    pid_path: &Path,
+    file: fs::File,
+) -> Result<EmptyPidReservation> {
     if !try_lock_file(&file)? {
         return Ok(EmptyPidReservation::Active);
     }
+    #[cfg(unix)]
+    let _probe_lock = EmptyPidProbeLock(file);
 
     let contents = match fs::read_to_string(pid_path).await {
         Ok(contents) => contents,
@@ -679,6 +818,7 @@ async fn read_process_start_time(pid: u32) -> Result<String> {
 async fn read_process_details(pid: u32) -> Result<(String, String)> {
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "stat=", "-o", "lstart="])
+        .kill_on_drop(true)
         .output()
         .await
         .context("failed to invoke ps for pid-managed app server")?;
@@ -714,21 +854,7 @@ async fn read_process_start_time(pid: u32) -> Result<String> {
 
 #[cfg(windows)]
 async fn process_matches_record(record: &PidRecord) -> Result<bool> {
-    let process = match super::windows::Process::open(record.pid) {
-        Ok(process) => process,
-        // A managed daemon is queryable by its launching user. A stale PID may
-        // have been reused by a protected process; never try to terminate it.
-        Err(err)
-            if err.downcast_ref::<std::io::Error>().is_some_and(|err| {
-                err.raw_os_error()
-                    == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32)
-            }) =>
-        {
-            return Ok(false);
-        }
-        Err(err) => return Err(err),
-    };
-    let Some(process) = process else {
+    let Some(process) = super::windows::Process::open(record.pid)? else {
         return Ok(false);
     };
     Ok(process.is_running()? && process.start_time()? == record.process_start_time)

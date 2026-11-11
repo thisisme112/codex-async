@@ -4,7 +4,9 @@ REPO_ROOT=$(git rev-parse --show-toplevel)
 export CODEX_REPO_ROOT="$REPO_ROOT"
 export STABLE_GIT_COMMIT
 STABLE_GIT_COMMIT=$(git rev-parse HEAD)
-export CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 RAYON_NUM_THREADS=1 CMAKE_BUILD_PARALLEL_LEVEL=1
+BUILD_JOBS=${ASYNC_BUILD_JOBS:-1}
+case "$BUILD_JOBS" in 1|2) ;; *) echo 'ASYNC_BUILD_JOBS must be 1 or 2' >&2; exit 1 ;; esac
+export CARGO_BUILD_JOBS="$BUILD_JOBS" CARGO_INCREMENTAL=0 RAYON_NUM_THREADS="$BUILD_JOBS" CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS"
 export CARGO_TARGET_DIR="$REPO_ROOT/target/async-ci"
 TOOLS="$RUNNER_TEMP/async-ci-tools"
 mkdir -p "$TOOLS"
@@ -58,7 +60,10 @@ mkdir -p "$CARGO_TARGET_DIR/dev-small/codex-resources"
 cp "$CARGO_TARGET_DIR/dev-small/bwrap" "$CARGO_TARGET_DIR/dev-small/codex-resources/bwrap"
 export CODEX_BWRAP_SHA256
 CODEX_BWRAP_SHA256=$(sha256sum "$CARGO_TARGET_DIR/dev-small/bwrap" | cut -d ' ' -f1)
-just test -p codex-core --lib --cargo-profile dev-small -j 1 -E 'test(tools::code_mode) | test(tools::context) | test(tools::handlers::unified_exec::tests) | test(tools::handlers::shell_spec::tests)'
+just test -p codex-code-mode-protocol -p codex-code-mode -p codex-code-mode-host --lib --cargo-profile dev-small -j 1
+just test -p codex-code-mode-runtime --lib --cargo-profile dev-small -j 1 -E 'test(session_runtime) | test(cell_actor)'
+just test -p codex-code-mode-host --test completion_ready --cargo-profile dev-small -j 1
+just test -p codex-core --lib --cargo-profile dev-small -j 1 -E 'test(tools::code_mode) | test(tools::context) | test(tools::handlers::unified_exec::tests) | test(tools::handlers::shell_spec::tests) | test(tools::network_approval) | test(unified_exec::) | test(session::completion_withdrawal)'
 just test -p codex-core --test async_completion --cargo-profile dev-small -j 1
 cargo build --locked --profile dev-small -p codex-cli --bin codex
 "$CARGO_TARGET_DIR/dev-small/codex" --version

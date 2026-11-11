@@ -33,7 +33,7 @@ impl SessionRuntimeDelegate for Probe {
         // Neither the store lock nor the phase lock is held during notification.
         assert_eq!(
             *self.inner.stored_values.try_lock().unwrap(),
-            HashMap::from([("key".to_string(), serde_json::json!(7))])
+            HashMap::from([("key".to_string(), Arc::new(serde_json::json!(7)))])
         );
         assert!(self.state.accepting_observations());
         self.ready.fetch_add(/*val*/ 1, Ordering::SeqCst);
@@ -41,7 +41,7 @@ impl SessionRuntimeDelegate for Probe {
 }
 
 #[tokio::test]
-async fn commit_notifies_without_observer_and_preserves_the_initial_yield_handoff() {
+async fn commit_notifies_without_observer_and_preserves_terminal_result() {
     let runtime = SessionRuntime::new();
     let state = Arc::new(CellState::new(CancellationToken::new()));
     let probe = Arc::new(Probe {
@@ -56,14 +56,14 @@ async fn commit_notifies_without_observer_and_preserves_the_initial_yield_handof
         execution_context: opentelemetry::Context::new(),
     };
     let result = CellEvent::Completed {
-        content_items: vec![],
+        content_items: crate::output::OutputCollector::Client(Vec::new()),
         error_text: Some("script error".to_string()),
+        result_buffered_for: std::time::Duration::ZERO,
     };
     assert_eq!(
         host.commit_completion(
-            HashMap::from([("key".to_string(), serde_json::json!(7))]),
-            result.clone(),
-            Some(vec![]),
+            HashMap::from([("key".to_string(), Arc::new(serde_json::json!(7)))]),
+            || result.clone(),
             Arc::clone(&state),
         )
         .await,
@@ -72,25 +72,26 @@ async fn commit_notifies_without_observer_and_preserves_the_initial_yield_handof
     assert_eq!(probe.ready.load(Ordering::SeqCst), 1);
     // A duplicate commit cannot emit a duplicate notification.
     assert_eq!(
-        host.commit_completion(
-            HashMap::new(),
-            result.clone(),
-            /*pending_initial_yield_items*/ None,
-            Arc::clone(&state)
-        )
-        .await,
-        CompletionCommit::Rejected(result.clone())
+        host.commit_completion(HashMap::new(), || result.clone(), Arc::clone(&state))
+            .await,
+        CompletionCommit::Rejected
     );
-    for expected in [
-        CellEvent::Yielded {
-            content_items: vec![],
-        },
-        result,
-    ] {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        state.route_observation(ObserveMode::YieldAfter(std::time::Duration::ZERO), sender);
-        assert_eq!(receiver.await.unwrap(), Ok(expected));
-    }
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    state.route_observation(sender);
+    let event = receiver.await.unwrap().unwrap();
+    let CellEvent::Completed {
+        content_items,
+        error_text,
+        ..
+    } = event
+    else {
+        panic!("completion result was consumed by the notification");
+    };
+    assert_eq!(
+        content_items,
+        crate::output::OutputCollector::Client(Vec::new())
+    );
+    assert_eq!(error_text, Some("script error".to_string()));
     host.closed().await;
     assert_eq!(probe.ready.load(Ordering::SeqCst), 1);
 }
@@ -111,22 +112,18 @@ async fn cancellation_while_waiting_for_store_commit_does_not_notify() {
         execution_context: opentelemetry::Context::new(),
     };
     let result = CellEvent::Completed {
-        content_items: vec![],
+        content_items: crate::output::OutputCollector::Client(Vec::new()),
         error_text: None,
+        result_buffered_for: std::time::Duration::ZERO,
     };
     let store = runtime.inner.stored_values.lock().await;
-    let commit = host.commit_completion(
-        HashMap::new(),
-        result.clone(),
-        /*pending_initial_yield_items*/ None,
-        state,
-    );
+    let commit = host.commit_completion(HashMap::new(), || result.clone(), state);
     tokio::pin!(commit);
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());
     assert!(commit.as_mut().poll(&mut context).is_pending());
     runtime.begin_shutdown();
     drop(store);
-    assert_eq!(commit.await, CompletionCommit::Rejected(result));
+    assert_eq!(commit.await, CompletionCommit::Rejected);
     host.closed().await;
     assert_eq!(probe.ready.load(Ordering::SeqCst), 0);
 }
