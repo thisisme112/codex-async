@@ -1,5 +1,7 @@
 # Codex async completion trial: event waits and capability guidance
 
+This file records the original trial build. Current upstream integration and validation are tracked in [UPSTREAM_STATUS.md](UPSTREAM_STATUS.md).
+
 Base: mkXultra/codex af1f26f7250a4ed9be075d0a38ee1a056ae4e9ac.
 This rebuild restores the prior trial runtime changes from the recorded implementation: terminal progress reads preserve completion, successful direct handoff is typed, and initial exec output reports the registered notification. The original scratch checkout was pruned, so its unpublished commits cannot be used as a Git parent.
 

@@ -4,7 +4,7 @@
 
 可用分支为 **async-main**。最初的官方 `main` 保留为 fork 创建时的参考快照，日常请使用默认分支 `async-main`。
 
-已在适配分支处理首次官方更新的 39 个文件冲突，正在验证新的执行与协议接口；记录见 [UPSTREAM_STATUS.md](UPSTREAM_STATUS.md)。每次合并仍须通过测试和构建后才能推进可用分支。
+首次官方更新的 39 个文件冲突已处理，官方基线为 `e58bf8f5233b51e7cd1679d947e3028c1ed91b06`；各组验证记录见 [UPSTREAM_STATUS.md](UPSTREAM_STATUS.md)。每次合并须通过相关测试和构建后才能推进可用分支。
 
 ## 自动同步
 
@@ -32,7 +32,7 @@ python3 scripts/async_fork/sync.py check
 python3 scripts/async_fork/sync.py prepare --output /tmp/codex-async-sync
 ```
 
-`prepare` 不更新可用分支。`promote` 只用于已完成编译和测试的候选版本，不应绕过验证手工调用。手动 Actions 运行时勾选 `check_only` 可以只检查合并情况，不编译、不发布。需要验证手工处理冲突的分支时，选择该分支并勾选 `verify_only`，保持 `check_only` 不勾选；此模式编译和测试选中提交，但不会自动发布。`integration/official-*` 适配分支的代码或验证脚本推送也会自动触发同样的只读验证。
+`prepare` 不更新可用分支。`promote` 只用于已完成编译和测试的候选版本，不应绕过验证手工调用。手动 Actions 运行时勾选 `check_only` 可以只检查合并情况，不编译、不发布。需要验证手工处理冲突的分支时，选择该分支并勾选 `verify_only`，保持 `check_only` 不勾选；此模式编译和测试选中提交，但不会自动发布。`integration/official-*` 适配分支的代码或验证脚本推送也会自动触发同样的只读验证。仅调整异步测试夹具时，可在 `integration/async-*` 分支只复验异步集成测试，沿用生产代码相同的其他成功验证记录；这个专项分支也不会自动发布。
 
 ## 构建与使用
 
@@ -44,5 +44,7 @@ just assemble-codex-package --target x86_64-unknown-linux-gnu --package-dir /tmp
 ```
 
 请保留完整目录。异步通知需要本地交互式 CLI 持续运行，关闭后暂不恢复通知。`wait_for_tasks` 等待完成事件，`write_stdin` 保留输入和进度读取；收到完成通知后读取输出和退出码再分析。基础提示用于引导模型减少轮询，不能保证模型完全不查询。
+
+遵循官方默认行为，中断会终止活动 Code Mode cell，已终止的 cell 不会再触发完成通知。显式关闭 `code_mode_interrupt` 时，仍存活的 cell 会保留完成状态，等用户继续后再通知。
 
 最初试用版的 93 项相关单元测试、36 项集成测试已通过本地模拟模型验证；这不代表后续任何官方合并候选都已通过验证。每个候选以其 Actions 结果为准。原始已验证源码信息见 `ASYNC_BUILD.md`。
