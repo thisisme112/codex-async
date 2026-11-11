@@ -1,6 +1,8 @@
 use super::ContextualUserFragment;
 use codex_code_mode::CellId;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 
 /// Identity-only notice. Admission limits IDs to 128 ASCII bytes and selects
 /// at most 16 whose complete rendered fragment fits within 512 tokens.
@@ -23,15 +25,15 @@ impl ContextualUserFragment for CodeModeCompletion {
         ("<code_mode_completion>", "</code_mode_completion>")
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         let ids = self
             .0
             .iter()
             .map(CellId::as_str)
             .collect::<Vec<_>>()
             .join(", ");
-        format!(
+        input_text(format!(
             "Code Mode cells completed: {ids}. Use the existing wait tool with each cell_id to retrieve its result. Completion may include a script error."
-        )
+        ))
     }
 }

@@ -1721,11 +1721,10 @@ impl Session {
         if self.services.code_mode_service.completions.is_enabled()
             && config.features.enabled(Feature::ShellTool)
             && config.features.enabled(Feature::UnifiedExec)
+            && let Some(guidance) = crate::context::BackgroundExecutionInstructions.render().into_text()
         {
             instructions.text.push_str("\n\n");
-            instructions
-                .text
-                .push_str(&crate::context::BackgroundExecutionInstructions.render());
+            instructions.text.push_str(&guidance);
         }
         instructions
     }

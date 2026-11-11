@@ -538,7 +538,7 @@ impl UnifiedExecProcessManager {
         mut completion: Option<&mut Completion<'_>>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let mut wake =
-            if completion.is_none() && !request.prepared.turn_environment.environment.is_remote() {
+            if completion.is_none() && !request.prepared.turn_environment.environment().is_remote() {
                 match context
                     .session
                     .services

@@ -793,10 +793,7 @@ impl Session {
         }
 
         let Some(mut active) = self.turn_for_tool_prompt().await else {
-            return McpServerElicitationOutcome {
-                response: None,
-                sent: false,
-            };
+            return None;
         };
         let _elicitation = self.services.elicitations.register();
         let (tx_response, rx_response) = oneshot::channel();
