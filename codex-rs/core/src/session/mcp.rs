@@ -792,9 +792,7 @@ impl Session {
             turn_context.turn_timing_state.invalidate_critical_path();
         }
 
-        let Some(mut active) = self.turn_for_tool_prompt().await else {
-            return None;
-        };
+        let mut active = self.turn_for_tool_prompt().await?;
         let _elicitation = self.services.elicitations.register();
         let (tx_response, rx_response) = oneshot::channel();
         let prev_entry = {

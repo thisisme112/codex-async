@@ -367,7 +367,7 @@ pub(super) async fn run_main_inner(
     } else {
         explicit_local_daemon_socket
     };
-    let mut app_server_target = app_server_target_for_launch(
+    let app_server_target = app_server_target_for_launch(
         explicit_remote_endpoint,
         default_daemon,
         reuse_implicit_local_daemon,
@@ -528,7 +528,7 @@ pub(super) async fn run_main_inner(
 
     // The shared daemon has no interactive completion-wake capability yet.
     // Model settings can select Code Mode even without a config feature override.
-    let app_server_target = code_mode_startup::interactive_target(app_server_target, &cli);
+    let mut app_server_target = code_mode_startup::interactive_target(app_server_target, &cli);
 
     let mut cloud_config_bundle = if workload_identity_selected {
         cloud_config_bundle
@@ -573,7 +573,9 @@ pub(super) async fn run_main_inner(
         None
     };
     let auto_start_daemon = cfg!(any(unix, windows))
-        && (cli.agents_overview || config.features.enabled(Feature::DaemonAutoStart))
+        // Shared daemon startup must not replace the completion-enabled embedded
+        // server selected for live interactive sessions above.
+        && cli.agents_overview
         && implicit_connection
         && !cli.no_daemon
         && !app_server_target.uses_remote_workspace();

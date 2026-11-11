@@ -741,6 +741,10 @@ impl NetworkApprovalService {
         )
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the retry closure shares only this request's prompt owner, and review attempts run sequentially"
+    )]
     pub(crate) async fn handle_inline_policy_request(
         &self,
         session: Arc<Session>,

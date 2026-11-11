@@ -11,7 +11,7 @@ pub(super) fn interactive_target(target: AppServerTarget, cli: &crate::Cli) -> A
         AppServerTarget::LocalDaemon { .. } | AppServerTarget::Embedded => {
             AppServerTarget::Embedded
         }
-        remote @ AppServerTarget::Remote { .. } => remote,
+        remote @ (AppServerTarget::Remote { .. } | AppServerTarget::Cloud) => remote,
     }
 }
 

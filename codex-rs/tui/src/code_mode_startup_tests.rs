@@ -176,6 +176,10 @@ async fn embedded_client_completion_wake_is_default_and_ordinary_client_stays_op
         cli.agents_overview = false;
         let explicit = AppServerTarget::Remote { endpoint };
         assert_eq!(interactive_target(explicit.clone(), &cli), explicit);
+        assert_eq!(
+            interactive_target(AppServerTarget::Cloud, &cli),
+            AppServerTarget::Cloud
+        );
 
         let mut client = if mode == ClientMode::Ordinary {
             let state_db =
