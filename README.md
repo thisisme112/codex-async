@@ -1,3 +1,5 @@
+> **异步增强 fork**：可用分支为 `async-main`，包含完成通知、事件等待和受验证保护的官方同步。使用与同步说明见 [README_ASYNC.md](README_ASYNC.md)。下方官方安装命令安装的是官方原版。
+
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">
   <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />

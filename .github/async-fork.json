@@ -1,0 +1,7 @@
+{
+  "repository": "thisisme112/codex-async",
+  "target_branch": "async-main",
+  "source_branch": "upstream/source",
+  "upstream_url": "https://github.com/openai/codex.git",
+  "upstream_branch": "main"
+}

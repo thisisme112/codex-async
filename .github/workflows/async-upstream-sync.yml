@@ -1,0 +1,111 @@
+name: Async fork upstream sync
+
+on:
+  schedule:
+    - cron: '23 19 * * *' # 03:23 Asia/Shanghai
+  workflow_dispatch:
+    inputs:
+      check_only:
+        description: Only inspect/merge; skip expensive Rust validation and publication
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: async-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+      base: ${{ steps.merge.outputs.base }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: async-main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Test synchronization safeguards
+        run: python3 -m unittest discover -s scripts/async_fork -p 'test_*.py' -v
+      - name: Prepare an isolated upstream merge
+        id: merge
+        run: python3 scripts/async_fork/sync.py prepare --output "$RUNNER_TEMP/async-sync"
+      - name: Keep the candidate for validation
+        if: steps.merge.outputs.changed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: async-sync-candidate
+          path: |
+            ${{ runner.temp }}/async-sync/candidate.bundle
+            ${{ runner.temp }}/async-sync/metadata.json
+          retention-days: 3
+      - name: Keep the synchronization report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: async-sync-report
+          path: |
+            ${{ runner.temp }}/async-sync/report.md
+            ${{ runner.temp }}/async-sync/metadata.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  validate:
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true' && !inputs.check_only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      RAYON_NUM_THREADS: '1'
+      CMAKE_BUILD_PARALLEL_LEVEL: '1'
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.base }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: async-sync-candidate
+          path: ${{ runner.temp }}/async-sync
+      - name: Select the exact candidate
+        run: |
+          git fetch "$RUNNER_TEMP/async-sync/candidate.bundle" refs/async-sync/candidate:refs/async-sync/candidate
+          git checkout --detach refs/async-sync/candidate
+          python3 scripts/async_fork/sync.py check
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libcap-dev pkg-config libssl-dev
+      - name: Validate CLI and asynchronous behavior
+        run: |
+          CORES=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
+          nice -n 15 taskset -c "$CORES" bash scripts/async_fork/validate.sh
+
+  publish:
+    needs: [prepare, validate]
+    if: needs.validate.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      # Only this final job has a write token. No candidate build code runs here.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.base }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: async-sync-candidate
+          path: ${{ runner.temp }}/async-sync
+      - name: Advance the usable branch atomically without force
+        run: python3 scripts/async_fork/sync.py promote --output "$RUNNER_TEMP/async-sync"
