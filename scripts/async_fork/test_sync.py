@@ -1,8 +1,10 @@
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import sync
 
@@ -12,6 +14,16 @@ class SyncTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        # Exercise GitHub reporting without writing into the real workflow's files.
+        reporting = patch.dict(
+            os.environ,
+            {
+                "GITHUB_STEP_SUMMARY": str(self.root / "step-summary.md"),
+                "GITHUB_OUTPUT": str(self.root / "step-output"),
+            },
+        )
+        reporting.start()
+        self.addCleanup(reporting.stop)
         self.repo = self.root / "repo"
         self.repo.mkdir()
         sync.git(self.repo, "init", "-b", "main")
