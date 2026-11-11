@@ -100,4 +100,6 @@ if [[ "$SUITE" == all || "$SUITE" == cli ]]; then
   cargo build --locked --profile dev-small -p codex-cli --bin codex
   "$CARGO_TARGET_DIR/dev-small/codex" --version
   "$CARGO_TARGET_DIR/dev-small/codex" --help >/dev/null
+  cargo build --locked --profile dev-small -p codex-exec-server-cli --bin codex-exec-server
+  ASYNC_PACKAGE_PREBUILT=1 bash "$REPO_ROOT/scripts/async_fork/package.sh"
 fi

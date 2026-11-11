@@ -36,6 +36,17 @@ python3 scripts/async_fork/sync.py prepare --output /tmp/codex-async-sync
 
 ## 构建与使用
 
+[下载已编译的 Linux x86_64 安装包](https://github.com/thisisme112/codex-async/releases)。下载 `codex-async-linux-x86_64.tar.gz`，完整解压后运行：
+
+```bash
+bash ./install.sh
+~/.local/bin/codex-async
+```
+
+默认安装到用户目录，不需要 sudo，保留原来的官方 `codex` 命令。需要 Ubuntu 22.04+ 或 Debian 12+ 等 glibc 2.35+ 系统，以及 libssl3/libcap2。发布页附带 SHA256 校验值和源码提交信息。
+
+首版使用 `dev-small` 配置，功能完整但未进行 release 优化。上游程序的版本横幅仍为 `0.0.0`，实际分支版本和来源见包内 `VERSION`、`BUILD_INFO.json`。官方同步验证成功后会自动发布安装包，优先直接复用验证时生成的包，不再重复编译。
+
 依赖配置见原仓库 `docs/install.md`。在仓库根目录组装包含配套工具的包：
 
 ```bash

@@ -74,7 +74,7 @@ jobs:
   validate:
     needs: prepare
     if: needs.prepare.outputs.changed == 'true' && !inputs.check_only
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.suite == 'cli' && 'ubuntu-22.04' || 'ubuntu-24.04' }}
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -104,6 +104,10 @@ jobs:
           git fetch "$RUNNER_TEMP/async-sync/candidate.bundle" refs/async-sync/candidate:refs/async-sync/candidate
           git checkout --detach refs/async-sync/candidate
           python3 scripts/async_fork/sync.py check
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: matrix.suite == 'cli'
+        with:
+          python-version: '3.12'
       - name: Prepare native build dependencies
         shell: bash
         timeout-minutes: 5
@@ -115,6 +119,13 @@ jobs:
         run: |
           CORES=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
           nice -n 15 taskset -c "$CORES" bash scripts/async_fork/validate.sh 2>&1 | tee "$RUNNER_TEMP/async-validation.log"
+      - name: Keep the already-built installable CLI package
+        if: matrix.suite == 'cli'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: async-linux-release-package
+          path: ${{ runner.temp }}/async-package/
+          retention-days: 7
       - name: Keep validation logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -127,7 +138,7 @@ jobs:
 
   verify_manual_merge:
     if: github.event_name == 'push' || (inputs.verify_only && !inputs.check_only)
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.suite == 'cli' && 'ubuntu-22.04' || 'ubuntu-24.04' }}
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -151,6 +162,10 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts/async_fork -p 'test_*.py' -v
           python3 scripts/async_fork/sync.py check
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: matrix.suite == 'cli'
+        with:
+          python-version: '3.12'
       - name: Prepare native build dependencies
         shell: bash
         timeout-minutes: 5
@@ -163,6 +178,13 @@ jobs:
           set -o pipefail
           CORES=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
           nice -n 15 taskset -c "$CORES" bash scripts/async_fork/validate.sh 2>&1 | tee "$RUNNER_TEMP/async-validation.log"
+      - name: Keep the already-built installable CLI package
+        if: matrix.suite == 'cli'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: async-linux-release-package
+          path: ${{ runner.temp }}/async-package/
+          retention-days: 7
       - name: Keep validation logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
