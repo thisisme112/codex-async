@@ -414,6 +414,7 @@ impl ExecCommandHandler {
                 truncation_policy: step_context.settings.model_info.truncation_policy.into(),
                 max_output_tokens,
                 process_id: None,
+                completion_notification_registered: false,
                 exit_code: None,
                 original_token_count: None,
                 output_omitted_bytes: None,
@@ -470,6 +471,7 @@ impl ExecCommandHandler {
                     // Sandbox denial is terminal, so there is no live
                     // process for write_stdin to resume.
                     process_id: None,
+                    completion_notification_registered: false,
                     exit_code: Some(output.exit_code),
                     original_token_count: Some(original_token_count),
                     output_omitted_bytes,

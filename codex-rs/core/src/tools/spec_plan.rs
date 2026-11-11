@@ -31,6 +31,7 @@ use crate::tools::handlers::TestSyncHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::ViewImageHandler;
 use crate::tools::handlers::WaitForEnvironmentHandler;
+use crate::tools::handlers::WaitForTasksHandler;
 use crate::tools::handlers::WriteStdinHandler;
 use crate::tools::handlers::extension_tools::ExtensionToolAdapter;
 use crate::tools::handlers::multi_agents::CloseAgentHandler;
@@ -109,6 +110,7 @@ const IMAGEGEN_TOOL_NAME: &str = "imagegen";
 
 #[derive(Clone, Copy)]
 struct CoreToolPlanContext<'a> {
+    completion_wake_enabled: bool,
     turn_context: &'a TurnContext,
     model_info: &'a ModelInfo,
     model_messages: Option<&'a ModelMessages>,
@@ -140,6 +142,7 @@ pub(crate) fn build_tool_router(
         .thread_extension_data
         .get::<crate::WaitForEnvironmentToolConfig>();
     let context = CoreToolPlanContext {
+        completion_wake_enabled: session.services.code_mode_service.completions.is_enabled(),
         turn_context,
         model_info,
         model_messages,
@@ -281,6 +284,7 @@ pub(crate) fn build_core_tool_registry(
     let default_agent_type_description =
         crate::agent::role::spawn_tool_spec::build(&std::collections::BTreeMap::new());
     let context = CoreToolPlanContext {
+        completion_wake_enabled: false,
         turn_context,
         model_info,
         model_messages: model_info.model_messages.as_ref(),
@@ -1104,6 +1108,9 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
     if features.enabled(Feature::UnifiedExec) {
         registry.add(ExecCommandHandler::new(options));
         registry.add(WriteStdinHandler);
+        if context.completion_wake_enabled {
+            registry.add(WaitForTasksHandler);
+        }
     } else {
         // Managed requirements are the only configuration path that can keep
         // unified exec disabled. Preserve command execution without exposing a

@@ -836,6 +836,7 @@ impl UnifiedExecProcessManager {
                 .into(),
             max_output_tokens: request.max_output_tokens,
             process_id: response_process_id,
+            completion_notification_registered: response_process_id.is_some() && wake.is_some(),
             exit_code,
             original_token_count: Some(original_token_count),
             output_omitted_bytes,
@@ -953,7 +954,6 @@ impl UnifiedExecProcessManager {
         } = self
             .prepare_process_handles(process_id, &locked_process)
             .await?;
-        process.retire_completion();
         let mut status_after_write = None;
 
         if !request.input.is_empty() {
@@ -1075,12 +1075,16 @@ impl UnifiedExecProcessManager {
             truncation_policy: request.truncation_policy,
             max_output_tokens: request.max_output_tokens,
             process_id,
+            completion_notification_registered: false,
             exit_code,
             original_token_count: Some(original_token_count),
             output_omitted_bytes,
             hook_command: Some(hook_command),
         };
 
+        if response.process_id.is_none() {
+            process.retire_completion();
+        }
         let should_emit_interaction = !request.input.is_empty() || response.process_id.is_some();
         if should_emit_interaction
             && let Some(WriteStdinInteractionEvent { session, turn }) = request.interaction_event

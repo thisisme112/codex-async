@@ -1412,20 +1412,29 @@ impl Session {
     pub(crate) async fn get_prompt_base_instructions(&self) -> BaseInstructions {
         let config = self.get_config().await;
         let instructions = self.get_base_instructions().await;
-        if !config.update_plan_enabled
+        let mut instructions = if !config.update_plan_enabled
             && config.model_catalog.is_none()
             && matches!(
                 instructions.provenance,
                 Some(BaseInstructionsProvenance::Model { .. })
-            )
-        {
+            ) {
             BaseInstructions {
                 text: crate::context::without_update_plan_instructions(&instructions.text),
                 ..instructions
             }
         } else {
             instructions
+        };
+        if self.services.code_mode_service.completions.is_enabled()
+            && config.features.enabled(Feature::ShellTool)
+            && config.features.enabled(Feature::UnifiedExec)
+        {
+            instructions.text.push_str("\n\n");
+            instructions
+                .text
+                .push_str(&crate::context::BackgroundExecutionInstructions.render());
         }
+        instructions
     }
 
     // Merges connector IDs into the session-level explicit connector selection.

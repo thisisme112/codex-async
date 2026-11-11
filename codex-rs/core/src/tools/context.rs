@@ -376,6 +376,7 @@ pub struct ExecCommandToolOutput {
     pub truncation_policy: TruncationPolicy,
     pub max_output_tokens: Option<usize>,
     pub process_id: Option<i32>,
+    pub completion_notification_registered: bool,
     pub exit_code: Option<i32>,
     pub original_token_count: Option<usize>,
     /// Bytes omitted by the output collection cap before model-facing truncation.
@@ -445,6 +446,8 @@ impl ToolOutput for ExecCommandToolOutput {
             exit_code: Option<i32>,
             #[serde(skip_serializing_if = "Option::is_none")]
             session_id: Option<i32>,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            completion_notification_registered: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
             original_token_count: Option<usize>,
             output: String,
@@ -455,6 +458,7 @@ impl ToolOutput for ExecCommandToolOutput {
             wall_time_seconds: self.wall_time.as_secs_f64(),
             exit_code: self.exit_code,
             session_id: self.process_id,
+            completion_notification_registered: self.completion_notification_registered,
             original_token_count: self.original_token_count,
             output: match self.max_output_tokens {
                 Some(max_tokens) => self.truncated_output(max_tokens),
@@ -527,6 +531,9 @@ impl ExecCommandToolOutput {
 
         if let Some(process_id) = &self.process_id {
             sections.push(format!("Process running with session ID {process_id}"));
+        }
+        if self.completion_notification_registered {
+            sections.push("Completion notification registered. Continue other work or end this turn; this live interactive thread resumes when the command finishes. To wait now, use wait_for_tasks with this session ID. Use write_stdin for actual intermediate diagnostics or stdin, not repeated completion checks.".to_string());
         }
 
         if let Some(original_token_count) = self.original_token_count {

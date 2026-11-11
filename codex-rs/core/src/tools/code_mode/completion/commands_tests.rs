@@ -14,9 +14,12 @@ pub(in crate::tools::code_mode::completion) fn output(call: &str, id: i32) -> Re
         namespace: None,
         internal_chat_message_metadata_passthrough: None,
         call_id: Some(call.to_string()),
-        output: FunctionCallOutputPayload::from_text(format!(
-            "Process running with session ID {id}\nOutput:\n"
-        )),
+        output: FunctionCallOutputPayload {
+            success: Some(true),
+            ..FunctionCallOutputPayload::from_text(format!(
+                "Process running with session ID {id}\nOutput:\n"
+            ))
+        },
     }
 }
 #[test_case("ready_first")]

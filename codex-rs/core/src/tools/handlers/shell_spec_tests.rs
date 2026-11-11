@@ -150,7 +150,7 @@ fn write_stdin_tool_matches_expected_spec() {
         ToolSpec::Function(ResponsesApiTool {
             name: "write_stdin".to_string(),
             description:
-                "Writes characters to an existing unified exec session and returns recent output."
+                "Writes characters to an existing unified exec session and returns recent output. Use for stdin or intermediate diagnostics. When completion notification is registered, use wait_for_tasks to wait for completion or end the turn for automatic notification; do not repeatedly poll solely to check completion."
                     .to_string(),
             strict: false,
             defer_loading: None,

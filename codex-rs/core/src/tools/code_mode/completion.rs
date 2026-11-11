@@ -1,6 +1,7 @@
 //! Shared bounded, identity-only Cell/command wake bookkeeping. No result ownership.
 //! Kept with the existing service so both producers use its live-thread activation,
 //! suppression and idle admission; command-specific bookkeeping lives in `commands`.
+mod command_wait;
 mod commands;
 mod delegate;
 mod dispatcher;
@@ -93,6 +94,10 @@ impl Default for Completions {
 }
 
 impl Completions {
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.state().enabled && !self.shutdown.is_cancelled()
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         self.state
             .lock()
@@ -193,16 +198,7 @@ impl Completions {
                         && if command.owner.is_some() {
                             custom
                         } else {
-                            entry.yielded
-                                && !custom
-                                && output.body.to_text().is_some_and(|text| {
-                                    text.lines().any(|line| {
-                                        line == format!(
-                                            "Process running with session ID {}",
-                                            command.process_id
-                                        )
-                                    })
-                                })
+                            entry.yielded && !custom && output.success == Some(true)
                         };
                     entry.exposed |= exposed;
                     return exposed;

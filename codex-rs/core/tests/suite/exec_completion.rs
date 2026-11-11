@@ -308,7 +308,7 @@ async fn cancellation_and_inactive_clients_do_not_wake(reason: &str) -> anyhow::
 }
 
 async fn request_started(mock: &ResponseMock) {
-    tokio::time::timeout(Duration::from_secs(/*secs*/ 5), async {
+    tokio::time::timeout(Duration::from_secs(/*secs*/ 10), async {
         while mock.requests().is_empty() {
             tokio::time::sleep(Duration::from_millis(/*millis*/ 5)).await;
         }
@@ -370,6 +370,211 @@ async fn command_yield_after_wrapper_exposure_survives_cell_wait_and_cleanup() -
             .to_string()
             .contains("retained-command-output")
     );
+    test.codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[test_case(false; "ordinary_client")]
+#[test_case(true; "interactive_client")]
+#[tokio::test]
+async fn completion_capability_reaches_model_instructions_and_tools(
+    enabled: bool,
+) -> anyhow::Result<()> {
+    let server = responses::start_mock_server().await;
+    let test = build(&server, /*nested*/ false, enabled).await?;
+    for _ in 0..2 {
+        let mock = responses::mount_sse_once(&server, responses::sse_completed("capability")).await;
+        test.submit_turn("Which tools are available?").await?;
+        let request = mock.single_request();
+        let body = request.body_json();
+        let instructions = body["instructions"].as_str().expect("model instructions");
+        assert_eq!(
+            instructions.matches("<background_execution>").count(),
+            usize::from(enabled)
+        );
+        assert_eq!(
+            body["tools"]
+                .as_array()
+                .expect("model tool definitions")
+                .iter()
+                .any(|tool| tool["name"].as_str() == Some("wait_for_tasks"))
+                || request
+                    .tool_by_name("functions", "wait_for_tasks")
+                    .is_some(),
+            enabled
+        );
+        if enabled {
+            assert!(instructions.contains("Do not repeatedly call write_stdin"));
+            assert!(instructions.contains("completion_notification_registered=true"));
+        }
+    }
+    test.codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[test_case(false; "direct")]
+#[test_case(true; "code_mode")]
+#[tokio::test]
+async fn event_wait_has_no_intermediate_inference_or_duplicate_wake(
+    nested: bool,
+) -> anyhow::Result<()> {
+    core_test_support::skip_if_remote!(Ok(()), "local completion rollout");
+    let server = responses::start_mock_server().await;
+    let test = build(&server, nested, /*enabled*/ true).await?;
+    let (id, _) = launch(
+        &server,
+        &test,
+        if nested { "detached" } else { "direct" },
+        /*exit*/ 7,
+    )
+    .await?;
+    let args = json!({"session_ids":[id]});
+    let call = if nested {
+        responses::ev_custom_tool_call(
+            "event-wait",
+            "exec",
+            &format!(
+                "// @exec: {{\"yield_time_ms\": 10000}}\ntext(await tools.wait_for_tasks({args}));"
+            ),
+        )
+    } else {
+        ev_function_call("event-wait", "wait_for_tasks", &args.to_string())
+    };
+    let wait = responses::mount_sse_once(&server, sse(vec![call, ev_completed("wait")])).await;
+    let read = if nested {
+        responses::ev_custom_tool_call(
+            "final-read",
+            "exec",
+            &format!("text(await tools.write_stdin({{session_id:{id},chars:''}}));"),
+        )
+    } else {
+        ev_function_call(
+            "final-read",
+            "write_stdin",
+            &json!({"session_id":id,"chars":""}).to_string(),
+        )
+    };
+    let next = responses::mount_sse_once(&server, sse(vec![read, ev_completed("read")])).await;
+    let result = responses::mount_sse_once(&server, responses::sse_completed("done")).await;
+    test.codex.start_or_steer_turn(user()).await?;
+    wait_for_event(&test.codex, |e| matches!(e, EventMsg::TurnStarted(_))).await;
+    request_started(&wait).await;
+    quiet(&next).await;
+    release(&test);
+    finish(&test).await;
+    let next_request = next.single_request();
+    let result_request = result.single_request();
+    let (wait_output, output) = if nested {
+        (
+            next_request.custom_tool_call_output("event-wait"),
+            result_request.custom_tool_call_output("final-read"),
+        )
+    } else {
+        (
+            next_request.function_call_output("event-wait"),
+            result_request.function_call_output("final-read"),
+        )
+    };
+    assert!(wait_output.to_string().contains("completed_session_ids"));
+    assert!(output.to_string().contains("retained-command-output"));
+    assert!(output.to_string().contains(if nested {
+        "exit_code"
+    } else {
+        "Process exited with code 7"
+    }));
+    let duplicate = responses::mount_sse_once(&server, responses::sse_completed("duplicate")).await;
+    quiet(&duplicate).await;
+    test.codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn progress_read_preserves_later_completion_notification() -> anyhow::Result<()> {
+    core_test_support::skip_if_remote!(Ok(()), "local completion rollout");
+    let server = responses::start_mock_server().await;
+    let test = build(&server, /*nested*/ false, /*enabled*/ true).await?;
+    let (id, _) = launch(&server, &test, "direct", /*exit*/ 7).await?;
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_function_call(
+                "progress",
+                "write_stdin",
+                &json!({"session_id":id,"chars":"","yield_time_ms":1}).to_string(),
+            ),
+            ev_completed("progress"),
+        ]),
+    )
+    .await;
+    let idle = responses::mount_sse_once(&server, responses::sse_completed("idle")).await;
+    test.codex.start_or_steer_turn(user()).await?;
+    finish(&test).await;
+    assert!(
+        idle.single_request()
+            .function_call_output("progress")
+            .to_string()
+            .contains("Process running with session ID")
+    );
+    let wake = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_function_call(
+                "retrieve",
+                "write_stdin",
+                &json!({"session_id":id,"chars":""}).to_string(),
+            ),
+            ev_completed("wake"),
+        ]),
+    )
+    .await;
+    let result = responses::mount_sse_once(&server, responses::sse_completed("done")).await;
+    quiet(&wake).await;
+    release(&test);
+    finish(&test).await;
+    assert!(
+        wake.single_request()
+            .body_contains_text("<exec_completion>")
+    );
+    assert!(
+        result
+            .single_request()
+            .function_call_output("retrieve")
+            .to_string()
+            .contains("Process exited with code 7")
+    );
+    test.codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn interrupt_releases_event_wait_without_consuming_result() -> anyhow::Result<()> {
+    core_test_support::skip_if_remote!(Ok(()), "local completion rollout");
+    let server = responses::start_mock_server().await;
+    let test = build(&server, /*nested*/ false, /*enabled*/ true).await?;
+    let (id, _) = launch(&server, &test, "direct", /*exit*/ 0).await?;
+    let wait = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_function_call(
+                "wait",
+                "wait_for_tasks",
+                &json!({"session_ids":[id]}).to_string(),
+            ),
+            ev_completed("waiting"),
+        ]),
+    )
+    .await;
+    let unexpected =
+        responses::mount_sse_once(&server, responses::sse_completed("unexpected")).await;
+    test.codex.start_or_steer_turn(user()).await?;
+    wait_for_event(&test.codex, |e| matches!(e, EventMsg::TurnStarted(_))).await;
+    request_started(&wait).await;
+    quiet(&unexpected).await;
+    test.codex.submit(Op::Interrupt).await?;
+    wait_for_event(&test.codex, |e| matches!(e, EventMsg::TurnAborted(_))).await;
+    release(&test);
+    wait_for_event(&test.codex, |e| matches!(e, EventMsg::ExecCommandEnd(_))).await;
+    quiet(&unexpected).await;
     test.codex.shutdown_and_wait().await?;
     Ok(())
 }

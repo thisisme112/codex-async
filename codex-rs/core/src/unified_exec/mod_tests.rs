@@ -206,6 +206,7 @@ async fn exec_command_with_tty(
         truncation_policy: turn.model_info().truncation_policy.into(),
         max_output_tokens: None,
         process_id: response_process_id,
+        completion_notification_registered: false,
         exit_code,
         original_token_count: Some(original_token_count),
         output_omitted_bytes,
