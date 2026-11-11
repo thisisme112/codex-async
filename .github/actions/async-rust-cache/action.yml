@@ -1,0 +1,27 @@
+name: Conservative Rust dependency cache
+description: Reuse compiled dependencies with pinned toolchains and bounded cache scope
+inputs:
+  group:
+    description: OS and suite compatibility group
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Select the repository Rust toolchain before computing cache keys
+      shell: bash
+      working-directory: codex-rs
+      run: |
+        TOOLCHAIN=$(rustup show active-toolchain | cut -d ' ' -f1)
+        echo "RUSTUP_TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
+    - name: Restore Cargo downloads and compiled dependencies
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        prefix-key: async-deps-v1
+        shared-key: ${{ inputs.group }}
+        workspaces: codex-rs -> target/async-ci
+        cache-bin: 'false'
+        cache-workspace-crates: 'false'
+        cache-on-failure: 'false'
+        # Default-branch caches are available to integration branches. Only the
+        # default branch writes, avoiding duplicate multi-GB branch caches.
+        save-if: ${{ github.ref == 'refs/heads/async-main' }}

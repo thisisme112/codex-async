@@ -5,6 +5,8 @@ on:
     branches: [async-main]
     paths:
       - '.github/workflows/async-linux-release.yml'
+      - '.github/actions/async-rust-cache/**'
+      - 'scripts/async_fork/release_source.py'
       - 'scripts/async_fork/package.sh'
       - 'scripts/async_fork/install-package.sh'
       - 'codex-rs/**'
@@ -17,6 +19,11 @@ on:
     types: [completed]
     branches: [async-main]
   workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: Build even if an older release has identical package inputs
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -42,16 +49,14 @@ jobs:
       - id: source
         env:
           GH_TOKEN: ${{ github.token }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild || false }}
         run: |
-          SHA=$(git rev-parse HEAD)
-          TAG="async-${SHA:0:12}"
-          gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName > "$RUNNER_TEMP/releases.json"
-          python3 - "$SHA" "$TAG" "$RUNNER_TEMP/releases.json" <<'PY'
-          import json, os, sys
-          found = any(item['tagName'] == sys.argv[2] for item in json.load(open(sys.argv[3])))
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write(f'sha={sys.argv[1]}\ntag={sys.argv[2]}\nbuild={str(not found).lower()}\n')
-          PY
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,isDraft > "$RUNNER_TEMP/releases.json"
+          if [[ "$FORCE_REBUILD" == true ]]; then
+            python3 scripts/async_fork/release_source.py "$RUNNER_TEMP/releases.json" --force
+          else
+            python3 scripts/async_fork/release_source.py "$RUNNER_TEMP/releases.json"
+          fi
 
   package:
     needs: source
@@ -61,9 +66,15 @@ jobs:
     permissions:
       contents: read
       actions: read
+    outputs:
+      reused: ${{ steps.reuse.outcome == 'success' }}
     env:
       ASYNC_BUILD_JOBS: '2'
       CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      RAYON_NUM_THREADS: '2'
+      CMAKE_BUILD_PARALLEL_LEVEL: '2'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -83,6 +94,11 @@ jobs:
         if: steps.reuse.outcome != 'success'
         with:
           python-version: '3.12'
+      - name: Restore compatible compiled dependencies
+        if: steps.reuse.outcome != 'success'
+        uses: ./.github/actions/async-rust-cache
+        with:
+          group: ubuntu22-cli
       - name: Prepare native dependencies
         if: steps.reuse.outcome != 'success'
         timeout-minutes: 5
@@ -103,10 +119,11 @@ jobs:
           sha256sum --check SHA256SUMS
           python3 -c 'import json, os; assert json.load(open("BUILD_INFO.json"))["source_commit"] == os.environ["SOURCE_SHA"]'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.reuse.outcome != 'success'
         with:
           name: downloadable-linux-cli
           path: ${{ runner.temp }}/async-package/
-          retention-days: 7
+          retention-days: 1
       - name: Retain build log
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -122,11 +139,21 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      actions: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: needs.package.outputs.reused != 'true'
         with:
           name: downloadable-linux-cli
           path: dist
+      - name: Download the original validated package without duplicating storage
+        if: needs.package.outputs.reused == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: async-linux-release-package
+          path: dist
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
       - name: Publish the finished package
         env:
           GH_TOKEN: ${{ github.token }}
@@ -143,3 +170,16 @@ jobs:
           Requires glibc 2.35+ (Ubuntu 22.04+, Debian 12+) and system libssl3/libcap2. Built with dev-small: full functionality without release optimization. The binary banner is upstream 0.0.0; VERSION and BUILD_INFO.json identify the fork build.
           EOF
           gh release create "$RELEASE_TAG" dist/codex-async-linux-x86_64.tar.gz dist/SHA256SUMS dist/BUILD_INFO.json dist/INSTALL.txt --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --title "Codex Async Linux x86_64 ($RELEASE_TAG)" --prerelease --notes-file "$RUNNER_TEMP/notes.md"
+      - name: Remove temporary package artifacts after successful publication
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ORIGINAL_RUN: ${{ github.event.workflow_run.id }}
+        run: |
+          for RUN in "$GITHUB_RUN_ID" "$ORIGINAL_RUN"; do
+            [[ "$RUN" =~ ^[0-9]+$ ]] || continue
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN/artifacts" --jq '.artifacts[] | select(.name == "downloadable-linux-cli" or .name == "async-linux-release-package") | .id' |
+              while read -r ARTIFACT; do
+                gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT"
+              done
+          done
