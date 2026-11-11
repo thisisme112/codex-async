@@ -319,14 +319,30 @@ async fn completion_never_injects_into_a_busy_turn(manual_wait: bool) -> anyhow:
     Ok(())
 }
 
+#[test_case(false; "retained_cells")]
+#[test_case(true; "default_terminated_cells")]
 #[tokio::test]
-async fn interrupted_thread_defers_until_explicit_user_continuation() -> anyhow::Result<()> {
+async fn interrupted_thread_defers_until_explicit_user_continuation(
+    terminate_cells: bool,
+) -> anyhow::Result<()> {
     let server = responses::start_mock_server().await;
     let session = Arc::new(ControlledSession {
         supported: true,
         ..Default::default()
     });
-    let test = fixture::build(&server, session.clone(), /*client*/ true).await?;
+    let test = fixture::builder(session.clone(), /*client*/ true)
+        .with_config(move |config| {
+            // Upstream now terminates cells on interrupt by default. Exercise
+            // retained completion separately without weakening that default.
+            if !terminate_cells {
+                config
+                    .features
+                    .disable(Feature::CodeModeInterrupt)
+                    .expect("retain interrupted cells for deferred completion");
+            }
+        })
+        .build_with_auto_env(&server)
+        .await?;
     launch(&server, &test, "held").await;
     let busy = responses::mount_response_sequence(
         &server,
@@ -353,25 +369,34 @@ async fn interrupted_thread_defers_until_explicit_user_continuation() -> anyhow:
         matches!(event, EventMsg::TurnAborted(_))
     })
     .await;
+    assert_eq!(
+        session.delegate.lock().expect("delegate lock").is_none(),
+        terminate_cells,
+        "default interruption must terminate the cell and retire its callback"
+    );
     let continuation =
         responses::mount_sse_once(&server, responses::sse_completed("user-continued")).await;
     session.complete();
     no_requests(&continuation).await;
     let wake = responses::mount_sse_once(&server, responses::sse_completed("wake")).await;
     test.submit_turn("Continue").await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
     assert!(
         !continuation
             .single_request()
             .body_contains_text("<code_mode_completion>")
     );
-    assert!(
-        wake.single_request()
-            .body_contains_text("<code_mode_completion>")
-    );
+    if terminate_cells {
+        no_requests(&wake).await;
+    } else {
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+        assert!(
+            wake.single_request()
+                .body_contains_text("<code_mode_completion>")
+        );
+    }
     test.codex.shutdown_and_wait().await?;
     Ok(())
 }
