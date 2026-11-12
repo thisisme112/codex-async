@@ -6,6 +6,7 @@ on:
     paths:
       - 'codex-rs/**'
       - 'scripts/codex_package/**'
+      - 'scripts/async_fork/**'
       - 'scripts/desktop/**'
       - 'third_party/v8/**'
       - '.github/workflows/async-upstream-sync.yml'
