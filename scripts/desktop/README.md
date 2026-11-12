@@ -2,6 +2,8 @@
 
 The upstream synchronization workflow verifies the Windows backend before it advances `async-main`. A separate Windows workflow retains binaries and a manifest for the exact validated commit. It builds direct changes to `async-main` and reuses the validated candidate after an automatic merge.
 
+The Windows build fetches the exact locked V8 source commit without its large Chromium submodules. It uses the separately verified prebuilt V8 archive and changes only V8's source entry in the temporary Cargo lockfile; the checked-in lockfile stays unchanged.
+
 On the Windows machine, `bootstrap.ps1` fetches the exact current `async-main` commit, extracts that commit's updater scripts without changing the checkout, and runs its `check-and-stage.ps1`. The latter compares the current `async-main` commit and installed Codex package version, downloads the matching successful Windows artifact, checks every binary against its manifest and prepares an isolated desktop candidate. The source application and the current enhanced desktop remain untouched. GitHub CLI authentication and access to the repository are required. Artifacts expire after seven days; if no matching artifact remains, the updater requests a new validated build unless one is already running or the latest build failed.
 
 ```powershell

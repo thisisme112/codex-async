@@ -86,6 +86,8 @@ jobs:
         run: |
           git config --global core.longpaths true
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python ../scripts/desktop/prepare-v8.py --workspace . --checkout C:/v8src
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --locked --profile dev-small -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner -p codex-windows-sandbox-service --bin codex-windows-sandbox-service
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --profile dev-small -p codex-core --lib tools::code_mode::completion
