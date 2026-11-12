@@ -9,6 +9,9 @@ cd "$SOURCE_DIR"
 sha256sum --check --quiet PACKAGE_SHA256SUMS
 VERSION=$(cat VERSION)
 case "$VERSION" in ''|*[!A-Za-z0-9.+_-]*) echo 'Invalid package version' >&2; exit 1 ;; esac
+BUILD_ID=$VERSION
+if [[ -f BUILD_ID ]]; then BUILD_ID=$(cat BUILD_ID); fi
+case "$BUILD_ID" in ''|*[!A-Za-z0-9.+_-]*) echo 'Invalid package build ID' >&2; exit 1 ;; esac
 for executable in bin/codex bin/codex-code-mode-host bin/codex-exec-server codex-resources/bwrap; do
   dependencies=$(ldd "$executable" 2>&1 || true)
   if [[ "$dependencies" == *'not found'* ]]; then
@@ -21,7 +24,7 @@ done
 mkdir -p "$PREFIX/bin" "$PREFIX/share/codex-async/releases"
 PREFIX=$(cd "$PREFIX" && pwd)
 case "$PREFIX/" in "$SOURCE_DIR/"*) echo 'Choose an installation prefix outside the unpacked package.' >&2; exit 1 ;; esac
-DESTINATION="$PREFIX/share/codex-async/releases/$VERSION"
+DESTINATION="$PREFIX/share/codex-async/releases/$BUILD_ID"
 LAUNCHER="$PREFIX/bin/codex-async"
 if [[ -e "$LAUNCHER" && ! -L "$LAUNCHER" ]]; then
   echo "$LAUNCHER already exists and is not a managed symlink." >&2

@@ -11,6 +11,13 @@ export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-"$REPO_ROOT/codex-rs/target/async-ci
 OUTPUT=${ASYNC_PACKAGE_OUTPUT:-"$RUNNER_TEMP/async-package"}
 PACKAGE="$RUNNER_TEMP/codex-async-package"
 BINARIES="$CARGO_TARGET_DIR/dev-small"
+VERSION_FILE=${ASYNC_UPSTREAM_VERSION_FILE:-"$RUNNER_TEMP/async-official-version.json"}
+cd "$REPO_ROOT"
+if [[ ! -f "$VERSION_FILE" ]]; then
+  python3 scripts/async_fork/upstream_version.py resolve --file "$VERSION_FILE"
+fi
+python3 scripts/async_fork/upstream_version.py stamp --file "$VERSION_FILE"
+VERSION=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$VERSION_FILE")
 mkdir -p "$OUTPUT"
 python3 -u - <<'PY' &
 import datetime
@@ -44,7 +51,6 @@ PY
   cargo build --locked --profile dev-small --bin codex --bin codex-code-mode-host --bin codex-exec-server
 fi
 cd "$REPO_ROOT"
-VERSION="0.0.0-async.sha${STABLE_GIT_COMMIT:0:12}"
 python3 scripts/build_codex_package.py \
   --target x86_64-unknown-linux-gnu --package-version "$VERSION" \
   --package-dir "$PACKAGE" --entrypoint-bin "$BINARIES/codex" \
@@ -53,6 +59,7 @@ python3 scripts/build_codex_package.py \
 cp scripts/async_fork/install-package.sh "$PACKAGE/install.sh"
 cp LICENSE NOTICE "$PACKAGE/"
 printf '%s\n' "$VERSION" > "$PACKAGE/VERSION"
+printf '%s-sha%s\n' "$VERSION" "${STABLE_GIT_COMMIT:0:12}" > "$PACKAGE/BUILD_ID"
 cat > "$PACKAGE/INSTALL.txt" <<'TXT'
 Codex Async preview — Linux x86_64
 
@@ -68,10 +75,11 @@ Interactive CLI completion notifications and wait_for_tasks are enabled
 automatically. No extra API service or system-prompt file is needed.
 Requires a running CLI; notification state does not survive shutdown.
 Uses the dev-small profile: full functionality, without release optimization.
-The upstream binary banner remains codex-cli 0.0.0; VERSION and BUILD_INFO.json
-identify this fork build. Source is available from the GitHub release tag.
+Program and package versions follow the matching official release, including
+alpha/beta suffixes. BUILD_ID and BUILD_INFO.json identify this fork build.
+Source is available from the GitHub release tag.
 TXT
-python3 - "$PACKAGE" "$REPO_ROOT" "$VERSION" <<'PY'
+python3 - "$PACKAGE" "$REPO_ROOT" "$VERSION" "$VERSION_FILE" <<'PY'
 import json
 import platform
 import subprocess
@@ -80,7 +88,8 @@ from pathlib import Path
 package, root = map(Path, sys.argv[1:3])
 sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
 state = json.loads((root / '.github/async-fork-state.json').read_text())
-(package / 'BUILD_INFO.json').write_text(json.dumps({'version':sys.argv[3], 'source_commit':sha, 'official_upstream':state['upstream'], 'profile':'dev-small', 'target':'x86_64-unknown-linux-gnu', 'build_glibc':platform.libc_ver()[1]}, indent=2) + '\n')
+official = json.loads(Path(sys.argv[4]).read_text())
+(package / 'BUILD_INFO.json').write_text(json.dumps({'version':sys.argv[3], 'build_id':(package/'BUILD_ID').read_text().strip(), 'source_commit':sha, 'official_upstream':state['upstream'], 'official_release':official, 'profile':'dev-small', 'target':'x86_64-unknown-linux-gnu', 'build_glibc':platform.libc_ver()[1]}, indent=2) + '\n')
 PY
 chmod +x "$PACKAGE/install.sh"
 (cd "$PACKAGE" && find . -type f ! -name PACKAGE_SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > PACKAGE_SHA256SUMS)
@@ -96,6 +105,7 @@ SMOKE=$(mktemp -d "$RUNNER_TEMP/package-smoke.XXXXXXXX")
 mkdir -p "$SMOKE/unpacked"
 tar -xzf "$OUTPUT/codex-async-linux-x86_64.tar.gz" -C "$SMOKE/unpacked"
 bash "$SMOKE/unpacked/install.sh" "$SMOKE/installed"
+[[ $("$SMOKE/installed/bin/codex-async" --version) == "codex-cli $VERSION" ]]
 timeout 30 "$SMOKE/installed/bin/codex-async" --help >/dev/null
 timeout 30 "$SMOKE/installed/bin/codex-async" features list > "$OUTPUT/features.txt"
 timeout 30 "$SMOKE/unpacked/bin/codex-code-mode-host" --help >/dev/null

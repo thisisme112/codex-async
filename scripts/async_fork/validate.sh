@@ -11,6 +11,14 @@ case "$SUITE" in all|runtime|core|cli|async) ;; *) echo 'Unknown ASYNC_VALIDATIO
 echo "Validating suite=$SUITE with build_jobs=$BUILD_JOBS"
 export CARGO_BUILD_JOBS="$BUILD_JOBS" CARGO_INCREMENTAL=0 RAYON_NUM_THREADS="$BUILD_JOBS" CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS"
 export CARGO_TARGET_DIR="$REPO_ROOT/codex-rs/target/async-ci"
+if [[ "$SUITE" == all || "$SUITE" == cli ]]; then
+  cd "$REPO_ROOT"
+  export ASYNC_UPSTREAM_VERSION_FILE=${ASYNC_UPSTREAM_VERSION_FILE:-"$RUNNER_TEMP/async-official-version.json"}
+  if [[ ! -f "$ASYNC_UPSTREAM_VERSION_FILE" ]]; then
+    python3 scripts/async_fork/upstream_version.py resolve --file "$ASYNC_UPSTREAM_VERSION_FILE"
+  fi
+  python3 scripts/async_fork/upstream_version.py stamp --file "$ASYNC_UPSTREAM_VERSION_FILE"
+fi
 
 # Rust can spend several minutes on one crate without printing a new line.
 # Keep resource telemetry in the same durable log without making model requests.

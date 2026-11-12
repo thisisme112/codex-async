@@ -62,6 +62,13 @@ class ReleaseSourceTests(unittest.TestCase):
         self.releases[0]['isDraft'] = True
         self.assertIsNone(self.match())
 
+    def test_official_version_change_requires_repackaging(self):
+        tag = 'rust-v0.170.0-alpha.2+async.test'
+        self.run_git('tag', tag)
+        self.releases = [{'tagName': tag, 'isDraft': False}]
+        self.assertEqual(release_source.matching_release(self.root, self.releases, fetch=False, version='0.170.0-alpha.2'), tag)
+        self.assertIsNone(release_source.matching_release(self.root, self.releases, fetch=False, version='0.170.0-alpha.3'))
+
     def test_older_incomplete_release_does_not_suppress_build(self):
         self.run_git('rm', 'scripts/async_fork/package.sh')
         self.commit()
