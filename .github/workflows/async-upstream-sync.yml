@@ -263,6 +263,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node scripts/desktop/test-background-panel.cjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./scripts/desktop/test-check-and-stage.ps1
       - name: Resolve verified V8 archive
         shell: pwsh
         run: |

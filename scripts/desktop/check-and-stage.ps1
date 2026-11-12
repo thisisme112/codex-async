@@ -19,9 +19,10 @@ if (Test-Path -LiteralPath $candidateInfo) {
     throw 'Existing candidate does not match the current source'
 }
 if (Test-Path -LiteralPath $candidate) { throw "Incomplete candidate requires inspection: $candidate" }
-$rawRuns = gh run list --repo $Repository --workflow async-windows-build.yml --limit 100 --json databaseId,status,conclusion,event
+$rawRuns = gh run list --repo $Repository --workflow async-windows-build.yml --limit 100 --json databaseId,status,conclusion,event,headSha
 if ($LASTEXITCODE -ne 0) { throw 'Unable to query GitHub Actions runs' }
-$runs = @($rawRuns | ConvertFrom-Json | Where-Object { $_.status -eq 'completed' -and $_.conclusion -eq 'success' -and $_.event -in @('push','workflow_run','workflow_dispatch') })
+$allRuns = @($rawRuns | ConvertFrom-Json)
+$runs = @($allRuns | Where-Object { $_.status -eq 'completed' -and $_.conclusion -eq 'success' -and $_.event -in @('push','workflow_run','workflow_dispatch') })
 New-Item -ItemType Directory -Path $StageRoot -Force | Out-Null
 foreach ($run in $runs) {
     $rawArtifacts = gh api "repos/$Repository/actions/runs/$($run.databaseId)/artifacts"
@@ -40,4 +41,14 @@ foreach ($run in $runs) {
     & (Join-Path $PSScriptRoot 'prepare-windows.ps1') -SourceApp (Join-Path $package.InstallLocation 'app') -BackendDirectory $download -ExpectedCommit $head -OutputDirectory $candidate
     return
 }
-Write-Output "No validated Windows build for async-main $head is available; the current installation is unchanged."
+$matchingRuns = @($allRuns | Where-Object { $_.headSha -ceq $head -and $_.event -in @('push','workflow_dispatch') })
+if ($matchingRuns.Count -gt 0 -and $matchingRuns[0].status -ne 'completed') {
+    Write-Output "Windows build for $head is already running; the current installation is unchanged."
+    return
+}
+if ($matchingRuns.Count -gt 0 -and $matchingRuns[0].conclusion -eq 'failure') {
+    throw "Windows build for $head failed in run $($matchingRuns[0].databaseId); inspect that run before retrying."
+}
+gh workflow run async-windows-build.yml --repo $Repository --ref async-main
+if ($LASTEXITCODE -ne 0) { throw 'No validated Windows build was available and a rebuild could not be requested' }
+Write-Output "Requested a validated Windows build for $head; the current installation is unchanged."

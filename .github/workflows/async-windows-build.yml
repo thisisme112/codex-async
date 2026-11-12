@@ -51,6 +51,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node scripts/desktop/test-background-panel.cjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./scripts/desktop/test-check-and-stage.ps1
       - name: Fetch the previously validated candidate
         id: reuse
         if: github.event_name == 'workflow_run'
@@ -118,4 +119,4 @@ jobs:
           name: async-windows-build
           path: ${{ runner.temp }}/windows-backend/
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 7
