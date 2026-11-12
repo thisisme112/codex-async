@@ -1,5 +1,6 @@
 use crate::McpRefreshReason;
 use crate::agent::LocalAgentControl;
+use codex_mcp::McpServerKey;
 use codex_protocol::ContextWindowId;
 #[path = "compaction_replay_tests.rs"]
 mod compaction_replay_tests;
@@ -2631,6 +2632,25 @@ async fn inter_agent_communication_waits_for_confirmed_delivery_persistence() {
         ]
     );
     let live = session.clone_history().await;
+    let replayed = session
+        .reconstruct_history_from_rollout(&replay_turn, &resumed.history)
+        .await;
+    let delivery_sources = |context: &codex_history::RetainedContext| {
+        context
+            .ordered_entries()
+            .filter_map(|(_, entry)| match entry {
+                codex_history::RetainedContextEntry::AssistantMessage(_) => Some(
+                    context
+                        .source(entry)
+                        .expect("confirmed delivery has a revision"),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let expected = delivery_sources(live.retained_context());
+    assert_eq!(expected.len(), 2);
+    assert_eq!(delivery_sources(&replayed.retained_context), expected);
     let communication = live
         .annotated_items()
         .iter()
@@ -6219,6 +6239,7 @@ async fn compaction_persists_resume_metadata_and_companion_records() {
 
     session.multi_agent_version = std::sync::OnceLock::from(MultiAgentVersion::V2);
     let expected = CompactionResumeMetadata {
+        next_item_ordinal: None,
         rejected_audio_file_ids: Default::default(),
         dynamic_tools: Some(Box::new(DynamicToolsSnapshot {
             thread_id: session.thread_id(),
@@ -6768,7 +6789,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         config.model_provider.clone(),
     );
     let agent_control = LocalAgentControl::default();
-    let item_id_generator = Arc::clone(&agent_control.runtime.item_id_generator);
+    let item_id_generator = Session::new_item_id_generator();
     let exec_policy = Arc::new(ExecPolicyManager::default());
     let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
     let model = get_model_offline_for_tests(config.model.as_deref());
@@ -9113,7 +9134,7 @@ where
         config.model_provider.clone(),
     );
     let agent_control = LocalAgentControl::default();
-    let item_id_generator = Arc::clone(&agent_control.runtime.item_id_generator);
+    let item_id_generator = Session::new_item_id_generator();
     let exec_policy = Arc::new(ExecPolicyManager::default());
     let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
     let model = get_model_offline_for_tests(config.model.as_deref());
@@ -9806,6 +9827,7 @@ async fn mcp_elicitation_reviewer_uses_active_reviewer_and_latest_runtime_policy
 
     let request = codex_mcp::ElicitationReviewRequest {
         server_name: "browser-use".to_string(),
+        server_key: McpServerKey::unscoped("browser-use"),
         request_id: rmcp::model::NumberOrString::Number(7),
         elicitation: codex_rmcp_client::Elicitation::Mcp(
             rmcp::model::ElicitRequestParams::FormElicitationParams {
