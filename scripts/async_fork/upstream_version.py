@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import tomllib
@@ -70,13 +71,38 @@ def stamp_workspace(repo, record):
     if old not in ('0.0.0', new):
         raise ValueError(f'Workspace version {old} conflicts with official version {new}')
     names = set()
-    for member in workspace['members']:
-        for directory in manifest.parent.glob(member):
-            path = directory / 'Cargo.toml'
-            if path.is_file():
-                package = tomllib.loads(path.read_text()).get('package', {})
-                if package.get('version') == {'workspace': True}:
-                    names.add(package['name'])
+    root = manifest.parent.resolve()
+    manifests = {root: tomllib.loads(original)}
+    for folder, directories, files in os.walk(root):
+        directories[:] = [name for name in directories if name not in ('target', '.git')]
+        if 'Cargo.toml' not in files:
+            continue
+        directory = Path(folder)
+        if directory not in manifests:
+            manifests[directory] = tomllib.loads((directory / 'Cargo.toml').read_text())
+        data = manifests[directory]
+        package = data.get('package', {})
+        if package.get('version') != {'workspace': True}:
+            continue
+        # Cargo also adds path dependencies as implicit workspace members.
+        # Find the owning workspace instead of relying on workspace.members.
+        owner = None
+        if 'workspace' in package:
+            owner = (directory / package['workspace']).resolve()
+        else:
+            for parent in (directory, *directory.parents):
+                if not parent.is_relative_to(root):
+                    break
+                candidate = parent / 'Cargo.toml'
+                if candidate.is_file():
+                    if parent not in manifests:
+                        manifests[parent] = tomllib.loads(candidate.read_text())
+                    parent_data = manifests[parent]
+                    if 'workspace' in parent_data:
+                        owner = parent
+                        break
+        if owner == root:
+            names.add(package['name'])
     lock_path = manifest.with_name('Cargo.lock')
     chunks = re.split(r'(?m)(?=^\[\[package\]\]$)', lock_path.read_text())
     for index, chunk in enumerate(chunks):
@@ -86,7 +112,10 @@ def stamp_workspace(repo, record):
         if 'source' not in package and package['name'] in names:
             if package['version'] not in (old, new):
                 raise ValueError('Workspace lockfile version does not match its manifest')
-            chunks[index] = re.sub(r'(?m)^version = "' + re.escape(package['version']) + r'"$', f'version = "{new}"', chunk, count=1)
+            chunks[index] = re.sub(
+                r'(?m)^(version\s*=\s*")' + re.escape(package['version']) + r'("[^\n]*)$',
+                lambda match: match[1] + new + match[2], chunk, count=1,
+            )
     lock = ''.join(chunks)
     for name in names:
         lock = lock.replace(f'"{name} {old}"', f'"{name} {new}"')

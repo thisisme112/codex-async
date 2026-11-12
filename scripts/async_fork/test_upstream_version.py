@@ -99,6 +99,26 @@ checksum = "preserved"
         version.stamp_workspace(self.root, self.record)
         self.assertEqual(first, [p.read_bytes() for p in files])
 
+    def test_implicit_path_member_version_is_stamped(self):
+        rs = self.root / 'codex-rs'
+        (rs / 'tests/support').mkdir(parents=True)
+        (rs / 'tests/support/Cargo.toml').write_text('[package]\nname="implicit_support"\nversion.workspace=true\n')
+        with (rs / 'Cargo.lock').open('a') as output:
+            output.write('[[package]]\nname="implicit_support"\nversion="0.0.0"\n')
+        version.stamp_workspace(self.root, self.record)
+        packages = tomllib.loads((rs / 'Cargo.lock').read_text())['package']
+        self.assertEqual(packages[-1]['version'], self.record['version'])
+
+    def test_separate_nested_workspace_keeps_its_own_version(self):
+        rs = self.root / 'codex-rs'
+        (rs / 'nested').mkdir()
+        (rs / 'nested/Cargo.toml').write_text('[workspace]\n[workspace.package]\nversion="0.0.0"\n[package]\nname="nested"\nversion.workspace=true\n')
+        with (rs / 'Cargo.lock').open('a') as output:
+            output.write('[[package]]\nname="nested"\nversion="0.0.0"\n')
+        version.stamp_workspace(self.root, self.record)
+        packages = tomllib.loads((rs / 'Cargo.lock').read_text())['package']
+        self.assertEqual(packages[-1]['version'], '0.0.0')
+
     def test_unexpected_existing_release_version_is_rejected(self):
         path = self.root / 'codex-rs/Cargo.toml'
         path.write_text(path.read_text().replace('0.0.0', '0.168.0'))
