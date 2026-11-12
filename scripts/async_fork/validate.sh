@@ -87,6 +87,9 @@ set +a
 
 cd "$REPO_ROOT/codex-rs"
 rustup show active-toolchain
+# The dependency cache can restore V8's build metadata without its generated
+# native archive. Re-run just that build script against the verified archive.
+cargo clean --profile dev-small -p v8
 cargo build --locked --profile dev-small -p codex-bwrap -p codex-code-mode-host --bins
 mkdir -p "$CARGO_TARGET_DIR/dev-small/codex-resources"
 cp "$CARGO_TARGET_DIR/dev-small/bwrap" "$CARGO_TARGET_DIR/dev-small/codex-resources/bwrap"

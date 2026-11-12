@@ -45,6 +45,8 @@ PY
   source "$RUNNER_TEMP/package-v8.env"
   set +a
   cd "$REPO_ROOT/codex-rs"
+  # Recreate V8 build outputs after a dependency-cache restore.
+  cargo clean --profile dev-small -p v8
   cargo build --locked --profile dev-small -p codex-bwrap --bin bwrap
   export CODEX_BWRAP_SHA256
   CODEX_BWRAP_SHA256=$(sha256sum "$BINARIES/bwrap" | cut -d ' ' -f1)

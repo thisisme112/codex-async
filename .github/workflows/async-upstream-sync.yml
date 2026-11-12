@@ -2,15 +2,17 @@ name: Async fork upstream sync
 
 on:
   push:
-    branches: [async-main, 'integration/official-*', 'integration/async-*']
+    branches: [async-main, 'integration/official-*', 'integration/async-*', 'integration/desktop-*']
     paths:
       - 'codex-rs/**'
       - 'scripts/async_fork/**'
+      - 'scripts/desktop/**'
       - 'scripts/codex_package/**'
       - 'third_party/v8/**'
       - 'MODULE.bazel'
       - 'MODULE.bazel.lock'
       - '.github/workflows/async-upstream-sync.yml'
+      - '.github/workflows/async-windows-build.yml'
       - '.github/async-fork-resolutions.json'
       - '.github/actions/async-rust-cache/**'
       - 'justfile'
@@ -224,9 +226,89 @@ jobs:
             ${{ runner.temp }}/async-validation.log
           retention-days: 7
 
+  validate_windows:
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true' && !inputs.check_only
+    runs-on: windows-2022
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      CODEX_REPO_ROOT: ${{ github.workspace }}
+      CARGO_HOME: C:\c
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.base }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: async-sync-candidate
+          path: ${{ runner.temp }}/async-sync
+      - name: Select and check the exact candidate
+        shell: pwsh
+        run: |
+          git fetch "$env:RUNNER_TEMP/async-sync/candidate.bundle" refs/async-sync/candidate:refs/async-sync/candidate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git checkout --detach refs/async-sync/candidate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/async_fork/sync.py check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest discover -s scripts/desktop -p 'test_*.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/desktop/test-background-panel.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./scripts/desktop/test-check-and-stage.ps1
+      - name: Resolve verified V8 archive
+        shell: pwsh
+        run: |
+          python -c "import os,sys;sys.path.insert(0,'scripts');from codex_package.targets import TARGET_SPECS;from codex_package.v8 import resolve_codex_v8_cargo_env;values=resolve_codex_v8_cargo_env(TARGET_SPECS['x86_64-pc-windows-msvc']);open(os.environ['GITHUB_ENV'],'a',encoding='utf-8').writelines(f'{k}={v}\n' for k,v in values.items())"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build and test Windows backend
+        working-directory: codex-rs
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python ../scripts/desktop/prepare-v8.py --workspace . --checkout C:/v8src
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --profile dev-small -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner -p codex-windows-sandbox-service --bin codex-windows-sandbox-service
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --profile dev-small -p codex-core --lib tools::code_mode::completion
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & target/dev-small/codex.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Record exact Windows build identity
+        shell: pwsh
+        run: |
+          $sha = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $files = @('codex.exe', 'codex-code-mode-host.exe', 'codex-command-runner.exe', 'codex-windows-sandbox-setup.exe', 'codex-windows-sandbox-service.exe')
+          $hashes = @{}
+          foreach ($name in $files) { $hashes[$name] = (Get-FileHash "codex-rs/target/dev-small/$name" -Algorithm SHA256).Hash.ToLowerInvariant() }
+          @{source_commit=$sha; target='x86_64-pc-windows-msvc'; profile='dev-small'; files=$hashes} | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 'codex-rs/target/dev-small/WINDOWS_BUILD_INFO.json'
+      - name: Keep Windows build for desktop candidates
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: async-windows-candidate
+          path: |
+            codex-rs/target/dev-small/codex.exe
+            codex-rs/target/dev-small/codex-code-mode-host.exe
+            codex-rs/target/dev-small/codex-command-runner.exe
+            codex-rs/target/dev-small/codex-windows-sandbox-setup.exe
+            codex-rs/target/dev-small/codex-windows-sandbox-service.exe
+            codex-rs/target/dev-small/WINDOWS_BUILD_INFO.json
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
-    needs: [prepare, validate]
-    if: needs.validate.result == 'success'
+    needs: [prepare, validate, validate_windows]
+    if: needs.validate.result == 'success' && needs.validate_windows.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

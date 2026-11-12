@@ -1,0 +1,124 @@
+name: Build Windows async backend
+
+on:
+  push:
+    branches: [async-main, 'integration/desktop-*']
+    paths:
+      - 'codex-rs/**'
+      - 'scripts/codex_package/**'
+      - 'scripts/async_fork/**'
+      - 'scripts/desktop/**'
+      - 'third_party/v8/**'
+      - '.github/workflows/async-upstream-sync.yml'
+      - '.github/workflows/async-windows-build.yml'
+  workflow_run:
+    workflows: ['Async fork upstream sync']
+    types: [completed]
+    branches: [async-main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: async-windows-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: windows-2022
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CODEX_REPO_ROOT: ${{ github.workspace }}
+      CARGO_HOME: C:\c
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.sha || 'async-main' }}
+          persist-credentials: false
+      - name: Check desktop patch behavior
+        shell: pwsh
+        run: |
+          python -m unittest discover -s scripts/desktop -p 'test_*.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/desktop/test-background-panel.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./scripts/desktop/test-check-and-stage.ps1
+      - name: Fetch the previously validated candidate
+        id: reuse
+        if: github.event_name == 'workflow_run'
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: async-windows-candidate
+          path: ${{ runner.temp }}/windows-backend
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Select matching validated build
+        id: select
+        shell: pwsh
+        run: |
+          $sha = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $info = Join-Path $env:RUNNER_TEMP 'windows-backend/WINDOWS_BUILD_INFO.json'
+          $matchingArtifact = (Test-Path -LiteralPath $info) -and ((Get-Content -LiteralPath $info -Raw | ConvertFrom-Json).source_commit -ceq $sha)
+          "source_sha=$sha" >> $env:GITHUB_OUTPUT
+          "reuse=$($matchingArtifact.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          if ('${{ github.event_name }}' -eq 'workflow_run' -and -not $matchingArtifact) { "skip=true" >> $env:GITHUB_OUTPUT }
+      - name: Resolve verified V8 archive
+        if: steps.select.outputs.skip != 'true' && steps.select.outputs.reuse != 'true'
+        shell: pwsh
+        run: |
+          python -c "import os,sys;sys.path.insert(0,'scripts');from codex_package.targets import TARGET_SPECS;from codex_package.v8 import resolve_codex_v8_cargo_env;v=resolve_codex_v8_cargo_env(TARGET_SPECS['x86_64-pc-windows-msvc']);open(os.environ['GITHUB_ENV'],'a',encoding='utf-8').writelines(f'{k}={x}\n' for k,x in v.items())"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build and test Windows backend
+        if: steps.select.outputs.skip != 'true' && steps.select.outputs.reuse != 'true'
+        working-directory: codex-rs
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python ../scripts/desktop/prepare-v8.py --workspace . --checkout C:/v8src
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --profile dev-small -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner -p codex-windows-sandbox-service --bin codex-windows-sandbox-service
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --profile dev-small -p codex-core --lib tools::code_mode::completion
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & target/dev-small/codex.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Prepare verified artifact
+        if: steps.select.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ steps.select.outputs.source_sha }}
+          REUSE_BUILD: ${{ steps.select.outputs.reuse }}
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'windows-backend'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $names = @('codex.exe','codex-code-mode-host.exe','codex-command-runner.exe','codex-windows-sandbox-setup.exe','codex-windows-sandbox-service.exe')
+          if ($env:REUSE_BUILD -ne 'true') {
+            foreach ($name in $names) { Copy-Item "codex-rs/target/dev-small/$name" $out }
+          }
+          $hashes = @{}
+          foreach ($name in $names) { $hashes[$name] = (Get-FileHash (Join-Path $out $name) -Algorithm SHA256).Hash.ToLowerInvariant() }
+          if ($env:REUSE_BUILD -eq 'true') {
+            $prior = Get-Content (Join-Path $out 'WINDOWS_BUILD_INFO.json') -Raw | ConvertFrom-Json
+            foreach ($name in $names) { if ($prior.files.$name -cne $hashes[$name]) { throw "Validated artifact mismatch: $name" } }
+          }
+          @{source_commit=$env:SOURCE_SHA;target='x86_64-pc-windows-msvc';profile='dev-small';files=$hashes} | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 (Join-Path $out 'WINDOWS_BUILD_INFO.json')
+      - name: Retain Windows build
+        if: steps.select.outputs.skip != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: async-windows-build
+          path: ${{ runner.temp }}/windows-backend/
+          if-no-files-found: error
+          retention-days: 7
