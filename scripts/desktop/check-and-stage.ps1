@@ -1,12 +1,14 @@
 param(
     [string]$Repository = 'thisisme112/codex-async',
-    [string]$StageRoot = 'E:\Codex\codex-async-staged'
+    [string]$StageRoot = 'E:\Codex\codex-async-staged',
+    [string]$ScriptCommit = ''
 )
 $ErrorActionPreference = 'Stop'
 $headLine = git ls-remote --heads "https://github.com/$Repository.git" refs/heads/async-main
 if ($LASTEXITCODE -ne 0 -or -not $headLine) { throw 'Unable to read the current async-main commit' }
 $head = ($headLine -split '\s+')[0].ToLowerInvariant()
 if ($head -notmatch '^[0-9a-f]{40}$') { throw 'Invalid remote commit ID' }
+if ($ScriptCommit -and $ScriptCommit -cne $head) { throw 'async-main advanced while loading updater scripts; retry on the new commit' }
 $package = Get-AppxPackage -Name OpenAI.Codex | Sort-Object Version -Descending | Select-Object -First 1
 if (-not $package) { throw 'Installed Codex package not found' }
 $candidate = Join-Path $StageRoot ("desktop-$($package.Version)-$($head.Substring(0,12))")

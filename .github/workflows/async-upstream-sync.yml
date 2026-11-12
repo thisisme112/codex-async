@@ -233,6 +233,8 @@ jobs:
       contents: read
     env:
       CODEX_REPO_ROOT: ${{ github.workspace }}
+      CARGO_HOME: C:\c
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
       CARGO_TERM_COLOR: always
@@ -268,6 +270,8 @@ jobs:
         working-directory: codex-rs
         shell: pwsh
         run: |
+          git config --global core.longpaths true
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --locked --profile dev-small -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner -p codex-windows-sandbox-service --bin codex-windows-sandbox-service
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --profile dev-small -p codex-core --lib tools::code_mode::completion
