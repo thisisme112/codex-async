@@ -2,10 +2,11 @@ name: Async fork upstream sync
 
 on:
   push:
-    branches: [async-main, 'integration/official-*', 'integration/async-*']
+    branches: [async-main, 'integration/official-*', 'integration/async-*', 'integration/desktop-*']
     paths:
       - 'codex-rs/**'
       - 'scripts/async_fork/**'
+      - 'scripts/desktop/**'
       - 'scripts/codex_package/**'
       - 'third_party/v8/**'
       - 'MODULE.bazel'
