@@ -31,6 +31,7 @@ jobs:
       contents: read
       actions: read
     env:
+      CODEX_REPO_ROOT: ${{ github.workspace }}
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
       CARGO_TERM_COLOR: always
