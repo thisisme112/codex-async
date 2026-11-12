@@ -12,6 +12,7 @@ on:
       - 'MODULE.bazel'
       - 'MODULE.bazel.lock'
       - '.github/workflows/async-upstream-sync.yml'
+      - '.github/workflows/async-windows-build.yml'
       - '.github/async-fork-resolutions.json'
       - '.github/actions/async-rust-cache/**'
       - 'justfile'

@@ -8,6 +8,7 @@ on:
       - 'scripts/codex_package/**'
       - 'scripts/desktop/**'
       - 'third_party/v8/**'
+      - '.github/workflows/async-upstream-sync.yml'
       - '.github/workflows/async-windows-build.yml'
   workflow_run:
     workflows: ['Async fork upstream sync']
