@@ -1027,7 +1027,7 @@ pub async fn run_main_with_transport_options(
         let initialize_notification_sender = outgoing_message_sender.clone();
         let outbound_control_tx = outbound_control_tx;
         let (startup_warnings_tx, mut startup_warnings_rx) = mpsc::unbounded_channel();
-        let mut processor = MessageProcessor::new(MessageProcessorArgs {
+        let processor_args = MessageProcessorArgs {
             cloud_skill_provider,
             outgoing: outgoing_message_sender,
             analytics_events_client,
@@ -1056,7 +1056,15 @@ pub async fn run_main_with_transport_options(
                 PluginStartupTasks::Start
             )
             .then_some(plugin_startup_config),
-        });
+        };
+        let mut processor = if single_client_mode {
+            MessageProcessor::new_with_completion_wake(
+                processor_args,
+                in_process::CompletionWake::Interactive,
+            )
+        } else {
+            MessageProcessor::new(processor_args)
+        };
         processor.remote_control_processor.daemon_settings_file = daemon_settings_file;
         let processor = Arc::new(processor);
         let mut thread_created_rx = processor.thread_created_receiver();
