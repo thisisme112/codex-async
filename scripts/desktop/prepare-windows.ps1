@@ -32,7 +32,11 @@ if ($LASTEXITCODE -gt 7) { throw "Desktop copy failed: robocopy exit $LASTEXITCO
 python (Join-Path $PSScriptRoot 'patch-asar.py') --app $candidateApp
 if ($LASTEXITCODE -ne 0) { throw 'Desktop patch is incompatible; keep the current version' }
 $resources = Join-Path $candidateApp 'resources'
-foreach ($name in $names) { Copy-Item -LiteralPath (Join-Path $backend $name) -Destination (Join-Path $resources $name) -Force }
+foreach ($name in $names) {
+    $destination = Join-Path $resources $name
+    Copy-Item -LiteralPath (Join-Path $backend $name) -Destination $destination -Force
+    if ((Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant() -cne $build.files.$name) { throw "Candidate binary checksum mismatch: $name" }
+}
 & (Join-Path $resources 'codex.exe') --version
 if ($LASTEXITCODE -ne 0) { throw 'Candidate backend did not start' }
 Copy-Item -LiteralPath $manifestPath -Destination (Join-Path $output 'WINDOWS_BUILD_INFO.json')
