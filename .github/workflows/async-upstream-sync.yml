@@ -2,7 +2,7 @@ name: Async fork upstream sync
 
 on:
   push:
-    branches: ['integration/official-*', 'integration/async-*']
+    branches: [async-main, 'integration/official-*', 'integration/async-*']
     paths:
       - 'codex-rs/**'
       - 'scripts/async_fork/**'
@@ -11,6 +11,7 @@ on:
       - 'MODULE.bazel'
       - 'MODULE.bazel.lock'
       - '.github/workflows/async-upstream-sync.yml'
+      - '.github/async-fork-resolutions.json'
       - '.github/actions/async-rust-cache/**'
       - 'justfile'
   schedule:
@@ -35,7 +36,7 @@ concurrency:
 
 jobs:
   prepare:
-    if: github.event_name != 'push' && !inputs.verify_only
+    if: ${{ !inputs.verify_only && (github.event_name != 'push' || github.ref == 'refs/heads/async-main') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     outputs:
@@ -142,7 +143,7 @@ jobs:
           retention-days: 7
 
   verify_manual_merge:
-    if: github.event_name == 'push' || (inputs.verify_only && !inputs.check_only)
+    if: (github.event_name == 'push' && github.ref != 'refs/heads/async-main') || (inputs.verify_only && !inputs.check_only)
     runs-on: ${{ matrix.suite == 'cli' && 'ubuntu-22.04' || 'ubuntu-24.04' }}
     timeout-minutes: 180
     strategy:

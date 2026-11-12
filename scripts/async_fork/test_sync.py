@@ -111,6 +111,51 @@ class SyncTests(unittest.TestCase):
         )
         sync.git(self.repo, "bundle", "verify", str(self.output / "candidate.bundle"))
 
+    def reviewed_conflict(self):
+        self.write('source.txt', 'fork source\n')
+        self.commit('fork source change')
+        ours = sync.oid(self.repo, 'HEAD')
+        upstream = self.upstream()
+        record = {
+            'path': 'source.txt',
+            'base_blob': sync.git(self.repo, 'rev-parse', f'{self.base}:source.txt').stdout.strip(),
+            'ours_blob': sync.git(self.repo, 'rev-parse', f'{ours}:source.txt').stdout.strip(),
+            'theirs_blob': sync.git(self.repo, 'rev-parse', f'{upstream}:source.txt').stdout.strip(),
+            'ours': 'fork source\n',
+            'theirs': 'official v2\n',
+            'resolved': 'official v2 with fork source\n',
+        }
+        return upstream, record
+
+    def test_reviewed_exact_conflict_is_resolved_without_changing_usable_checkout(self):
+        upstream, record = self.reviewed_conflict()
+        self.write(sync.RESOLUTIONS, json.dumps([record]))
+        self.commit('record reviewed conflict')
+        base = sync.oid(self.repo, 'HEAD')
+        result = sync.prepare(self.repo, self.output, upstream)
+        self.assertEqual(result['status'], 'candidate')
+        self.assertEqual(result['resolved_conflicts'], ['source.txt'])
+        self.assertEqual(sync.oid(self.repo, 'HEAD'), base)
+        self.assertEqual(sync.git(self.repo, 'show', f'{result["candidate"]}:source.txt').stdout, record['resolved'])
+        self.assertEqual(sync.git(self.repo, 'status', '--porcelain').stdout, '')
+
+    def test_unreviewed_blob_version_still_blocks_merge(self):
+        upstream, record = self.reviewed_conflict()
+        record['theirs_blob'] = '0' * 40
+        self.write(sync.RESOLUTIONS, json.dumps([record]))
+        self.commit('record different version')
+        result = sync.prepare(self.repo, self.output, upstream)
+        self.assertEqual(result['status'], 'conflict')
+        self.assertEqual(result['conflicts'], ['source.txt'])
+
+    def test_unreviewed_conflict_text_still_blocks_merge(self):
+        upstream, record = self.reviewed_conflict()
+        record['ours'] = 'unreviewed source\n'
+        self.write(sync.RESOLUTIONS, json.dumps([record]))
+        self.commit('record different conflict text')
+        result = sync.prepare(self.repo, self.output, upstream)
+        self.assertEqual(result['status'], 'conflict')
+        self.assertEqual(result['conflicts'], ['source.txt'])
     def test_conflict_keeps_usable_branch_and_records_paths(self):
         self.write("source.txt", "our incompatible edit\n")
         self.commit("local source edit")

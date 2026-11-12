@@ -12,6 +12,7 @@ from pathlib import Path
 STATE = ".github/async-fork-state.json"
 CONFIG = ".github/async-fork.json"
 WORKFLOW = ".github/workflows/async-upstream-sync.yml"
+RESOLUTIONS = ".github/async-fork-resolutions.json"
 REF_CANDIDATE = "refs/async-sync/candidate"
 REF_SOURCE = "refs/async-sync/source"
 REQUIRED = {
@@ -99,6 +100,9 @@ def report(output, value):
     if value.get("conflicts"):
         lines += ["", "Conflicts (usable branch was not changed):", ""]
         lines += [f"- `{name}`" for name in value["conflicts"][:100]]
+    if value.get("resolved_conflicts"):
+        lines += ["", "Exact reviewed conflict resolutions applied:", ""]
+        lines += [f"- `{name}`" for name in value["resolved_conflicts"]]
     text = "\n".join(lines) + "\n"
     (output / "report.md").write_text(text)
     if path := os.environ.get("GITHUB_STEP_SUMMARY"):
@@ -110,6 +114,49 @@ def report(output, value):
                 f"changed={'true' if value['status'] == 'candidate' else 'false'}\n"
             )
             stream.write(f"base={value.get('base', '')}\n")
+
+
+def resolve_reviewed_conflicts(repo):
+    path = repo / RESOLUTIONS
+    if not path.is_file():
+        return []
+    records = json.loads(path.read_text())
+    conflicts = set(
+        git(repo, "diff", "--name-only", "--diff-filter=U", "-z").stdout.split("\0")
+    )
+    resolved = []
+    pattern = re.compile(
+        r"^<<<<<<<[^\n]*\n(.*?)^=======\n(.*?)^>>>>>>>[^\n]*(?:\n|$)", re.M | re.S
+    )
+    for record in records:
+        name = record["path"]
+        if name not in conflicts:
+            continue
+        # Resolve only the exact reviewed base/ours/upstream versions. Any new
+        # upstream change or unexpected conflict still requires manual review.
+        versions = [
+            git(repo, "rev-parse", f":{stage}:{name}", check=False)
+            for stage in (1, 2, 3)
+        ]
+        expected = [record[key] for key in ("base_blob", "ours_blob", "theirs_blob")]
+        if any(version.returncode for version in versions) or [
+            version.stdout.strip() for version in versions
+        ] != expected:
+            continue
+        source = (repo / name).read_text()
+        matches = list(pattern.finditer(source))
+        if len(matches) != 1:
+            continue
+        match = matches[0]
+        if (match[1], match[2]) != (record["ours"], record["theirs"]):
+            continue
+        merged = source[:match.start()] + record["resolved"] + source[match.end():]
+        if pattern.search(merged):
+            continue
+        (repo / name).write_text(merged)
+        git(repo, "add", "--", name)
+        resolved.append(name)
+    return resolved
 
 
 def prepare(repo, output, upstream_ref=None):
@@ -170,19 +217,20 @@ def prepare(repo, output, upstream_ref=None):
         git(repo, "worktree", "add", "--detach", str(worktree), base)
         try:
             merge = git(
-                worktree, "merge", "--no-commit", "--no-ff", source, check=False
+                worktree, "-c", "merge.conflictStyle=merge", "merge", "--no-commit", "--no-ff", source, check=False
             )
             if merge.returncode:
+                resolved = resolve_reviewed_conflicts(worktree)
+                if resolved:
+                    value["resolved_conflicts"] = resolved
                 conflicts = git(
                     worktree, "diff", "--name-only", "--diff-filter=U", "-z"
                 ).stdout
-                value.update(
-                    status="conflict",
-                    conflicts=[name for name in conflicts.split("\0") if name],
-                    error=merge.stderr[-2000:],
-                )
-                report(output, value)
-                return value
+                remaining = [name for name in conflicts.split("\0") if name]
+                if remaining or not resolved:
+                    value.update(status="conflict", conflicts=remaining, error=merge.stderr[-2000:])
+                    report(output, value)
+                    return value
             changed = git(
                 worktree, "diff", "--cached", "--name-only", "-z", base
             ).stdout.split("\0")
@@ -191,7 +239,7 @@ def prepare(repo, output, upstream_ref=None):
                 for name in changed
                 if name
                 and (
-                    name.startswith("scripts/async_fork/") or name in [CONFIG, WORKFLOW]
+                    name.startswith("scripts/async_fork/") or name in [CONFIG, WORKFLOW, RESOLUTIONS]
                 )
             ]
             if protected:
@@ -302,6 +350,7 @@ def main():
         if args.operation == "prepare":
             value = prepare(repo, output, args.upstream_ref)
             if value["status"] == "conflict":
+                print("Manual upstream merge required: " + ", ".join(value.get("conflicts", [])), flush=True)
                 raise SystemExit(2)
         else:
             promote(repo, output)

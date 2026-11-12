@@ -1,0 +1,13 @@
+[
+  {
+    "path": "codex-rs/app-server/src/in_process.rs",
+    "reason": "Preserve the explicit completion-wake wrapper while accepting upstream initialized acknowledgement semantics.",
+    "upstream_commit": "88c58562580aa4abe2da6ce4d7676bf171682230",
+    "base_blob": "0b1859f14a1d2d5c69214da445b0c0cd24ca5911",
+    "ours_blob": "4116d922b5cfb797316ab8af5c4aa305bc9e7ddc",
+    "theirs_blob": "a0d03a9de1e2363e11c9ffa6cce8cfa9c86ce4ae",
+    "ours": "/// This function sends `initialize` followed by `initialized` before returning\n/// the handle, so callers receive a ready-to-use runtime. If initialize fails,\n/// the runtime is shut down and an `InvalidData` error is returned.\npub async fn start(args: InProcessStartArgs) -> IoResult<InProcessClientHandle> {\n    start_with_completion_wake(args, CompletionWake::Disabled).await\n}\n\n/// Host capability for interactive clients that remain connected between turns.\n#[derive(Clone, Copy)]\npub enum CompletionWake {\n    Disabled,\n    Interactive,\n}\n\n/// Starts an embedded runtime with an explicit client completion-wake capability.\n/// This does not activate Code Mode tools; provider negotiation is still required.\npub async fn start_with_completion_wake(\n    mut args: InProcessStartArgs,\n    completion_wake: CompletionWake,\n) -> IoResult<InProcessClientHandle> {\n",
+    "theirs": "/// This function waits for `initialize` and `initialized` to be processed before\n/// returning the handle, so callers receive a ready-to-use runtime. Rejected\n/// initialization shuts down the runtime and returns an `InvalidData` error.\n/// Transport failures while processing `initialized` also shut down the runtime.\npub async fn start(mut args: InProcessStartArgs) -> IoResult<InProcessClientHandle> {\n",
+    "resolved": "/// This function waits for `initialize` and `initialized` to be processed before\n/// returning the handle, so callers receive a ready-to-use runtime. Rejected\n/// initialization shuts down the runtime and returns an `InvalidData` error.\n/// Transport failures while processing `initialized` also shut down the runtime.\npub async fn start(args: InProcessStartArgs) -> IoResult<InProcessClientHandle> {\n    start_with_completion_wake(args, CompletionWake::Disabled).await\n}\n\n/// Host capability for interactive clients that remain connected between turns.\n#[derive(Clone, Copy)]\npub enum CompletionWake {\n    Disabled,\n    Interactive,\n}\n\n/// Starts an embedded runtime with an explicit client completion-wake capability.\n/// This does not activate Code Mode tools; provider negotiation is still required.\npub async fn start_with_completion_wake(\n    mut args: InProcessStartArgs,\n    completion_wake: CompletionWake,\n) -> IoResult<InProcessClientHandle> {\n"
+  }
+]

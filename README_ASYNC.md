@@ -4,7 +4,7 @@
 
 可用分支为 **async-main**。最初的官方 `main` 保留为 fork 创建时的参考快照，日常请使用默认分支 `async-main`。
 
-首次官方更新的 39 个文件冲突已处理，官方基线为 `e58bf8f5233b51e7cd1679d947e3028c1ed91b06`；各组验证记录见 [UPSTREAM_STATUS.md](UPSTREAM_STATUS.md)。每次合并须通过相关测试和构建后才能推进可用分支。
+首次官方更新的 39 个文件冲突已处理，首次适配基线为 `e58bf8f5233b51e7cd1679d947e3028c1ed91b06`；当前已同步提交以 `.github/async-fork-state.json` 为准，各组验证记录见 [UPSTREAM_STATUS.md](UPSTREAM_STATUS.md)。每次合并须通过相关测试和构建后才能推进可用分支。
 
 ## 自动同步
 
@@ -13,6 +13,8 @@
 流程先在独立临时工作树合并。没有冲突、异步功能契约保留后，才构建 Linux CLI 并运行相关核心单元测试与异步集成测试。全部通过才以原子、非强制推送更新 `async-main` 和 `upstream/source`；验证期间有人更新可用分支，会拒绝覆盖。
 
 冲突、功能契约变化、编译或测试失败都会阻止更新。Actions 的 Summary 和 `async-sync-report` 下载项会留下结果。遇到架构变化仍需要人工适配，不能保证所有官方更新都能自动合并。
+
+已人工审阅的冲突可记录到 `.github/async-fork-resolutions.json`：只有共同基线、我方、官方三个文件 blob 和冲突文本全部一致，才使用对应的合并结果；其他版本继续停止并报告。向 `async-main` 推送同步修复后会自动重试受保护的合并、验证和发布流程。
 
 官方的 `.github/workflows/` 入口不随源代码合并，本仓库只运行自己的同步工作流，避免触发官方整套 CI。官方其他源代码、构建脚本、测试和本地 action 均保留。`upstream/source` 是排除这些工作流入口后的官方源代码快照，提交历史仍关联真实官方提交。
 
