@@ -458,6 +458,26 @@ impl InputQueue {
             .send_replace(activity.unwrap_or(InputQueueActivity::Steer));
     }
 
+    /// Atomically admit a child result only before the final-answer boundary.
+    pub(super) async fn try_inject_child_result(
+        &self,
+        turn_state: &Mutex<TurnState>,
+        item: codex_history::ResponseItemEnvelope,
+    ) -> bool {
+        let mut state = turn_state.lock().await;
+        if !state.accepts_mailbox_delivery_for_current_turn() {
+            return false;
+        }
+        let input = TurnInput::ResponseItem(item);
+        let activity = input.wait_activity();
+        state.pending_input.notified_activity =
+            state.pending_input.notified_activity.max(Some(activity));
+        state.pending_input.items.push(input);
+        drop(state);
+        self.activity_tx.send_replace(activity);
+        true
+    }
+
     pub(crate) async fn extend_pending_input_for_turn_state(
         &self,
         turn_state: &Mutex<TurnState>,

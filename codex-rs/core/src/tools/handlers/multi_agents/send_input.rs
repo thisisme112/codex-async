@@ -94,8 +94,12 @@ impl Handler {
                 }),
             )
             .await;
+        let completions = &session.services.code_mode_service.completions;
+        let completion_token = completions.new_agent_token();
+        let previous_token = completion_token
+            .and_then(|token| completions.replace_agent_child(receiver_thread_id, token));
         let result = local_agent_control
-            .send_input(
+            .send_input_with_kind(
                 receiver_thread_id,
                 input_items,
                 crate::TurnStartOptions {
@@ -131,7 +135,30 @@ impl Handler {
                 }),
             )
             .await;
-        let submission_id = result?;
+        let (submission_id, child_turn_id) = match result {
+            Ok(id) => id,
+            Err(error) => {
+                if let (Some(token), Some(previous)) = (completion_token, previous_token) {
+                    completions.restore_agent_child(receiver_thread_id, token, previous);
+                }
+                return Err(error);
+            }
+        };
+        if let Some(token) = completion_token {
+            let watching = local_agent_control
+                .watch_followup_completion(
+                    receiver_thread_id,
+                    session.thread_id,
+                    token,
+                    Some(child_turn_id),
+                )
+                .await;
+            if !watching {
+                if let Some(previous) = previous_token {
+                    completions.restore_agent_child(receiver_thread_id, token, previous);
+                }
+            }
+        }
 
         Ok(boxed_tool_output(SendInputResult { submission_id }))
     }

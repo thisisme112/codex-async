@@ -88,6 +88,47 @@ impl Session {
         }
     }
 
+    /// Serialize child-result delivery with active-turn admission. Stale results
+    /// remain in the child session and never wake a different user task.
+    pub(crate) async fn deliver_or_wake_subagent(
+        &self,
+        item: ResponseItem,
+        agent: codex_protocol::ThreadId,
+        token: (u64, uuid::Uuid),
+    ) {
+        let mut active = self.active_turn.lock().await;
+        let completions = &self.services.code_mode_service.completions;
+        if !completions.agent_child_matches(agent, token) {
+            return;
+        }
+        if let Some(turn) = active.as_mut().filter(|turn| turn.finishing.is_none())
+            && self
+                .input_queue
+                .try_inject_child_result(
+                    turn.turn_state.as_ref(),
+                    ResponseItemEnvelope::new(item.clone()),
+                )
+                .await
+        {
+            completions.retire_agent_child(agent, token);
+            return;
+        }
+        if completions.queue_agent_completion(agent, token) {
+            return;
+        }
+        drop(active);
+        self.inject_no_new_turn(vec![item], None).await;
+    }
+
+    pub(crate) fn last_terminal_agent_status(
+        &self,
+    ) -> Option<(String, codex_protocol::protocol::AgentStatus)> {
+        self.last_terminal_agent_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Injects hook context into the running turn atomically.
     #[expect(
         clippy::await_holding_invalid_type,

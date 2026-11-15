@@ -194,3 +194,189 @@ fn notices_are_bounded_and_admission_revalidates_suppression_and_consumption() {
     }
     assert_eq!(delivered, CAPACITY);
 }
+
+#[test]
+fn agent_wakes_are_coalesced_deduplicated_and_scoped_to_user_input() {
+    let registry = registry();
+    let a = codex_protocol::ThreadId::new();
+    let b = codex_protocol::ThreadId::new();
+    let generation = registry.new_agent_token().unwrap();
+    registry.register_agent_child(a, generation);
+    registry.register_agent_child(b, generation);
+    assert!(registry.queue_agent_completion(a, generation));
+    assert!(registry.queue_agent_completion(a, generation));
+    assert!(registry.queue_agent_completion(b, generation));
+    let (trigger, notice) = registry.batch().expect("agent completion batch");
+    let text = match notice {
+        ResponseItem::Message { content, .. } => format!("{content:?}"),
+        _ => panic!("message"),
+    };
+    assert!(text.contains(&a.to_string()) && text.contains(&b.to_string()));
+    assert!(registry.permits(&trigger));
+    registry.delivered();
+    assert!(registry.batch().is_none());
+    registry.register_agent_child(a, generation);
+    assert!(registry.queue_agent_completion(a, generation));
+    let (trigger, _) = registry.batch().unwrap();
+    registry.invalidate_agent_origins();
+    assert!(!registry.permits(&trigger));
+    assert!(registry.batch().is_none());
+    assert!(!registry.queue_agent_completion(b, generation));
+}
+
+#[test]
+fn interrupt_suppresses_agent_wakes_and_prevents_stale_resume() {
+    let registry = registry();
+    let a = codex_protocol::ThreadId::new();
+    let generation = registry.new_agent_token().unwrap();
+    registry.register_agent_child(a, generation);
+    assert!(registry.queue_agent_completion(a, generation));
+    let (trigger, _) = registry.batch().unwrap();
+    registry.suppress();
+    assert!(!registry.permits(&trigger));
+    registry.resume();
+    assert!(registry.batch().is_none());
+    assert!(!registry.queue_agent_completion(a, generation));
+}
+
+#[tokio::test]
+async fn agent_result_respects_active_idle_and_final_answer_boundary() {
+    use crate::session::tests::make_session_and_context;
+    use crate::state::{ActiveTurn, MailboxDeliveryPhase};
+    let (session, _) = make_session_and_context().await;
+    let registry = &session.services.code_mode_service.completions;
+    registry.state().enabled = true;
+    let generation = registry.new_agent_token().unwrap();
+    let first = codex_protocol::ThreadId::new();
+    let second = codex_protocol::ThreadId::new();
+    let third = codex_protocol::ThreadId::new();
+    for child in [first, second, third] {
+        registry.register_agent_child(child, generation);
+    }
+    let item = || {
+        ContextualUserFragment::into(crate::context::SubagentNotification::new(
+            "child",
+            codex_protocol::protocol::AgentStatus::Completed(Some("done".into())),
+        ))
+    };
+    session
+        .deliver_or_wake_subagent(item(), first, generation)
+        .await;
+    let (_, notice) = registry.batch().expect("idle wakes");
+    assert!(format!("{notice:?}").contains(&first.to_string()));
+    registry.delivered();
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    session
+        .deliver_or_wake_subagent(item(), second, generation)
+        .await;
+    assert!(
+        registry.batch().is_none(),
+        "busy parent handles result inside current turn"
+    );
+    {
+        let active = session.active_turn.lock().await;
+        active
+            .as_ref()
+            .unwrap()
+            .turn_state
+            .lock()
+            .await
+            .set_mailbox_delivery_phase(MailboxDeliveryPhase::NextTurn);
+    }
+    session
+        .deliver_or_wake_subagent(item(), third, generation)
+        .await;
+    let (_, notice) = registry
+        .batch()
+        .expect("result after final answer must wake after idle");
+    assert!(format!("{notice:?}").contains(&third.to_string()));
+}
+
+#[test]
+fn a_new_user_generation_cannot_reuse_an_old_child_registration() {
+    let registry = registry();
+    let old = codex_protocol::ThreadId::new();
+    let new = codex_protocol::ThreadId::new();
+    let prior = registry.new_agent_token().unwrap();
+    registry.register_agent_child(old, prior);
+    registry.invalidate_agent_origins();
+    let current = registry.new_agent_token().unwrap();
+    registry.register_agent_child(new, current);
+    assert!(!registry.agent_child_matches(old, prior));
+    assert!(!registry.queue_agent_completion(old, prior));
+    assert!(registry.queue_agent_completion(new, current));
+}
+
+#[test]
+fn followup_dispatch_supersedes_old_completion_and_rolls_back_on_failure() {
+    let registry = registry();
+    let child = codex_protocol::ThreadId::new();
+    let old = registry.new_agent_token().unwrap();
+    registry.register_agent_child(child, old);
+    assert!(registry.queue_agent_completion(child, old));
+    let (old_trigger, _) = registry.batch().unwrap();
+    let next = registry.new_agent_token().unwrap();
+    let previous = registry
+        .replace_agent_child(child, next)
+        .expect("reserve follow-up");
+    assert!(!registry.permits(&old_trigger));
+    assert!(!registry.queue_agent_completion(child, old));
+    registry.restore_agent_child(child, next, previous);
+    assert!(registry.agent_child_matches(child, old));
+    assert!(
+        registry.batch().is_some(),
+        "failed follow-up restores the earlier result"
+    );
+    let next = registry.new_agent_token().unwrap();
+    registry
+        .replace_agent_child(child, next)
+        .expect("reserve follow-up");
+    assert!(!registry.queue_agent_completion(child, old));
+    assert!(registry.queue_agent_completion(child, next));
+}
+
+#[test]
+fn explicit_recheck_rearms_once_after_user_turn_without_duplicate_watchers() {
+    let registry = registry();
+    let child = codex_protocol::ThreadId::new();
+    let old = registry.new_agent_token().unwrap();
+    registry.register_agent_child(child, old);
+    assert!(registry.register_untracked_agent(child).is_none());
+    registry.invalidate_agent_origins();
+    let renewed = registry
+        .register_untracked_agent(child)
+        .expect("explicitly rearm");
+    assert!(!registry.agent_child_matches(child, old));
+    assert!(registry.agent_child_matches(child, renewed));
+    assert!(registry.register_untracked_agent(child).is_none());
+}
+
+#[tokio::test]
+async fn terminal_status_is_correlated_with_its_completed_turn() {
+    use crate::session::tests::make_session_and_context;
+    use codex_protocol::protocol::{AgentStatus, EventMsg, TurnCompleteEvent};
+    let (session, turn) = make_session_and_context().await;
+    assert!(session.last_terminal_agent_status().is_none());
+    session
+        .send_event(
+            &turn,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                root_turn_id: None,
+                turn_id: turn.sub_id.clone(),
+                last_agent_message: Some("first-result".to_string()),
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+    assert_eq!(
+        session.last_terminal_agent_status(),
+        Some((
+            turn.sub_id.clone(),
+            AgentStatus::Completed(Some("first-result".to_string()))
+        ))
+    );
+}

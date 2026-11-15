@@ -1289,3 +1289,63 @@ async fn scored_prompt_keeps_its_submission_item_id() {
     assert_eq!(ui_ids.len(), 3);
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
+
+#[tokio::test]
+async fn steering_active_task_preserves_subagent_wake_registration() {
+    let (session, turn, _rx) = make_session_and_context_with_rx().await;
+    let completions = &session.services.code_mode_service.completions;
+    completions.enable_for_test();
+    let child = codex_protocol::ThreadId::new();
+    let token = completions.new_agent_token().unwrap();
+    completions.register_agent_child(child, token);
+    session
+        .spawn_task(
+            Arc::clone(&turn),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: false,
+            },
+        )
+        .await;
+    let input = vec![UserInput::Text {
+        text: "How is the same task going?".to_string(),
+        text_elements: Vec::new(),
+    }];
+    let result = handle(
+        &session,
+        TurnInputRequest::user_input(input),
+        TurnInputMode::StartOrSteer,
+        "steer-submission".to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, TurnInputSubmission::Steered { .. }));
+    assert!(completions.agent_child_matches(child, token));
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn starting_a_new_user_turn_invalidates_old_subagent_wake_registration() {
+    let (session, _turn, _rx) = make_session_and_context_with_rx().await;
+    let completions = &session.services.code_mode_service.completions;
+    completions.enable_for_test();
+    let child = codex_protocol::ThreadId::new();
+    let token = completions.new_agent_token().unwrap();
+    completions.register_agent_child(child, token);
+    let input = vec![UserInput::Text {
+        text: "Start an unrelated task.".to_string(),
+        text_elements: Vec::new(),
+    }];
+    let result = handle(
+        &session,
+        TurnInputRequest::user_input(input),
+        TurnInputMode::StartOrSteer,
+        "new-user-submission".to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, TurnInputSubmission::Started { .. }));
+    assert!(!completions.agent_child_matches(child, token));
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}

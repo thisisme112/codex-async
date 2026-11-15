@@ -204,6 +204,19 @@ impl Handler {
         };
 
         let timed_out = statuses.is_empty();
+        if timed_out {
+            let completions = &session.services.code_mode_service.completions;
+            for id in &receiver_thread_ids {
+                if let Some(token) = completions.register_untracked_agent(*id) {
+                    if !local_agent_control
+                        .watch_followup_completion(*id, session.thread_id, token, None)
+                        .await
+                    {
+                        completions.retire_agent_child(*id, token);
+                    }
+                }
+            }
+        }
         let statuses_by_id = statuses.clone().into_iter().collect::<HashMap<_, _>>();
         let result = WaitAgentResult {
             status: statuses

@@ -989,6 +989,17 @@ impl LocalAgentControl {
             .map_err(CodexErr::InvalidRequest)?
             .or(Some(inherited));
         }
+        let completion_token = options.completion_token;
+        if let (Some(parent_id), Some(token)) = (options.parent_thread_id, completion_token)
+            && let Ok(parent) = state.get_thread(parent_id).await
+        {
+            parent
+                .session
+                .services
+                .code_mode_service
+                .completions
+                .register_agent_child(new_thread.thread_id, token);
+        }
         let start_options = TurnStartOptions {
             parent_turn_id: options.parent_turn_id,
             turn_trigger: options.turn_trigger,
@@ -1044,6 +1055,8 @@ impl LocalAgentControl {
                 notification_source,
                 child_reference,
                 agent_metadata.agent_path.clone(),
+                completion_token,
+                None,
             );
         }
 
@@ -1260,6 +1273,8 @@ impl LocalAgentControl {
                 Some(notification_source.clone()),
                 child_reference,
                 agent_metadata.agent_path.clone(),
+                None,
+                None,
             );
         }
         let _ = self

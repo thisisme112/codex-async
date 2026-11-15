@@ -1005,11 +1005,21 @@ impl CodexThread {
         self.session.token_usage_info().await
     }
 
-    /// Records a context fragment without creating a new user turn boundary.
-    pub(crate) async fn inject_fragment_without_turn(&self, fragment: impl ContextualUserFragment) {
+    /// Route a child result to its owning live task, or schedule an idle wake.
+    pub(crate) async fn notify_subagent_result(
+        &self,
+        fragment: impl ContextualUserFragment,
+        agent: ThreadId,
+        token: Option<(u64, uuid::Uuid)>,
+    ) {
         let item = ContextualUserFragment::into(fragment);
+        let completions = &self.session.services.code_mode_service.completions;
+        if !completions.is_enabled() || token.is_none() {
+            self.session.inject_no_new_turn(vec![item], None).await;
+            return;
+        }
         self.session
-            .inject_no_new_turn(vec![item], /*current_turn_context*/ None)
+            .deliver_or_wake_subagent(item, agent, token.unwrap())
             .await;
     }
 

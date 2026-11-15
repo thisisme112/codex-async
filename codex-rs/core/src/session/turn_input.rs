@@ -455,6 +455,8 @@ async fn start_or_steer(
         start,
     )
     .await?;
+    let new_user_turn =
+        matches!(&input, SubmittedTurnInput::UserInput { .. }) && has_explicit_input;
     let sender_messages = capture_sender_user_messages(session, &mut input).await;
     match session
         .steer_input(
@@ -477,6 +479,14 @@ async fn start_or_steer(
             })
         }
         Err(NotSubmittedReason::NoActiveTurn) => {
+            if new_user_turn {
+                let _active = session.active_turn.lock().await;
+                session
+                    .services
+                    .code_mode_service
+                    .completions
+                    .invalidate_agent_origins();
+            }
             // MAv1 sends explicit input to spawned agents as part of an existing
             // parent's work. Client RPCs are gated separately by the host.
             let is_delegated_input = settings.start_options.parent_turn_id.is_some()
@@ -632,6 +642,13 @@ async fn start_if_idle(
         // stop cannot create a loop of new turns that never reach the provider.
         if kind != TurnStartKind::User {
             session.check_rollout_budget()?;
+        }
+        if kind == TurnStartKind::User {
+            session
+                .services
+                .code_mode_service
+                .completions
+                .invalidate_agent_origins();
         }
         let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
         Arc::clone(&active_turn.turn_state)

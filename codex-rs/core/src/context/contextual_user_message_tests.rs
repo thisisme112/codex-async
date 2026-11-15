@@ -182,3 +182,12 @@ fn detects_hook_prompt_fragment_and_roundtrips_escaping() {
     );
     assert!(!text.contains("&quot;waves&quot; & <tides>"));
 }
+
+#[test]
+fn subagent_completion_is_runtime_context_not_user_authorization() {
+    let fragment =
+        crate::context::SubagentCompletion(vec![codex_protocol::ThreadId::new().to_string()]);
+    let item = ContextualUserFragment::into(fragment);
+    assert!(is_guardian_context_message(&item));
+    assert!(!is_user_authorization_message(&item));
+}

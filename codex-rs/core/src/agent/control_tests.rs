@@ -4735,6 +4735,8 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
         })),
         tester_path.to_string(),
         Some(tester_path.clone()),
+        None,
+        None,
     );
     let tester_turn = tester_thread.session.new_default_turn().await;
     tester_thread
@@ -4820,6 +4822,8 @@ async fn completion_watcher_notifies_parent_when_child_is_missing() {
         })),
         child_thread_id.to_string(),
         /*child_agent_path*/ None,
+        None,
+        None,
     );
 
     assert_eq!(wait_for_subagent_notification(&parent_thread).await, true);
@@ -4855,6 +4859,8 @@ async fn completion_watcher_does_not_hide_tree_shutdown_failure() {
         })),
         child_thread_id.to_string(),
         /*child_agent_path*/ None,
+        None,
+        None,
     );
     harness.control.runtime.record_shutdown_failure(
         crate::thread_manager::AgentTreeShutdownFailure::operation_failed(

@@ -13,6 +13,7 @@ use std::sync::MutexGuard;
 
 use codex_code_mode::CellId;
 use codex_code_mode::CompletionReadySupport;
+use codex_protocol::ThreadId;
 use codex_protocol::models::ResponseItem;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -20,6 +21,7 @@ use uuid::Uuid;
 
 use crate::context::CodeModeCompletion;
 use crate::context::ContextualUserFragment;
+use crate::context::SubagentCompletion;
 
 pub(crate) use commands::CommandCompletion;
 pub(super) use delegate::CompletionDelegate;
@@ -39,6 +41,9 @@ struct State {
     suppressed: bool,
     entries: BTreeMap<Uuid, Entry>,
     batch: Option<Batch>,
+    agent_generation: u64,
+    agent_children: BTreeMap<String, (u64, Uuid)>,
+    agents: BTreeMap<String, (u64, Uuid)>,
 }
 
 struct Entry {
@@ -75,6 +80,7 @@ impl Entry {
 struct Batch {
     trigger: String,
     executions: Vec<Uuid>,
+    agents: Vec<(String, (u64, Uuid))>,
 }
 
 pub(crate) struct Completions {
@@ -98,10 +104,136 @@ impl Completions {
         self.state().enabled && !self.shutdown.is_cancelled()
     }
 
+    #[cfg(test)]
+    pub(crate) fn enable_for_test(&self) {
+        self.state().enabled = true;
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Capture a task generation and a unique dispatch identity.
+    pub(crate) fn new_agent_token(&self) -> Option<(u64, Uuid)> {
+        let state = self.state();
+        (state.enabled && !state.suppressed && !self.shutdown.is_cancelled())
+            .then(|| (state.agent_generation, Uuid::new_v4()))
+    }
+
+    pub(crate) fn register_agent_child(&self, agent: ThreadId, token: (u64, Uuid)) {
+        let mut state = self.state();
+        if state.enabled
+            && !state.suppressed
+            && !self.shutdown.is_cancelled()
+            && state.agent_generation == token.0
+            && (state.agent_children.len() < 1024
+                || state.agent_children.contains_key(&agent.to_string()))
+        {
+            state.agent_children.insert(agent.to_string(), token);
+            state.agents.remove(&agent.to_string());
+        }
+    }
+
+    /// Re-subscribe to a still-running child only when a new user turn has
+    /// explicitly queried it and no current watcher is registered.
+    pub(crate) fn register_untracked_agent(&self, agent: ThreadId) -> Option<(u64, Uuid)> {
+        let mut state = self.state();
+        let id = agent.to_string();
+        if !state.enabled
+            || state.suppressed
+            || self.shutdown.is_cancelled()
+            || state.agent_children.contains_key(&id)
+            || state.agent_children.len() >= 1024
+        {
+            return None;
+        }
+        let token = (state.agent_generation, Uuid::new_v4());
+        state.agent_children.insert(id, token);
+        Some(token)
+    }
+
+    /// Reserve a follow-up dispatch while retaining any unconsumed prior result.
+    pub(crate) fn replace_agent_child(
+        &self,
+        agent: ThreadId,
+        token: (u64, Uuid),
+    ) -> Option<(Option<(u64, Uuid)>, Option<(u64, Uuid)>)> {
+        let mut state = self.state();
+        if !state.enabled || state.suppressed || state.agent_generation != token.0 {
+            return None;
+        }
+        let id = agent.to_string();
+        let pending = state.agents.remove(&id);
+        let previous = state.agent_children.insert(id, token);
+        Some((previous, pending))
+    }
+
+    pub(crate) fn restore_agent_child(
+        &self,
+        agent: ThreadId,
+        token: (u64, Uuid),
+        previous: (Option<(u64, Uuid)>, Option<(u64, Uuid)>),
+    ) {
+        let mut state = self.state();
+        let id = agent.to_string();
+        if state.agent_generation != token.0 || state.agent_children.get(&id) != Some(&token) {
+            return;
+        }
+        if let Some(old) = previous.0 {
+            state.agent_children.insert(id.clone(), old);
+        } else {
+            state.agent_children.remove(&id);
+        }
+        if let Some(pending) = previous.1 {
+            state.agents.insert(id, pending);
+        }
+        drop(state);
+        self.activity();
+    }
+
+    pub(crate) fn agent_child_matches(&self, agent: ThreadId, token: (u64, Uuid)) -> bool {
+        let state = self.state();
+        state.enabled
+            && !state.suppressed
+            && !self.shutdown.is_cancelled()
+            && state.agent_generation == token.0
+            && state.agent_children.get(&agent.to_string()) == Some(&token)
+    }
+
+    pub(crate) fn retire_agent_child(&self, agent: ThreadId, token: (u64, Uuid)) {
+        let mut state = self.state();
+        let id = agent.to_string();
+        if state.agent_children.get(&id) == Some(&token) {
+            state.agent_children.remove(&id);
+        }
+    }
+
+    pub(crate) fn invalidate_agent_origins(&self) {
+        let mut state = self.state();
+        state.agent_generation = state.agent_generation.wrapping_add(1);
+        state.agent_children.clear();
+        state.agents.clear();
+        drop(state);
+        self.activity();
+    }
+
+    pub(crate) fn queue_agent_completion(&self, agent: ThreadId, token: (u64, Uuid)) -> bool {
+        let mut state = self.state();
+        if !state.enabled
+            || state.suppressed
+            || self.shutdown.is_cancelled()
+            || state.agent_generation != token.0
+            || state.agent_children.get(&agent.to_string()) != Some(&token)
+            || (state.agents.len() >= CAPACITY && !state.agents.contains_key(&agent.to_string()))
+        {
+            return false;
+        }
+        state.agents.insert(agent.to_string(), token);
+        drop(state);
+        self.activity();
+        true
     }
 
     pub(crate) fn subscribe(&self) -> watch::Receiver<()> {
@@ -233,7 +365,12 @@ impl Completions {
 
     /// Call under Core's active-turn lock before interruption/error releases admission.
     pub(crate) fn suppress(&self) {
-        self.state().suppressed = true;
+        let mut state = self.state();
+        state.suppressed = true;
+        state.agent_generation = state.agent_generation.wrapping_add(1);
+        state.agent_children.clear();
+        state.agents.clear();
+        drop(state);
         self.activity();
     }
 
@@ -244,7 +381,10 @@ impl Completions {
 
     pub(crate) fn shutdown(&self) {
         self.shutdown.cancel();
-        self.state().entries.clear();
+        let mut state = self.state();
+        state.entries.clear();
+        state.agent_children.clear();
+        state.agents.clear();
     }
 
     pub(crate) fn permits(&self, trigger: &str) -> bool {
@@ -252,7 +392,12 @@ impl Completions {
         !self.shutdown.is_cancelled()
             && !state.suppressed
             && state.batch.as_ref().is_some_and(|batch| {
-                batch.trigger == trigger && batch.executions.iter().all(|key| state.eligible(key))
+                batch.trigger == trigger
+                    && batch.executions.iter().all(|key| state.eligible(key))
+                    && batch
+                        .agents
+                        .iter()
+                        .all(|(id, token)| state.agents.get(id) == Some(token))
             })
     }
 
@@ -263,6 +408,14 @@ impl Completions {
         if let Some(batch) = state.batch.take() {
             for key in batch.executions {
                 state.entries.remove(&key);
+            }
+            for (id, token) in batch.agents {
+                if state.agents.get(&id) == Some(&token) {
+                    state.agents.remove(&id);
+                    if state.agent_children.get(&id) == Some(&token) {
+                        state.agent_children.remove(&id);
+                    }
+                }
             }
         }
     }
@@ -297,12 +450,33 @@ impl Completions {
             }
         }
         if executions.is_empty() {
+            if !state.agents.is_empty() {
+                let agents = state
+                    .agents
+                    .iter()
+                    .take(8)
+                    .map(|(id, token)| (id.clone(), *token))
+                    .collect::<Vec<_>>();
+                let trigger = format!("{TRIGGER}{}", Uuid::new_v4());
+                state.batch = Some(Batch {
+                    trigger: trigger.clone(),
+                    executions: Vec::new(),
+                    agents: agents.clone(),
+                });
+                return Some((
+                    trigger,
+                    ContextualUserFragment::into(SubagentCompletion(
+                        agents.into_iter().map(|(id, _)| id).collect(),
+                    )),
+                ));
+            }
             return self.command_batch(&mut state);
         }
         let trigger = format!("{TRIGGER}{}", Uuid::new_v4());
         state.batch = Some(Batch {
             trigger: trigger.clone(),
             executions,
+            agents: Vec::new(),
         });
         Some((trigger, ContextualUserFragment::into(notice)))
     }

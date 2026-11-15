@@ -32,6 +32,7 @@ const CONTEXTUAL_USER_FRAGMENT_MATCHERS: &[fn(&str) -> bool] = &[
     UserShellCommand::matches_text,
     TurnAborted::matches_text,
     SubagentNotification::matches_text,
+    super::SubagentCompletion::matches_text,
     InternalModelContextFragment::matches_text,
     // compatibility for user-role recommendation messages in existing rollouts
     RecommendedPluginsInstructions::matches_text,

@@ -140,20 +140,31 @@ impl LocalAgentControl {
         input: Vec<UserInput>,
         start_options: TurnStartOptions,
     ) -> CodexResult<String> {
+        self.send_input_with_kind(agent_id, input, start_options)
+            .await
+            .map(|(id, _)| id)
+    }
+
+    pub(crate) async fn send_input_with_kind(
+        &self,
+        agent_id: ThreadId,
+        input: Vec<UserInput>,
+        start_options: TurnStartOptions,
+    ) -> CodexResult<(String, String)> {
         let state = self.runtime.upgrade()?;
         let thread = state.get_thread(agent_id).await?;
         let result = match thread
             .start_or_steer_turn(TurnInputRequest::user_input(input).on_start(start_options))
             .await
         {
-            Ok(TurnInputSubmission::Started { turn_id, .. }) => Ok(turn_id),
+            Ok(TurnInputSubmission::Started { turn_id, .. }) => Ok((turn_id.clone(), turn_id)),
             Ok(TurnInputSubmission::Accepted) => unreachable!("user input returns a turn outcome"),
-            Ok(TurnInputSubmission::Steered { .. }) => {
+            Ok(TurnInputSubmission::Steered { turn_id, .. }) => {
                 // MAv1 exposes an opaque `submission_id` to the model. The legacy
                 // `Op::UserInput` path returned a fresh ID for every steer, while the
                 // turn-input API returns the active turn ID. Keep the tool-visible ID
                 // unique without adding a submission receipt back to Core.
-                Ok(Uuid::now_v7().to_string())
+                Ok((Uuid::now_v7().to_string(), turn_id))
             }
             Ok(TurnInputSubmission::NotSubmitted { reason }) => Err(CodexErr::InvalidRequest(
                 format!("turn input was not submitted: {reason:?}"),
@@ -352,12 +363,12 @@ impl LocalAgentControl {
         .await
     }
 
-    async fn handle_thread_request_result(
+    async fn handle_thread_request_result<T>(
         &self,
         agent_id: ThreadId,
         state: &Arc<ThreadManagerState>,
-        result: CodexResult<String>,
-    ) -> CodexResult<String> {
+        result: CodexResult<T>,
+    ) -> CodexResult<T> {
         if result
             .as_ref()
             .is_err_and(|err| matches!(err.details(), CodexErrorDetails::InternalAgentDied))
@@ -468,15 +479,17 @@ impl LocalAgentControl {
         session_source: Option<SessionSource>,
         child_reference: String,
         child_agent_path: Option<AgentPath>,
-    ) {
+        completion_token: Option<(u64, uuid::Uuid)>,
+        expected_child_turn: Option<String>,
+    ) -> bool {
         let Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id, ..
         })) = session_source
         else {
-            return;
+            return false;
         };
         let Ok(membership) = self.runtime.admit_start() else {
-            return;
+            return false;
         };
         let teardown = membership.into_teardown_guard("completion_watcher", Some(child_thread_id));
         let control = self.clone();
@@ -492,6 +505,16 @@ impl LocalAgentControl {
                         if let Some(status) = snapshot.status()
                             && is_final(status)
                         {
+                            if let Some(expected) = expected_child_turn.as_deref()
+                                && let Ok(state) = control.runtime.upgrade()
+                                && let Ok(child) = state.get_thread(child_thread_id).await
+                                && !matches!(status, AgentStatus::Shutdown)
+                                && !child.session.last_terminal_agent_status().is_some_and(
+                                    |(id, observed)| id == expected && &observed == status,
+                                )
+                            {
+                                continue;
+                            }
                             final_status = Some(status.clone());
                             break;
                         }
@@ -503,6 +526,25 @@ impl LocalAgentControl {
                 }
                 Err(_) => control.get_status(child_thread_id).await,
             };
+            // A closed status stream may fall back to the previous turn's status.
+            // Never publish it as the result of a later follow-up dispatch.
+            if let Some(expected) = expected_child_turn.as_deref()
+                && !matches!(status, AgentStatus::Shutdown | AgentStatus::NotFound)
+            {
+                let Ok(state) = control.runtime.upgrade() else {
+                    return;
+                };
+                let Ok(child) = state.get_thread(child_thread_id).await else {
+                    return;
+                };
+                if !child
+                    .session
+                    .last_terminal_agent_status()
+                    .is_some_and(|(id, observed)| id == expected && observed == status)
+                {
+                    return;
+                }
+            }
             // Tree shutdown is a lifecycle handoff, not a child result for the parent.
             if !is_final(&status)
                 || (matches!(&status, AgentStatus::Shutdown)
@@ -580,9 +622,11 @@ impl LocalAgentControl {
                 ),
             };
             parent_thread
-                .inject_fragment_without_turn(
+                .notify_subagent_result(
                     SubagentNotification::new(child_reference.as_str(), status)
                         .with_metadata(ContentItemMetadata::tool(namespace)),
+                    child_thread_id,
+                    completion_token,
                 )
                 .await;
         };
@@ -590,6 +634,42 @@ impl LocalAgentControl {
             watcher.await;
             teardown.complete();
         });
+        true
+    }
+
+    /// Re-arm the one-shot V1 watcher for a new task on an existing child.
+    pub(crate) async fn watch_followup_completion(
+        &self,
+        child_id: ThreadId,
+        parent_id: ThreadId,
+        token: (u64, uuid::Uuid),
+        expected_child_turn: Option<String>,
+    ) -> bool {
+        let Ok(state) = self.runtime.upgrade() else {
+            return false;
+        };
+        let Ok(child) = state.get_thread(child_id).await else {
+            return false;
+        };
+        let source = child.config_snapshot().await.session_source;
+        if !matches!(&source, SessionSource::SubAgent(SubAgentSource::ThreadSpawn { parent_thread_id, .. }) if *parent_thread_id == parent_id)
+        {
+            return false;
+        }
+        let metadata = self.get_agent_metadata(child_id).unwrap_or_default();
+        let reference = metadata
+            .agent_path
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| child_id.to_string());
+        self.maybe_start_completion_watcher(
+            child_id,
+            Some(source),
+            reference,
+            metadata.agent_path,
+            Some(token),
+            expected_child_turn,
+        )
     }
 
     fn prepare_agent_metadata(

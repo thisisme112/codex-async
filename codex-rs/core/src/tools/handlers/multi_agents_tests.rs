@@ -3398,6 +3398,67 @@ async fn wait_agent_times_out_when_status_is_not_final() {
 }
 
 #[tokio::test]
+async fn wait_timeout_rearms_an_explicitly_queried_child_once() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let parent = manager
+        .start_thread(StartThreadOptions::new(turn.config.as_ref().clone()))
+        .await
+        .expect("start parent");
+    session.thread_id = parent.thread_id;
+    set_agent_control(&mut session, manager.agent_control());
+    session
+        .services
+        .code_mode_service
+        .completions
+        .enable_for_test();
+    let child = manager
+        .start_thread(StartThreadOptions {
+            session_source: Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: session.thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            ..StartThreadOptions::new(turn.config.as_ref().clone())
+        })
+        .await
+        .expect("start child");
+    let child_id = child.thread_id;
+    let session = Arc::new(session);
+    let inv = invocation(
+        Arc::clone(&session),
+        Arc::new(turn),
+        "wait_agent",
+        function_payload(json!({
+            "targets": [child_id.to_string()], "timeout_ms": MIN_WAIT_TIMEOUT_MS
+        })),
+    );
+    let output = WaitAgentHandler::default()
+        .handle(inv)
+        .await
+        .expect("wait succeeds");
+    let (content, _) = expect_text_output(output);
+    let result: wait::WaitAgentResult = serde_json::from_str(&content).unwrap();
+    assert!(result.timed_out);
+    assert!(
+        session
+            .services
+            .code_mode_service
+            .completions
+            .register_untracked_agent(child_id)
+            .is_none(),
+        "the timed-out explicit check has already rearmed this child"
+    );
+    child
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown");
+}
+
+#[tokio::test]
 async fn wait_agent_clamps_short_timeouts_to_minimum() {
     let (mut session, turn) = make_session_and_context().await;
     let manager = thread_manager();

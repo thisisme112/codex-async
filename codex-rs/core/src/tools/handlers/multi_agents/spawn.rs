@@ -112,6 +112,11 @@ async fn handle_spawn_agent(
     .map_err(FunctionCallError::RespondToModel)?;
     let config = prepared.config;
     let fork_mode = args.fork_context.then_some(SpawnAgentForkMode::FullHistory);
+    let completion_token = session
+        .services
+        .code_mode_service
+        .completions
+        .new_agent_token();
     let result = session
         .services
         .agent_control
@@ -132,6 +137,7 @@ async fn handle_spawn_agent(
                 fork_mode: fork_mode.clone(),
                 parent_thread_id: Some(session.thread_id),
                 parent_turn_id: Some(turn.sub_id.clone()),
+                completion_token,
                 root_turn_id: turn.turn_metadata_state.root_turn_id(),
                 turn_trigger: turn.turn_metadata_state.current_turn_trigger(),
                 environments: Some(step_context.inherited_environments.clone()),

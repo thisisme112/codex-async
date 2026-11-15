@@ -3070,6 +3070,19 @@ impl Session {
         }
         // Record the last known agent status.
         if let Some(status) = agent_status_from_event(&event.msg) {
+            if crate::agent::status::is_final(&status) && !matches!(status, AgentStatus::Shutdown) {
+                let turn_id = match &event.msg {
+                    EventMsg::TurnComplete(completed) => completed.turn_id.clone(),
+                    EventMsg::TurnAborted(aborted) => {
+                        aborted.turn_id.clone().unwrap_or_else(|| event.id.clone())
+                    }
+                    _ => event.id.clone(),
+                };
+                *self
+                    .last_terminal_agent_status
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some((turn_id, status.clone()));
+            }
             self.agent_status.send_replace(status);
         }
         if let Err(e) = self.tx_event.send(event).await {

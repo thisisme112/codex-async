@@ -38,6 +38,8 @@ pub struct SpawnAgentOptions {
     pub fork_mode: Option<SpawnAgentForkMode>,
     pub parent_thread_id: Option<ThreadId>,
     pub parent_turn_id: Option<String>,
+    /// Ephemeral parent user-input generation for safe completion wake routing.
+    pub completion_token: Option<(u64, uuid::Uuid)>,
     /// Attribute delegated usage to the turn that initiated it.
     pub turn_trigger: Option<String>,
     pub root_turn_id: Option<String>,

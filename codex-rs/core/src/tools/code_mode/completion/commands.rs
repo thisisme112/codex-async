@@ -156,6 +156,7 @@ impl Completions {
         state.batch = Some(Batch {
             trigger: trigger.clone(),
             executions,
+            agents: Vec::new(),
         });
         Some((trigger, ContextualUserFragment::into(notice)))
     }
