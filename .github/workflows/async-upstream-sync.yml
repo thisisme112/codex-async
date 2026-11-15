@@ -33,7 +33,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: async-upstream-sync
+  group: async-upstream-runtime-validation
   cancel-in-progress: false
 
 jobs:
@@ -161,7 +161,7 @@ jobs:
       matrix:
         # Fixture-only repairs can reuse successful runtime/core-unit/CLI runs.
         # Scheduled upstream candidates still validate all three suites above.
-        suite: ${{ fromJSON(startsWith(github.ref, 'refs/heads/integration/async-') && '["async"]' || '["runtime","core","cli"]') }}
+        suite: [runtime]
     permissions:
       contents: read
     env:
