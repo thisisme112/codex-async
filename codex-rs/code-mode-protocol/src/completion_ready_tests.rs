@@ -40,6 +40,7 @@ fn upstream_truncation_and_callback_capacity_do_not_opt_in_to_completion() {
             cell_execution_limits: None,
             output_truncation: Some(grpc::OutputTruncation::Server.into()),
             max_pending_delegate_calls: Some(1024),
+            heartbeat_interval_s: 0,
             completion_ready: false,
         }
     );
@@ -59,5 +60,22 @@ fn upstream_truncation_and_callback_capacity_do_not_opt_in_to_completion() {
     assert_eq!(
         grpc::OpenSessionRequest::decode(opted_in.encode_to_vec().as_slice()).unwrap(),
         opted_in
+    );
+}
+
+#[test]
+fn legacy_completion_opt_in_does_not_enable_the_new_event_format() {
+    // Earlier experimental peers used field 100 for capability negotiation
+    // and session event field 6, which now belongs to upstream heartbeats.
+    let legacy_opt_in = &[0xa0, 0x06, 0x01][..];
+    assert!(
+        !grpc::OpenSessionRequest::decode(legacy_opt_in)
+            .unwrap()
+            .completion_ready
+    );
+    assert!(
+        !grpc::SessionOpened::decode(legacy_opt_in)
+            .unwrap()
+            .completion_ready
     );
 }
