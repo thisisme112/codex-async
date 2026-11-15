@@ -117,11 +117,7 @@ async fn completion_task_revalidates_after_async_start_preparation(race: &str, c
         let session = session.clone();
         async move {
             session
-                .start_task_with_completion_admission(
-                    Arc::new(turn),
-                    Vec::new(),
-                    RegularTask::new(),
-                )
+                .start_task(Arc::new(turn), Vec::new(), RegularTask::new())
                 .await
         }
     });
@@ -156,12 +152,13 @@ async fn completion_task_revalidates_after_async_start_preparation(race: &str, c
         _ => unreachable!(),
     }
     gate.release.notify_one();
-    assert!(
-        !tokio::time::timeout(Duration::from_secs(5), starting)
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), starting)
             .await
             .expect("admission cleanup must not deadlock")
-            .expect("start task joined")
-    );
+            .expect("start task joined"),
+        codex_protocol::turn_input::TurnInputSubmission::NotSubmitted { .. }
+    ));
     assert_eq!(
         *gate.events.lock().expect("state lock"),
         vec![(rejected_id.clone(), "start"), (rejected_id, "abort")],
