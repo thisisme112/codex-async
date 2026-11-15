@@ -14,6 +14,7 @@ if ($ExpectedCommit -notmatch '^[0-9a-f]{40}$') { throw 'ExpectedCommit must be 
 $manifestPath = Join-Path $backend 'WINDOWS_BUILD_INFO.json'
 $build = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 if ($build.source_commit -cne $ExpectedCommit -or $build.target -cne 'x86_64-pc-windows-msvc') { throw 'Backend identity does not match the approved commit and target' }
+if (-not $build.official_version -or $build.official_tag -cne ('rust-v' + $build.official_version)) { throw 'Backend has no matching official version identity' }
 $names = @('codex.exe','codex-code-mode-host.exe','codex-command-runner.exe','codex-windows-sandbox-setup.exe','codex-windows-sandbox-service.exe')
 foreach ($name in $names) {
     $file = Join-Path $backend $name
@@ -37,8 +38,9 @@ foreach ($name in $names) {
     Copy-Item -LiteralPath (Join-Path $backend $name) -Destination $destination -Force
     if ((Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant() -cne $build.files.$name) { throw "Candidate binary checksum mismatch: $name" }
 }
-& (Join-Path $resources 'codex.exe') --version
+$actualVersion = (& (Join-Path $resources 'codex.exe') --version).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Candidate backend did not start' }
+if ($actualVersion -cne "codex-cli $($build.official_version)") { throw "Candidate CLI version does not match its manifest: $actualVersion" }
 Copy-Item -LiteralPath $manifestPath -Destination (Join-Path $output 'WINDOWS_BUILD_INFO.json')
 @'
 $ErrorActionPreference = 'Stop'

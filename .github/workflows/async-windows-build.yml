@@ -73,6 +73,16 @@ jobs:
           "source_sha=$sha" >> $env:GITHUB_OUTPUT
           "reuse=$($matchingArtifact.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           if ('${{ github.event_name }}' -eq 'workflow_run' -and -not $matchingArtifact) { "skip=true" >> $env:GITHUB_OUTPUT }
+      - name: Resolve and stamp the matching official version
+        if: steps.select.outputs.skip != 'true' && steps.select.outputs.reuse != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/async_fork/upstream_version.py resolve --file "$env:RUNNER_TEMP/official-version.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/async_fork/upstream_version.py stamp --file "$env:RUNNER_TEMP/official-version.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Resolve verified V8 archive
         if: steps.select.outputs.skip != 'true' && steps.select.outputs.reuse != 'true'
         shell: pwsh
@@ -92,8 +102,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --profile dev-small -p codex-core --lib tools::code_mode::completion
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & target/dev-small/codex.exe --version
+          $expected = (Get-Content "$env:RUNNER_TEMP/official-version.json" -Raw | ConvertFrom-Json).version
+          $actual = (& target/dev-small/codex.exe --version).Trim()
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($actual -cne "codex-cli $expected") { throw "Unexpected CLI version: $actual" }
       - name: Prepare verified artifact
         if: steps.select.outputs.skip != 'true'
         shell: pwsh
@@ -112,8 +124,15 @@ jobs:
           if ($env:REUSE_BUILD -eq 'true') {
             $prior = Get-Content (Join-Path $out 'WINDOWS_BUILD_INFO.json') -Raw | ConvertFrom-Json
             foreach ($name in $names) { if ($prior.files.$name -cne $hashes[$name]) { throw "Validated artifact mismatch: $name" } }
+            if (-not $prior.official_version -or -not $prior.official_tag) { throw 'Validated artifact has no official version identity' }
+            $officialVersion = $prior.official_version
+            $officialTag = $prior.official_tag
+          } else {
+            $official = Get-Content "$env:RUNNER_TEMP/official-version.json" -Raw | ConvertFrom-Json
+            $officialVersion = $official.version
+            $officialTag = $official.official_tag
           }
-          @{source_commit=$env:SOURCE_SHA;target='x86_64-pc-windows-msvc';profile='dev-small';files=$hashes} | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 (Join-Path $out 'WINDOWS_BUILD_INFO.json')
+          @{source_commit=$env:SOURCE_SHA;target='x86_64-pc-windows-msvc';profile='dev-small';official_version=$officialVersion;official_tag=$officialTag;files=$hashes} | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 (Join-Path $out 'WINDOWS_BUILD_INFO.json')
       - name: Retain Windows build
         if: steps.select.outputs.skip != 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

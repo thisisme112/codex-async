@@ -264,6 +264,15 @@ jobs:
           node scripts/desktop/test-background-panel.cjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & ./scripts/desktop/test-check-and-stage.ps1
+      - name: Resolve and stamp the matching official version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/async_fork/upstream_version.py resolve --file "$env:RUNNER_TEMP/official-version.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/async_fork/upstream_version.py stamp --file "$env:RUNNER_TEMP/official-version.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Resolve verified V8 archive
         shell: pwsh
         run: |
@@ -281,8 +290,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --profile dev-small -p codex-core --lib tools::code_mode::completion
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & target/dev-small/codex.exe --version
+          $expected = (Get-Content "$env:RUNNER_TEMP/official-version.json" -Raw | ConvertFrom-Json).version
+          $actual = (& target/dev-small/codex.exe --version).Trim()
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($actual -cne "codex-cli $expected") { throw "Unexpected CLI version: $actual" }
       - name: Record exact Windows build identity
         shell: pwsh
         run: |
@@ -291,7 +302,8 @@ jobs:
           $files = @('codex.exe', 'codex-code-mode-host.exe', 'codex-command-runner.exe', 'codex-windows-sandbox-setup.exe', 'codex-windows-sandbox-service.exe')
           $hashes = @{}
           foreach ($name in $files) { $hashes[$name] = (Get-FileHash "codex-rs/target/dev-small/$name" -Algorithm SHA256).Hash.ToLowerInvariant() }
-          @{source_commit=$sha; target='x86_64-pc-windows-msvc'; profile='dev-small'; files=$hashes} | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 'codex-rs/target/dev-small/WINDOWS_BUILD_INFO.json'
+          $official = Get-Content "$env:RUNNER_TEMP/official-version.json" -Raw | ConvertFrom-Json
+          @{source_commit=$sha; target='x86_64-pc-windows-msvc'; profile='dev-small'; official_version=$official.version; official_tag=$official.official_tag; files=$hashes} | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 'codex-rs/target/dev-small/WINDOWS_BUILD_INFO.json'
       - name: Keep Windows build for desktop candidates
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
