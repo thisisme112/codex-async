@@ -67,8 +67,8 @@ pub(super) async fn prepare_fresh_startup_config(
         }
     };
     let defaults = crate::config_update::read_effective_config_with_layers(
-        app_server.request_handle(),
-        defaults_cwd,
+        &app_server.request_handle(),
+        defaults_cwd.display().to_string(),
     )
     .await?;
     super::new_session::overlay_new_session_defaults(
@@ -936,6 +936,8 @@ impl App {
         }
         chat_widget.remote_connection = remote_connection;
         chat_widget.snapshot_local_images = app_server_target.uses_remote_workspace();
+        chat_widget.thread_settings_owner = app_server.thread_params_mode().settings_owner();
+        chat_widget.pending_cloud_turn_settings = app_server.pending_cloud_turn_settings();
         chat_widget.set_local_worktree_operations(!crate::uses_remote_workspace_or_environment(
             &app_server_target,
             environment_manager.as_ref(),
@@ -1065,6 +1067,7 @@ See the Codex keymap documentation for supported actions and examples."
             background_voice: None,
             background_voice_error: None,
             temporary_structured_requests: HashMap::new(),
+            cloud_title_shutdown: Default::default(),
             pending_thread_titles: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
@@ -1139,9 +1142,13 @@ See the Codex keymap documentation for supported actions and examples."
                 /*server_version*/ None,
             );
         }
+        app.backend_registry.connect(&app_server);
         if let Some(thread_id) = app.current_displayed_thread_id() {
             app.backend_registry
                 .observe(app_server.backend_id(), thread_id);
+        }
+        for session in &other_backends {
+            app.backend_registry.connect(session);
         }
         if start_in_agents_overview {
             app.open_agents_overview(&app_server);
@@ -1625,6 +1632,10 @@ See the Codex keymap documentation for supported actions and examples."
                                 backends.defer_side_startup(event);
                             }
                             Some(event) if owner != displayed_owner || !app.reconnect.offline => {
+                                if matches!(&event.event, codex_app_server_client::AppServerEvent::Disconnected { .. }) {
+                                    app.backend_registry.disconnect(owner);
+                                    app.cancel_agents_overview_refresh(owner);
+                                }
                                 if let Some(slot) = backends.slot(owner) {
                                     let (session, parked_inputs) = backends.session_and_parked_inputs(slot);
                                     app.handle_polled_backend_event(session, displayed_owner, parked_inputs, event).await;
@@ -1632,8 +1643,9 @@ See the Codex keymap documentation for supported actions and examples."
                             }
                             Some(_) => {}
                             None => {
-                                app.agents_overview
-                                    .invalidate_discovery(owner, owner == displayed_owner);
+                                app.backend_registry.disconnect(owner);
+                                app.cancel_agents_overview_refresh(owner);
+                                app.reset_agents_overview_discovery(owner);
                                 if owner == displayed_owner {
                                     if app.reconnect.offline && app.pending_startup_thread_start {
                                         reconnect = None;
@@ -1794,6 +1806,18 @@ See the Codex keymap documentation for supported actions and examples."
         };
         // Let the pending terminal poll unwind while the app server shuts down.
         tui.pause_events();
+        // Skip pending inference on exit. Give the fallback writes a bounded chance
+        // to finish before closing the connections they use.
+        if app.cloud_title_shutdown.send(()).is_ok()
+            && tokio::time::timeout(Duration::from_secs(3), app.cloud_title_shutdown.closed())
+                .await
+                .is_err()
+        {
+            tracing::debug!("timed out saving pending Cloud titles during shutdown");
+        }
+        for cancellation in app.pending_thread_titles.values() {
+            cancellation.cancel();
+        }
         app.chat_widget.mention_usage_mut().flush().await;
         if let Err(err) = backends.shutdown().await {
             tracing::warn!(error = %err, "failed to shut down embedded app server");
