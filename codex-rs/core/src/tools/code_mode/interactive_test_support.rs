@@ -34,6 +34,7 @@ impl HookMcpExecutor for ReviewHook {
             // No decision: continue through the real reviewer/user path.
             Ok(HookMcpOutput {
                 text: String::new(),
+                structured_content: None,
                 source_tool_namespace: None,
             })
         })
