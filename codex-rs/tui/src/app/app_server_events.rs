@@ -76,19 +76,24 @@ impl App {
                     "app-server event consumer lagged; dropping ignored events"
                 );
                 self.chat_widget.finish_mcp_startup_after_lag();
-                if let Some(task) = self.agents_overview.refresh_task.take() {
-                    task.abort();
-                }
-                self.agents_overview.active_refresh = None;
-                self.agents_overview.refresh_show_more = false;
-                self.agents_overview.active_refresh_thread_ids.clear();
-                self.agents_overview.refresh_pending = false;
+                let owner = app_server_client.backend_id();
+                self.cancel_agents_overview_refresh(owner);
+                self.reset_agents_overview_discovery(owner);
+                let registry = &self.backend_registry;
+                let belongs_to_other =
+                    |id: &ThreadId| registry.owner(*id).is_some_and(|known| known != owner);
                 self.agents_overview
-                    .invalidate_discovery(app_server_client.backend_id(), /*displayed*/ true);
-                self.agents_overview.refresh_notifications.clear();
-                self.agents_overview.activity.clear();
-                self.agents_overview.last_messages.clear();
-                self.agents_overview.usage.clear();
+                    .refresh_notifications
+                    .retain(|id, _| belongs_to_other(id));
+                self.agents_overview
+                    .activity
+                    .retain(|id, _| belongs_to_other(id));
+                self.agents_overview
+                    .last_messages
+                    .retain(|id, _| belongs_to_other(id));
+                self.agents_overview
+                    .usage
+                    .retain(|id, _| belongs_to_other(id));
                 self.agents_overview.pending_usage = None;
                 self.agents_overview.usage_disabled = false;
                 self.repaint_agents_overview();
@@ -367,13 +372,10 @@ impl App {
                     pending.completions.push(notification.clone());
                     return;
                 }
-                if notification.login_id.is_some() {
-                    if notification.login_id.as_ref()
-                        != self.active_mcp_login_ids.get(&notification.name)
-                    {
-                        return;
-                    }
-                    self.active_mcp_login_ids.remove(&notification.name);
+                if let Some(login_id) = &notification.login_id
+                    && self.active_mcp_login_ids.remove(login_id).is_none()
+                {
+                    return;
                 }
             }
 
@@ -401,8 +403,9 @@ impl App {
                 return;
             }
             ServerNotification::AccountUpdated(notification) => {
-                self.agents_overview
-                    .invalidate_discovery(app_server_client.backend_id(), /*displayed*/ true);
+                let owner = app_server_client.backend_id();
+                self.cancel_agents_overview_refresh(owner);
+                self.reset_agents_overview_discovery(owner);
                 self.refresh_changed_agents_overview_threads(app_server_client);
                 self.agents_overview.usage.clear();
                 self.agents_overview.pending_usage = None;
@@ -794,7 +797,6 @@ impl App {
             &request,
             ServerRequest::DynamicToolCall { .. }
                 | ServerRequest::AttestationGenerate { .. }
-                | ServerRequest::CurrentTimeRead { .. }
                 | ServerRequest::ApplyPatchApproval { .. }
                 | ServerRequest::ExecCommandApproval { .. }
         );

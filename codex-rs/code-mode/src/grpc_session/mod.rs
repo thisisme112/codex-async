@@ -59,6 +59,9 @@ mod transport;
 
 type GrpcClient = CodeModeHostClient<GrpcTransport>;
 
+#[derive(Clone)]
+struct SessionAdmission;
+
 const SHUTDOWN_ERROR: &str = "code mode session is shutting down";
 const ROUTE_HEADER: &str = "x-code-mode-route";
 // Bound result-delivery RPCs, not running tools. A full completion burst can
@@ -173,6 +176,7 @@ impl GrpcCodeModeSessionProvider {
             let mut retries = 0;
             loop {
                 let mut request = tonic::Request::new(grpc::OpenSessionRequest {
+                    heartbeat_interval_s: options.heartbeat_interval_s,
                     max_pending_delegate_calls: Some(
                         codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_CALLS as u32,
                     ),
@@ -184,6 +188,7 @@ impl GrpcCodeModeSessionProvider {
                         }
                     },
                 });
+                request.extensions_mut().insert(SessionAdmission);
                 inject_span_traceparent(&mut request, &open_session_span);
                 let result = async {
                     let response = client.as_ref().clone().open_session(request).await?;
@@ -285,6 +290,7 @@ impl GrpcCodeModeSessionProvider {
             session.id = %inner.id,
         );
         let mut request = inner.request(grpc::SubscribeToToolCallsRequest {
+            heartbeat_interval_s: options.heartbeat_interval_s,
             session_id: inner.id.clone(),
             tool_names: Vec::new(),
         });

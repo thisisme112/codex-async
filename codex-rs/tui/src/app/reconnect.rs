@@ -27,6 +27,7 @@ pub(super) struct Reconnected {
     pub(super) session: AppServerSession,
     bootstrap: AppServerBootstrap,
     thread: Option<AppServerStartedThread>,
+    archived_thread: Option<ThreadId>,
 }
 
 #[expect(
@@ -79,7 +80,7 @@ pub(super) async fn reconnect(
                 .with_thread_tool_transport(task_tools.clone());
             stage = "loading session settings";
             let bootstrap = session.bootstrap(&config).await?;
-            let thread = if let Some(thread_id) = thread_id {
+            let (thread, archived_thread) = if let Some(thread_id) = thread_id {
                 stage = "resuming the conversation";
                 match session
                     .resume_thread(
@@ -90,7 +91,7 @@ pub(super) async fn reconnect(
                     )
                     .await
                 {
-                    Ok(thread) => Some(thread),
+                    Ok(thread) => (Some(thread), None),
                     Err(error)
                         if matches!(
                             error.downcast_ref::<TypedRequestError>(),
@@ -114,20 +115,31 @@ pub(super) async fn reconnect(
                     Err(error)
                         if matches!(
                             error.downcast_ref::<TypedRequestError>(),
+                            Some(TypedRequestError::Server { method, source })
+                                if method == "thread/resume" && source.code == -32600
+                                    && source.message.starts_with(&format!("session {thread_id} is archived. "))
+                        ) =>
+                    {
+                        (None, Some(thread_id))
+                    }
+                    Err(error)
+                        if matches!(
+                            error.downcast_ref::<TypedRequestError>(),
                             Some(TypedRequestError::Server { source, .. }) if source.code == -32600
                         ) || presentation == ReconnectPresentation::Overview =>
                     {
-                        None
+                        (None, None)
                     }
                     Err(error) => return Err(error),
                 }
             } else {
-                None
+                (None, None)
             };
             Ok::<_, color_eyre::Report>(Reconnected {
                 session,
                 bootstrap,
                 thread,
+                archived_thread,
             })
         };
         let result = tokio::time::timeout_at(deadline, attempt).await;
@@ -138,7 +150,7 @@ pub(super) async fn reconnect(
         }
     }
     tracing::warn!(stage, "automatic reconnect timed out");
-    color_eyre::eyre::bail!("Automatic reconnect timed out while {stage}.")
+    color_eyre::eyre::bail!("Automatic reconnect timed out while {stage}.");
 }
 
 impl App {
@@ -258,24 +270,40 @@ impl App {
             self.overlay = None;
             self.commit_animation = None;
             self.clear_recap_request(crate::app_event::RecapTrigger::Manual);
-            if let Some(task) = self.agents_overview.refresh_task.take() {
-                task.abort();
-            }
-            self.agents_overview.active_refresh = None;
-            if let Some(owner) = self.app_server_backend_id {
+            let displayed_backend = self.displayed_conversation_backend_id();
+            if let Some(backend_id) = displayed_backend {
+                self.backend_registry.disconnect(backend_id);
+                self.cancel_agents_overview_refresh(backend_id);
+                self.reset_agents_overview_discovery(backend_id);
+                let registry = &self.backend_registry;
+                let other_backend =
+                    |id: &ThreadId| registry.owner(*id).is_some_and(|owner| owner != backend_id);
                 self.agents_overview
-                    .invalidate_discovery(owner, /*displayed*/ true);
+                    .refresh_notifications
+                    .retain(|id, _| other_backend(id));
+                self.agents_overview.usage.retain(|id, _| other_backend(id));
+                self.agents_overview
+                    .activity
+                    .retain(|id, _| other_backend(id));
+                self.agents_overview
+                    .last_messages
+                    .retain(|id, _| other_backend(id));
+            } else {
+                if let Some(task) = self.agents_overview.refresh_task.take() {
+                    task.abort();
+                }
+                self.agents_overview.active_refresh = None;
+                self.agents_overview.refresh_show_more = false;
+                self.agents_overview.active_refresh_thread_ids.clear();
+                self.agents_overview.pending_refresh_backends.clear();
+                self.agents_overview.refresh_notifications.clear();
+                self.agents_overview.usage.clear();
+                self.agents_overview.activity.clear();
+                self.agents_overview.last_messages.clear();
             }
-            self.agents_overview.refresh_show_more = false;
-            self.agents_overview.active_refresh_thread_ids.clear();
-            self.agents_overview.refresh_pending = false;
-            self.agents_overview.refresh_notifications.clear();
             self.agents_overview.pending_pin_change = None;
             self.agents_overview.pending_usage = None;
             self.agents_overview.usage_disabled = false;
-            self.agents_overview.usage.clear();
-            self.agents_overview.activity.clear();
-            self.agents_overview.last_messages.clear();
             self.reconnect.presentation = if self
                 .chat_widget
                 .selected_index_for_active_view(agents_overview::AGENTS_OVERVIEW_VIEW_ID)
@@ -327,6 +355,8 @@ impl App {
         search_dir: PathBuf,
     ) {
         self.chat_widget.snapshot_local_images = self.app_server_target.uses_remote_workspace();
+        self.chat_widget.thread_settings_owner = app_server.thread_params_mode().settings_owner();
+        self.chat_widget.pending_cloud_turn_settings = app_server.pending_cloud_turn_settings();
         self.chat_widget.set_local_worktree_operations(
             !crate::uses_remote_workspace_or_environment(
                 &self.app_server_target,
@@ -365,6 +395,7 @@ impl App {
             mut session,
             bootstrap,
             thread,
+            archived_thread,
         } = connected;
         session.model_provider_override = self.harness_overrides.model_provider.clone();
         let selected = self
@@ -455,10 +486,9 @@ impl App {
             cancellation.cancel();
         }
         self.agents_overview.dispatched_requests.clear();
-        self.agents_overview.active_refresh = None;
-        self.agents_overview.refresh_show_more = false;
-        self.agents_overview.active_refresh_thread_ids.clear();
-        self.agents_overview.refresh_pending = false;
+        if let Some((_, owner)) = self.agents_overview.active_refresh {
+            self.cancel_agents_overview_refresh(owner);
+        }
         for input in self.agents_overview.input_states.values_mut() {
             input.reconnect_pending = true;
         }
@@ -468,10 +498,13 @@ impl App {
         );
         // Move cached UI state into fresh channels. Old producers retain the old sender/store,
         // so their late requests cannot leak into recovery. Background threads attach on selection.
-        for channel in self.thread_event_channels.values_mut() {
+        for (&thread_id, channel) in &mut self.thread_event_channels {
             let mut replacement = ThreadEventChannel::new(THREAD_EVENT_CHANNEL_CAPACITY);
+            replacement.archived = channel.archived || archived_thread == Some(thread_id);
             replacement.backend_id = channel.backend_id;
-            if channel.attachment() == ThreadEventAttachment::ExternalWriter {
+            if !replacement.archived
+                && channel.attachment() == ThreadEventAttachment::ExternalWriter
+            {
                 replacement.mark_external_writer();
             } else {
                 replacement.mark_replay_only();
@@ -483,6 +516,9 @@ impl App {
             store.pending_interactive_replay = Default::default();
             store.pending_interrupt_turn_id = None;
             store.active = false;
+            if let Some(session) = &mut store.session {
+                session.read_only_history = true;
+            }
             store
                 .buffer
                 .retain(|event| matches!(event, ThreadBufferedEvent::Notification(_)));
@@ -547,7 +583,7 @@ impl App {
                 return Err(err);
             }
             self.config = self.chat_widget.config_ref().clone();
-            if self.thread_unavailable(id) && !self.chat_widget.is_external_writer_view() {
+            if self.thread_unavailable(id) && !self.chat_widget.is_read_only_view() {
                 self.agent_navigation.mark_stopped(id);
                 self.chat_widget.pause_unavailable_thread();
                 self.chat_widget.add_info_message("This conversation is unavailable. Its cached transcript and draft remain here; input is paused. Open the agent picker or return to the parent to continue.".into(), /*hint*/ None);
@@ -570,9 +606,8 @@ impl App {
         self.refresh_pending_thread_approvals().await;
         // Discover tasks whose notifications were missed, without clearing retained rows.
         // A hidden overview performs this discovery when it is next opened.
-        self.agents_overview
-            .initialized
-            .remove(&app_server.backend_id());
+        self.reset_agents_overview_discovery(app_server.backend_id());
+        self.backend_registry.connect(app_server);
         if self.reconnect.presentation == ReconnectPresentation::Overview {
             let threads = self
                 .agents_overview
@@ -583,7 +618,6 @@ impl App {
                 .collect();
             let view = self.agents_overview_view(threads, selected);
             self.chat_widget.show_bottom_pane_view(Box::new(view));
-            self.refresh_agents_overview_threads(app_server);
             // The Overview survived request cleanup, but terminal typeahead may have survived too.
             if self.startup_protected_input_boundary {
                 self.render_startup_frame(tui, app_event_rx)?;
@@ -601,6 +635,9 @@ impl App {
             server.reconnect(app_server.request_handle(), self.app_event_tx.clone());
         }
         self.reconnect.offline = false;
+        if self.reconnect.presentation == ReconnectPresentation::Overview {
+            self.refresh_agents_overview_threads(app_server);
+        }
         self.chat_widget.update_account_state(
             bootstrap.status_account_display,
             bootstrap.plan_type,
