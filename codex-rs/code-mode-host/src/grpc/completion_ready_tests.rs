@@ -10,6 +10,7 @@ async fn session_opt_in_is_required_before_sending_the_new_event() {
                 cell_execution_limits: None,
                 output_truncation: None,
                 max_pending_delegate_calls: None,
+                heartbeat_interval_s: 0,
                 completion_ready: requested,
             }))
             .await
