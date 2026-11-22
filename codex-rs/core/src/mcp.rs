@@ -242,13 +242,16 @@ impl McpManager {
         if let McpEnvironmentScope::Selected(environments) = &identity.environments {
             context = context.with_selected_environments(environments);
         }
-        self.runtime_config_with_context(
-            context,
-            Some(identity.originator),
-            identity.environments,
-            identity.disabled_plugin_ids,
-        )
-        .await
+        let mut projection = self
+            .runtime_config_with_context(
+                context,
+                Some(identity.originator),
+                identity.environments,
+                identity.disabled_plugin_ids,
+            )
+            .await;
+        projection.config.executor_discovery_v2 = executor_capability_discovery_v2.map(Arc::from);
+        projection
     }
 
     /// Resolves only plugins from this step's ready roots, independent of shared MCP refresh.
@@ -512,7 +515,7 @@ impl McpManager {
                 CODEX_APPS_MCP_SERVER_NAME.to_string(),
                 LEGACY_CODEX_APPS_REGISTRATION_ID,
                 codex_apps_mcp_server_config(
-                    &mcp_config.chatgpt_base_url,
+                    &mcp_config.client.chatgpt_base_url,
                     mcp_config.apps_mcp_product_sku.as_deref(),
                     originator,
                 ),

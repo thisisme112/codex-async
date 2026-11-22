@@ -323,6 +323,7 @@ pub(super) async fn run_main_inner(
                 .bootstrap_config
                 .config_layer_stack
                 .requirements_toml(),
+            codex_cloud_config::ConfigServerLoginMethod::Browser,
         )
         .await?;
     }
@@ -735,6 +736,11 @@ pub(super) async fn run_main_inner(
         .as_ref()
         .and_then(codex_otel::OtelProvider::metrics)
         .cloned();
+    let statusline_metrics = crate::statusline_metrics::StatuslineMetrics::new(
+        &config,
+        metrics.clone(),
+        &otel_originator,
+    );
     if let Some(metrics) = &metrics {
         let _ = codex_otel::record_process_start_once(metrics, otel_originator.as_str());
         let telemetry =
@@ -783,6 +789,7 @@ pub(super) async fn run_main_inner(
             TerminalName::AppleTerminal => "apple_terminal",
             TerminalName::Ghostty => "ghostty",
             TerminalName::Rex => "rex",
+            TerminalName::Orca => "orca",
             TerminalName::Iterm2 => "iterm2",
             TerminalName::WarpTerminal => "warp",
             TerminalName::VsCode => "vscode",
@@ -1015,6 +1022,7 @@ pub(super) async fn run_main_inner(
         app_server_target,
         remote_cwd_override,
         config,
+        statusline_metrics,
         manually_selected_oss_provider,
         overrides,
         cli_kv_overrides,

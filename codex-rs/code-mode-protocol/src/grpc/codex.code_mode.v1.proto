@@ -57,10 +57,13 @@ message GetProcessMetricsResponse {
 }
 
 message OpenSessionRequest {
+  reserved 100, 101; // Legacy fork opt-in tags.
   // Opt in to understanding completion events; each Execute also opts in.
-  // Tag 100 was used by the earlier completion event protocol, whose event
-  // tag 6 conflicts with upstream heartbeats. Negotiate this version separately.
-  bool completion_ready = 101;
+  // Older fork peers negotiated tag 101 but encoded completion opt-in on
+  // ExecuteRequest tag 8, now reserved for upstream catalog revisions.
+  // Use a new opt-in tag so those peers send neither ambiguous Execute data
+  // nor completion events; tag 100 also belongs to a legacy preview.
+  bool completion_ready = 102;
   optional SessionCellExecutionLimits cell_execution_limits = 1;
   // Absent preserves the legacy client-side truncation behavior.
   optional OutputTruncation output_truncation = 2;
@@ -97,11 +100,14 @@ message SessionEvent {
 }
 
 message SessionOpened {
+  reserved 100, 101; // Legacy fork opt-in tags.
   // False for old hosts or when the client did not opt in.
-  bool completion_ready = 101;
+  bool completion_ready = 102;
   string session_id = 1;
   // Absent (including from an older host) means the client owns truncation.
   optional OutputTruncation output_truncation = 2;
+  // Clients may send ExecuteRequest.catalog_revision when advertised.
+  bool supports_catalog_revision = 3;
 }
 
 message CloseSessionRequest {
@@ -206,7 +212,6 @@ message CellCompletionReady {
 }
 
 message ExecuteRequest {
-  bool completion_ready = 8;
   string session_id = 1;
 
   // Chosen by the client so callbacks can be correlated before cell admission.
@@ -216,6 +221,9 @@ message ExecuteRequest {
   repeated ToolDefinition enabled_tools = 5;
   optional uint64 yield_time_ms = 6;
   optional uint64 max_output_tokens = 7;
+  // Nonempty enabled_tools installs a session-local revision. Empty references it.
+  optional uint64 catalog_revision = 8;
+  bool completion_ready = 101;
 }
 
 message ExecuteEvent {

@@ -22,28 +22,43 @@ async fn session_opt_in_is_required_before_sending_the_new_event() {
             panic!("session opening")
         };
         assert_eq!(opened.completion_ready, requested);
-        let mut request =
-            super::tests::execute_request(&opened.session_id, "execution", "text('done');");
-        request.completion_ready = true;
-        request.yield_time_ms = Some(10_000);
-        let mut execution = host
-            .execute(Request::new(request))
-            .await
-            .unwrap()
-            .into_inner();
-        while execution.next().await.is_some() {}
-        let first = events.next().await.unwrap().unwrap().event.unwrap();
-        if requested {
-            assert!(matches!(
-                first,
-                proto::session_event::Event::CellCompletionReady(_)
-            ));
-            assert!(matches!(
-                events.next().await.unwrap().unwrap().event,
-                Some(proto::session_event::Event::CellClosed(_))
-            ));
-        } else {
-            assert!(matches!(first, proto::session_event::Event::CellClosed(_)));
+        assert!(opened.supports_catalog_revision);
+        for (execution_id, install_catalog) in [("install", true), ("reuse", false)] {
+            let mut request =
+                super::tests::execute_request(&opened.session_id, execution_id, "text('done');");
+            request.completion_ready = true;
+            request.catalog_revision = Some(42);
+            if install_catalog {
+                request.enabled_tools.push(super::tests::tool("echo"));
+            }
+            request.yield_time_ms = Some(10_000);
+            let mut execution = host
+                .execute(Request::new(request))
+                .await
+                .unwrap()
+                .into_inner();
+            while let Some(event) = execution.next().await {
+                event.unwrap();
+            }
+            let first = events.next().await.unwrap().unwrap().event.unwrap();
+            if requested {
+                assert!(matches!(
+                    first,
+                    proto::session_event::Event::CellCompletionReady(ready)
+                        if ready.execution_id == execution_id
+                ));
+                assert!(matches!(
+                    events.next().await.unwrap().unwrap().event,
+                    Some(proto::session_event::Event::CellClosed(closed))
+                        if closed.execution_id == execution_id
+                ));
+            } else {
+                assert!(matches!(
+                    first,
+                    proto::session_event::Event::CellClosed(closed)
+                        if closed.execution_id == execution_id
+                ));
+            }
         }
         host.close_session(Request::new(proto::CloseSessionRequest {
             session_id: opened.session_id,

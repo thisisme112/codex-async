@@ -8,6 +8,7 @@ use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeNestedToolCall;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::CodeModeToolKind;
+use codex_code_mode_protocol::CompletionReadySupport;
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::NotificationFuture;
 use codex_code_mode_protocol::RuntimeResponse;
@@ -31,6 +32,7 @@ struct RecordingDelegate {
     calls: Mutex<Vec<CodeModeNestedToolCall>>,
     notifications: Mutex<Vec<(String, CellId, String)>>,
     closed: Mutex<Vec<CellId>>,
+    completion_ready: Mutex<Vec<CellId>>,
 }
 
 impl CodeModeSessionDelegate for RecordingDelegate {
@@ -55,6 +57,17 @@ impl CodeModeSessionDelegate for RecordingDelegate {
             .expect("notifications lock")
             .push((call_id, cell_id, text));
         Box::pin(async { Ok(()) })
+    }
+
+    fn wants_completion_ready(&self) -> bool {
+        true
+    }
+
+    fn cell_completion_ready(&self, cell_id: &CellId) {
+        self.completion_ready
+            .lock()
+            .expect("completion readiness lock")
+            .push(cell_id.clone());
     }
 
     fn cell_closed(&self, cell_id: &CellId) {
@@ -141,6 +154,8 @@ async fn reconnect_maps_every_delegate_callback_to_its_generation() {
             .await,
         Ok(())
     );
+    assert!(delegate.wants_completion_ready());
+    delegate.cell_completion_ready(&wire_id);
     delegate.cell_closed(&wire_id);
 
     assert_eq!(
@@ -157,6 +172,13 @@ async fn reconnect_maps_every_delegate_callback_to_its_generation() {
             public_id.clone(),
             "notice".to_string()
         )]
+    );
+    assert_eq!(
+        *recording
+            .completion_ready
+            .lock()
+            .expect("completion readiness lock"),
+        vec![public_id.clone()]
     );
     assert_eq!(
         *recording.closed.lock().expect("closed cells lock"),
@@ -180,13 +202,18 @@ async fn reconnected_execution_maps_started_and_initial_response_ids() {
         result_buffered_for: Duration::ZERO,
         error_text: None,
     };
-    let started = StartedCell::from_future(wire_id, async move {
+    let mut started = StartedCell::from_future(wire_id, async move {
         initial_response_claimed.store(true, Ordering::Release);
         response_rx.await.expect("receive initial response")
     });
+    started.completion_ready_support = CompletionReadySupport::Supported;
     let started = public_started_cell(/*generation*/ 2, started);
 
     assert_eq!(started.cell_id, public_id);
+    assert_eq!(
+        started.completion_ready_support,
+        CompletionReadySupport::Supported
+    );
     tokio::task::yield_now().await;
     assert!(!claimed.load(Ordering::Acquire));
     response_tx

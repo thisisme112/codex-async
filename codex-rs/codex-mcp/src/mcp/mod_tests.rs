@@ -214,9 +214,15 @@ async fn status_snapshot_only_downgrades_oauth_and_ema_authentication_failures()
 
 pub(crate) fn test_mcp_config(codex_home: PathBuf) -> McpConfig {
     McpConfig {
-        chatgpt_base_url: "https://chatgpt.com".to_string(),
+        client: super::McpClientConfig {
+            chatgpt_base_url: "https://chatgpt.com".to_string(),
+            requires_read_only_mcp_tools: false,
+            protocol_mode: McpProtocolMode::Legacy,
+            discover_local_stdio: false,
+            mcp_tool_list_changed: true,
+            client_elicitation_capability: ElicitationCapability::default(),
+        },
         apps_mcp_product_sku: None,
-        requires_read_only_mcp_tools: false,
         codex_home,
         mcp_enterprise_managed_auth: None,
         ema_state: Default::default(),
@@ -245,13 +251,10 @@ pub(crate) fn test_mcp_config(codex_home: PathBuf) -> McpConfig {
         apps_early_resource_discovery: false,
         prefix_mcp_tool_names: true,
         non_prefixed_mcp_tool_servers: Vec::new(),
-        protocol_mode: McpProtocolMode::Legacy,
-        discover_local_stdio: false,
-        mcp_tool_list_changed: true,
         host_owned_apps_protocol_mode: McpProtocolMode::Legacy,
-        client_elicitation_capability: ElicitationCapability::default(),
         mcp_server_catalog: ResolvedMcpCatalog::default(),
         connector_snapshot: codex_connectors::ConnectorSnapshot::default(),
+        executor_discovery_v2: None,
     }
 }
 
@@ -525,7 +528,7 @@ fn tool_plugin_context_collects_app_and_mcp_sources() {
 }
 
 #[test]
-fn selected_mcp_attribution_does_not_join_an_unrelated_local_summary() {
+fn selected_plugin_attribution_does_not_join_an_unrelated_local_summary() {
     let key = McpServerKey::in_environment(DEFAULT_MCP_SERVER_ENVIRONMENT_ID, "github");
     let mut config = test_mcp_config(PathBuf::new());
     let mut catalog = ResolvedMcpCatalog::builder();
@@ -742,7 +745,7 @@ fn effective_mcp_servers_preserve_chatgpt_auth_for_trusted_origins() {
         ("https://chatgpt.com", "https://GOV.CHATGPT.COM:443"),
     ] {
         let mut config = test_mcp_config(PathBuf::new());
-        config.chatgpt_base_url = base_url.to_string();
+        config.client.chatgpt_base_url = base_url.to_string();
         let server = codex_apps_mcp_server_config(
             server_url, /*apps_mcp_product_sku*/ None, /*originator*/ None,
         );
@@ -775,7 +778,7 @@ fn effective_mcp_servers_reject_untrusted_origins_for_chatgpt_auth() {
         "https://example.com",
     ] {
         let mut config = test_mcp_config(PathBuf::new());
-        config.chatgpt_base_url = url.to_string();
+        config.client.chatgpt_base_url = url.to_string();
         let server = codex_apps_mcp_server_config(
             url, /*apps_mcp_product_sku*/ None, /*originator*/ None,
         );
@@ -869,7 +872,7 @@ async fn effective_mcp_servers_preserve_runtime_servers() {
     catalog.register(McpServerRegistration::from_config(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         codex_apps_mcp_server_config(
-            &config.chatgpt_base_url,
+            &config.client.chatgpt_base_url,
             config.apps_mcp_product_sku.as_deref(),
             /*originator*/ None,
         ),
