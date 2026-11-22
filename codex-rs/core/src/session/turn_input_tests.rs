@@ -1290,10 +1290,9 @@ async fn steering_active_task_preserves_subagent_wake_registration() {
             },
         )
         .await;
-    let input = vec![UserInput::Text {
-        text: "How is the same task going?".to_string(),
-        text_elements: Vec::new(),
-    }];
+    let input = vec![ResolvedUserInput::text(
+        "How is the same task going?".to_string(),
+    )];
     let result = handle(
         &session,
         TurnInputRequest::user_input(input),
@@ -1315,10 +1314,9 @@ async fn starting_a_new_user_turn_invalidates_old_subagent_wake_registration() {
     let child = codex_protocol::ThreadId::new();
     let token = completions.new_agent_token().unwrap();
     completions.register_agent_child(child, token);
-    let input = vec![UserInput::Text {
-        text: "Start an unrelated task.".to_string(),
-        text_elements: Vec::new(),
-    }];
+    let input = vec![ResolvedUserInput::text(
+        "Start an unrelated task.".to_string(),
+    )];
     let result = handle(
         &session,
         TurnInputRequest::user_input(input),

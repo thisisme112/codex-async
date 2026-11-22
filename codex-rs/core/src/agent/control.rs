@@ -149,7 +149,7 @@ impl LocalAgentControl {
     pub(crate) async fn send_input_with_kind(
         &self,
         agent_id: ThreadId,
-        input: Vec<UserInput>,
+        input: Vec<ResolvedUserInput>,
         start_options: TurnStartOptions,
     ) -> CodexResult<(String, String)> {
         let state = self.runtime.upgrade()?;

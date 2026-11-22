@@ -513,7 +513,7 @@ impl InputQueue {
         let activity = input.wait_activity();
         state.pending_input.notified_activity =
             state.pending_input.notified_activity.max(Some(activity));
-        state.pending_input.items.push(input);
+        state.pending_input.items.push(input.into());
         drop(state);
         self.activity_tx.send_replace(activity);
         true
