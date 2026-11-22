@@ -37,6 +37,7 @@ use crate::terminal_hyperlinks::mark_buffer_hyperlinks;
 use crate::terminal_hyperlinks::plain_hyperlink_lines;
 use crate::terminal_hyperlinks::remap_wrapped_line;
 use crate::terminal_hyperlinks::visible_lines;
+use crate::thread_label::ThreadLabelStyle;
 use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadActiveFlag;
@@ -109,6 +110,7 @@ fn is_subagent(thread: &Thread) -> bool {
 #[derive(Clone)]
 pub(super) struct AgentsOverviewRow {
     pub(super) backend_id: Option<crate::backend_id::BackendId>,
+    pub(super) label_style: ThreadLabelStyle,
     pub(super) search_id: Option<uuid::Uuid>,
     pub(super) details: AgentsOverviewDetails,
     pub(super) thread: Thread,
@@ -158,8 +160,16 @@ pub(super) fn directory_group_key(cwd: &Path, worktrees_enabled: bool) -> PathBu
         .unwrap_or_else(|| cwd.to_path_buf())
 }
 
+/// The item painted under the pointer, identified across task-list refreshes.
+#[derive(Clone, Copy)]
+enum RowTarget {
+    Thread(ThreadId),
+    ShowMore,
+}
+
 #[derive(Default)]
 pub(super) struct AgentsOverviewViewState {
+    row_hits: Vec<(RowTarget, Rect)>,
     scroll: usize,
     page_height: usize,
     status_filter: usize,
@@ -225,6 +235,8 @@ impl AgentsOverviewViewState {
 }
 
 pub(super) struct AgentsOverviewView {
+    /// Some when shown beside the conversation. The value records keyboard focus.
+    pub(super) dock_focused: Option<bool>,
     use_theme_colors: bool,
     pub(super) rows: Vec<AgentsOverviewRow>,
     project_groups: Vec<AgentsOverviewProjectGroup>,
@@ -303,6 +315,7 @@ impl AgentsOverviewView {
             }
         }
         let mut view = Self {
+            dock_focused: None,
             editor_keymap: keymap.clone(),
             use_theme_colors,
             rows,
@@ -326,6 +339,29 @@ impl AgentsOverviewView {
         view.state().completion = None;
         view.reconcile_command_center_selection();
         view
+    }
+
+    pub(super) fn owns_nested_input(&self) -> bool {
+        let state = self.state();
+        state.editing_metadata() || state.help || state.removal.is_some() || state.creating_worktree
+    }
+
+    /// Follow a newly displayed task once its row arrives. Ordinary refreshes keep the browse position.
+    pub(super) fn follow_changed_conversation(&mut self, previous: &Self) {
+        let Some((index, current)) = self.rows.iter().enumerate().find(|(_, row)| row.is_current)
+        else {
+            return;
+        };
+        if !previous
+            .rows
+            .iter()
+            .any(|row| row.is_current && row.thread_id == current.thread_id)
+            && !self.owns_nested_input()
+            && self.visible_indices().contains(&index)
+        {
+            self.selected = index;
+            self.state().show_more_selected = false;
+        }
     }
 
     pub(super) fn thread_ids(&self) -> Vec<ThreadId> {
@@ -517,23 +553,21 @@ impl AgentsOverviewView {
             ]),
             width,
         );
+        let title = Line::from(Span::styled(
+            display_title(&row.thread).to_owned(),
+            self.title_style(row.thread_id).bold(),
+        ));
         let mut lines = vec![
             Line::from("Task details".bold()),
             Line::default(),
-            crate::line_truncation::truncate_line_with_ellipsis_if_overflow(
-                Line::from(Span::styled(
-                    display_title(&row.thread).to_owned(),
-                    self.title_style(row.thread_id).bold(),
-                )),
-                width,
-            ),
+            row.label_style.render(title, width),
             Line::from(vec![dot, " ".into(), status.into()]),
             Line::default(),
             model,
             reasoning,
             Line::default(),
             Line::from("Project".dim()),
-            Line::from(row.thread.cwd.display().to_string()),
+            Line::from(row.thread.cwd.to_string()),
         ];
         lines.extend(row.details.usage_lines.clone());
         if let Some(branch) = row
@@ -723,6 +757,15 @@ impl BottomPaneView for AgentsOverviewView {
             return;
         }
 
+        if self.agents_keymap.next_group.is_pressed(key) {
+            self.select_section(command_center::SectionDirection::Next);
+            return;
+        }
+        if self.agents_keymap.previous_group.is_pressed(key) {
+            self.select_section(command_center::SectionDirection::Previous);
+            return;
+        }
+
         if self.agents_keymap.search.is_pressed(key) {
             let mut state = self.state();
             if state.rename_target.is_none() {
@@ -792,7 +835,7 @@ impl BottomPaneView for AgentsOverviewView {
         if self.agents_keymap.new_task.is_pressed(key) {
             self.app_event_tx.send(AppEvent::NewAgentsOverviewSession {
                 backend_id: self.selected_row().and_then(|row| row.backend_id),
-                cwd: self.selected_row().map(|row| row.thread.cwd.clone()),
+                cwd: self.selected_row().map(|row| row.thread.cwd.to_path_buf()),
             });
             return;
         }
@@ -800,7 +843,9 @@ impl BottomPaneView for AgentsOverviewView {
             if self.worktrees_enabled {
                 self.app_event_tx.send(AppEvent::NewAgentsOverviewWorktree {
                     backend_id: self.selected_row().and_then(|row| row.backend_id),
-                    cwd: self.selected_row().map(|row| row.thread.cwd.clone()),
+                    cwd: self
+                        .selected_row()
+                        .and_then(|row| row.thread.cwd.to_inferred_abs_path()),
                 });
             }
             return;

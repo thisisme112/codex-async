@@ -52,7 +52,6 @@ use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_network_proxy::NetworkProxyConfig;
 use codex_protocol::approvals::GuardianAssessmentStatus;
-use codex_protocol::approvals::GuardianReviewReason;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::CollaborationMode;
@@ -408,6 +407,13 @@ async fn remote_test_env_exposes_target_shell_and_exec_guidance_to_model() -> Re
             .find(|line| line.trim_start().starts_with("<shell>"))
             .map(str::trim),
         Some(expected_shell),
+    );
+    let login_description = exec_command["parameters"]["properties"]["login"]["description"]
+        .as_str()
+        .context("login should have a description")?;
+    assert_eq!(
+        login_description.contains("In PowerShell, false skips profiles."),
+        expected_shell == "<shell>powershell</shell>",
     );
 
     Ok(())
@@ -1635,6 +1641,7 @@ impl NoiseRendezvousConnectProvider for OfflineThenReadyNoiseConnectProvider {
             });
         }
         let bundle = NoiseRendezvousConnectBundle {
+            http_headers: Default::default(),
             websocket_url: self.websocket_url.clone(),
             environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
             executor_registration_id: "ready-first-registration".to_string(),
@@ -2368,7 +2375,8 @@ async fn pending_attachment_installs_configuration_before_waiting_turn_resumes()
     let exec_command_parameters = response_mock
         .requests()
         .iter()
-        .map(|request| {
+        .enumerate()
+        .map(|(index, request)| {
             let body = request.body_json();
             let exec_command = body["tools"]
                 .as_array()
@@ -2376,14 +2384,22 @@ async fn pending_attachment_installs_configuration_before_waiting_turn_resumes()
                 .iter()
                 .find(|tool| tool["name"] == "exec_command")
                 .context("exec_command should stay available")?;
-            let parameters = &exec_command["parameters"];
-            parameters["properties"]
+            let mut parameters = exec_command["parameters"].clone();
+            let login = parameters["properties"]
                 .get("login")
                 .context("login should be advertised regardless of environment state or policy")?;
+            let description = login["description"].as_str().context("login description")?;
+            let ready = matches!(index, 4 | 5 | 8);
+            assert_eq!(
+                description.contains("In PowerShell, false skips profiles."),
+                ready && matches!(test_target_os(), TestTargetOs::Windows),
+            );
             parameters["properties"].get("shell").context(
                 "shell should be advertised regardless of environment state or shell mode",
             )?;
-            Ok(parameters.clone())
+            // Only shell-specific wording may change when the executor becomes ready.
+            parameters["properties"]["login"]["description"] = Value::Null;
+            Ok(parameters)
         })
         .collect::<Result<Vec<_>>>()?;
     assert_eq!(
@@ -3241,6 +3257,24 @@ async fn deferred_executor_guardian_uses_newly_ready_step_environment(
     let server = start_mock_server().await;
     let completed_response =
         |id: &str, item| sse(vec![ev_response_created(id), item, ev_completed(id)]);
+    if tool == "mcp_elicitation" {
+        // Probe flags are observational, so the async scorer still runs. Keep its
+        // responses separate from the parent and synchronous Guardian review.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "model": "gpt-5.6-luna",
+                "tool_choice": "none",
+            })))
+            .respond_with(core_test_support::responses::sse_response(
+                completed_response(
+                    "resp-guardian-score",
+                    ev_assistant_message("msg-guardian-score", "high"),
+                ),
+            ))
+            .with_priority(/*p*/ 1)
+            .mount(&server)
+            .await;
+    }
     let responses = mount_sse_sequence(
         &server,
         vec![
@@ -3392,17 +3426,18 @@ async fn deferred_executor_guardian_uses_newly_ready_step_environment(
         .await?;
     wait_for_response_request_count(&responses, /*expected_count*/ 1).await;
     attach_tx.send(()).expect("attach remote environment");
-    let mut denial_reason = None;
+    let mut was_denied = false;
     wait_for_event(&test.codex, |event| {
         if let EventMsg::GuardianAssessment(assessment) = event
             && assessment.status == GuardianAssessmentStatus::Denied
             && assessment.target_item_id.as_deref() == Some(EXEC_CALL_ID)
         {
-            denial_reason = assessment.review_reason;
+            was_denied = true;
         }
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+    assert!(was_denied, "Guardian should deny the action");
 
     let requests = responses.requests();
     assert!(
@@ -3420,8 +3455,6 @@ async fn deferred_executor_guardian_uses_newly_ready_step_environment(
     let guardian_context = guardian_request.message_input_texts("user").join("\n");
     // Both actions start in the remote-primary step, but the MCP server runs locally.
     let (owner_denied_path, other_denied_path) = if tool == "mcp_elicitation" {
-        // The low score is labeled local, but the model saw the remote primary's rules.
-        assert_eq!(denial_reason, Some(GuardianReviewReason::FreshRequired));
         (&local_denied_path, &remote_denied_path)
     } else {
         (&remote_denied_path, &local_denied_path)
