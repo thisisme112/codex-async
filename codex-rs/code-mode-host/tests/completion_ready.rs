@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use codex_code_mode::*;
 use codex_code_mode_runtime::InProcessCodeModeSession;
+use codex_core::ProcessOwnedGrpcCodeModeSessionProvider;
 use pretty_assertions::assert_eq;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -77,7 +78,7 @@ async fn completion_contract_across_providers() {
     let host = host::HostHarness::start("grpc://127.0.0.1:0")
         .await
         .unwrap();
-    let stdio = ProcessOwnedCodeModeSessionProvider::with_host_program(
+    let stdio = ProcessOwnedGrpcCodeModeSessionProvider::with_host_program(
         codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").unwrap(),
     );
     let grpc = GrpcCodeModeSessionProvider::new(&host.endpoint);

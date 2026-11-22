@@ -32,6 +32,7 @@ pub(super) fn execute_request(
     request: ExecuteRequest,
 ) -> Result<grpc::ExecuteRequest, String> {
     Ok(grpc::ExecuteRequest {
+        catalog_revision: None,
         completion_ready: false,
         session_id: session_id.to_string(),
         execution_id,

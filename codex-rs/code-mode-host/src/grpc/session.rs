@@ -18,6 +18,7 @@ use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::grpc as proto;
 use codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_CALLS;
 use codex_code_mode_runtime::InProcessCodeModeSession;
+use codex_code_mode_runtime::ToolPreload;
 use serde_json::Value as JsonValue;
 use tokio::sync::Notify;
 use tokio::sync::OwnedSemaphorePermit;
@@ -100,6 +101,13 @@ pub(super) struct BoundedIds<T = String> {
     order: VecDeque<T>,
 }
 
+struct GrpcSessionOptions {
+    runtime: CodeModeSessionOptions,
+    max_pending_delegate_calls: usize,
+    completion_ready: bool,
+    tool_preloads: &'static [ToolPreload],
+}
+
 impl GrpcHostState {
     pub(super) fn new() -> Self {
         Self {
@@ -115,6 +123,7 @@ impl GrpcHostState {
         options: CodeModeSessionOptions,
         max_pending_delegate_calls: usize,
         completion_ready: bool,
+        tool_preloads: &'static [ToolPreload],
     ) -> Result<GrpcStream<proto::SessionEvent>, Status> {
         let id = Uuid::new_v4();
         let (events, receiver) = mpsc::channel(OUTGOING_CHANNEL_CAPACITY);
@@ -125,15 +134,19 @@ impl GrpcHostState {
             event_sender,
             closed,
             Arc::clone(&self.delegate_permits),
-            options,
-            max_pending_delegate_calls,
-            completion_ready,
+            GrpcSessionOptions {
+                runtime: options,
+                max_pending_delegate_calls,
+                completion_ready,
+                tool_preloads,
+            },
         );
         events
             .try_send(Ok(proto::SessionEvent {
                 event: Some(proto::session_event::Event::Opened(proto::SessionOpened {
                     session_id: id.to_string(),
                     completion_ready,
+                    supports_catalog_revision: true,
                     output_truncation: match session.runtime.output_truncation() {
                         CodeModeOutputTruncation::Server => {
                             Some(proto::OutputTruncation::Server.into())
@@ -228,9 +241,7 @@ impl GrpcSession {
         events: EventSender,
         closed: CancellationToken,
         delegate_permits: Arc<Semaphore>,
-        options: CodeModeSessionOptions,
-        max_pending_delegate_calls: usize,
-        completion_ready: bool,
+        options: GrpcSessionOptions,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak: &Weak<Self>| {
             let failure_session = weak.clone();
@@ -242,17 +253,20 @@ impl GrpcSession {
             });
             Self {
                 id,
-                completion_ready,
-                runtime: Arc::new(InProcessCodeModeSession::with_options(
-                    options,
+                completion_ready: options.completion_ready,
+                runtime: Arc::new(InProcessCodeModeSession::with_options_and_tool_preloads(
+                    options.runtime,
                     Some(failure_handler),
+                    options.tool_preloads,
                 )),
                 closed,
                 state: Mutex::new(SessionState::default()),
                 events,
                 cells_changed: Notify::new(),
                 delegate_permits,
-                client_delegate_permits: Arc::new(Semaphore::new(max_pending_delegate_calls)),
+                client_delegate_permits: Arc::new(Semaphore::new(
+                    options.max_pending_delegate_calls,
+                )),
             }
         })
     }

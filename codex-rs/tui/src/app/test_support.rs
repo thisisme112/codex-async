@@ -15,6 +15,16 @@ use codex_models_manager::test_support::get_model_offline_for_tests;
 pub(crate) use super::cloud_switch_wait::ClipboardHandoff;
 pub(crate) use super::cloud_switch_wait::wait_for_cloud_switch;
 
+/// Opt in to testing the original Command Center modal through the chat widget.
+pub(super) fn use_modal_agents_overview(app: &mut App) {
+    app.config
+        .features
+        .disable(Feature::TuiWorkspace)
+        .expect("disable TUI workspace for the modal fixture");
+    app.cli_kv_overrides
+        .push(("features.tui_workspace".to_owned(), false.into()));
+}
+
 pub(super) fn enable_side_retention(app: &mut App) -> Result<()> {
     app.config.features.enable(Feature::TuiWorkspace)?;
     app.local_settings.transcript_mode = crate::transcript_mode::TranscriptMode::Owned;
@@ -43,6 +53,8 @@ pub(crate) async fn make_test_app() -> Box<App> {
     let session_telemetry = test_session_telemetry(&config, model.as_str());
 
     Box::new(App {
+        statusline_picker: None,
+        statusline_metrics: Default::default(),
         provider_writes: HashMap::new(),
         feature_write_lock: Arc::default(),
         config_notification_test_generation: 0,
@@ -63,6 +75,7 @@ pub(crate) async fn make_test_app() -> Box<App> {
         local_settings: crate::local_settings::LocalSettings::from(&config),
         config,
         state_db: None,
+        realtime_call_client: Arc::default(),
         cli_kv_overrides: Vec::new(),
         harness_overrides: ConfigOverrides::default(),
         loader_overrides: LoaderOverrides::without_managed_config_for_tests(),
@@ -115,6 +128,7 @@ pub(crate) async fn make_test_app() -> Box<App> {
         daemon_cli_executable: None,
         pending_update_action: None,
         daemon_restart: None,
+        remote_control_pending: false,
         pending_shutdown_exit_thread_id: None,
         windows_sandbox: WindowsSandboxState::default(),
         thread_event_channels: HashMap::new(),
@@ -138,6 +152,7 @@ pub(crate) async fn make_test_app() -> Box<App> {
         divider_drag: None,
         pane_resize: None,
         passive_link_drag: None,
+        sidebar_press: None,
         abandoned_side_threads: HashSet::new(),
         active_thread_id: None,
         active_thread_rx: None,
