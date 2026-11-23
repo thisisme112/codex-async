@@ -95,6 +95,13 @@ impl ChatWidget {
         contexts
     }
 
+    pub(crate) fn set_key_chord_pending(&mut self, pending: bool) {
+        self.bottom_pane.key_chord_pending = pending;
+        if pending && !self.has_active_modal() {
+            self.bottom_pane.record_composer_activity_at(Instant::now());
+        }
+    }
+
     pub(crate) fn take_key_chord_reset(&mut self) -> bool {
         std::mem::take(&mut self.bottom_pane.key_chord_reset_requested)
     }
@@ -113,6 +120,14 @@ impl ChatWidget {
     pub(crate) fn inherit_view_transition_key_guard(&mut self, previous: &mut Self) {
         if let Some(guard) = previous.bottom_pane.view_transition_key_guard.take() {
             self.bottom_pane.view_transition_key_guard = Some(guard);
+        }
+    }
+
+    pub(crate) fn protect_modal_from_held_activation_key(&mut self, now: Instant) {
+        if !self.bottom_pane.reports_key_releases()
+            && let Some(guard) = &mut self.bottom_pane.view_transition_key_guard
+        {
+            guard.extend_for_protected_view(now);
         }
     }
 
