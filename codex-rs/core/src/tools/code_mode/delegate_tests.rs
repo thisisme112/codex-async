@@ -309,7 +309,10 @@ async fn replacement_hands_off_gated_call_and_idle_notify_does_not_block_tools()
     drop(old); // Receiver holds the message, but its Cell gate is still closed.
     let _replacement = broker.start_turn_worker(session.clone(), step, tracker);
     broker.mark_cell_ready_for_dispatch(&cell_id, /*originating_call*/ None);
-    assert_eq!(callback.await, Ok(serde_json::json!("audit-probe-ok")));
+    assert_eq!(
+        callback.await,
+        Ok(CodeModeToolResult::from(serde_json::json!("audit-probe-ok")))
+    );
 
     let mut notification = delegate.notify(
         "notice".to_string(),
@@ -323,7 +326,7 @@ async fn replacement_hands_off_gated_call_and_idle_notify_does_not_block_tools()
         delegate
             .invoke_tool(invocation, CancellationToken::new())
             .await,
-        Ok(serde_json::json!("audit-probe-ok"))
+        Ok(CodeModeToolResult::from(serde_json::json!("audit-probe-ok")))
     );
     assert!(futures::poll!(notification.as_mut()).is_pending());
     *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
