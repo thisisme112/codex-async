@@ -110,8 +110,6 @@ use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::HooksListEntry;
 use codex_app_server_protocol::ListMcpServerStatusParams;
 use codex_app_server_protocol::ListMcpServerStatusResponse;
-#[cfg(test)]
-use codex_app_server_protocol::McpAuthStatus;
 use codex_app_server_protocol::McpServerStatus;
 use codex_app_server_protocol::McpServerStatusDetail;
 use codex_app_server_protocol::MergeStrategy;
@@ -707,7 +705,6 @@ pub(crate) struct App {
     sidebar_press: Option<side_focus::SidebarPress>,
     abandoned_side_threads: HashSet<ThreadId>,
     active_thread_id: Option<ThreadId>,
-    active_thread_rx: Option<mpsc::Receiver<ThreadBufferedEvent>>,
     primary_thread_id: Option<ThreadId>,
     last_subagent_backfill_attempt: Option<ThreadId>,
     primary_session_configured: Option<ThreadSessionState>,
@@ -902,6 +899,7 @@ impl App {
         if matches!(event, TuiEvent::Draw) && tui::tmux_mouse_disabled() {
             self.sidebar_press = None;
             self.divider_drag = None;
+            self.agents_overview.workspace.divider_drag_viewport = None;
             self.chat_widget.end_composer_drag();
             self.chat_widget.rendered_selection.borrow_mut().end_drag();
         }
@@ -919,7 +917,10 @@ impl App {
                     return Ok(AppRunControl::Continue);
                 }
             }
-            _ => self.sidebar_press = None,
+            _ => {
+                self.sidebar_press = None;
+                self.agents_overview.workspace.divider_drag_viewport = None;
+            }
         }
         self.transcript_view.agent_links = self
             .side_retention_enabled(tui)
@@ -1052,6 +1053,15 @@ impl App {
         if let TuiEvent::Mouse(mouse) = &event
             && self.handle_workspace_mouse(tui, *mouse)
         {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                && self
+                    .agents_overview
+                    .workspace
+                    .divider_drag_viewport
+                    .is_some()
+            {
+                self.refresh_link_hover(tui)?;
+            }
             return Ok(AppRunControl::Continue);
         }
         if matches!(&event, TuiEvent::Key(_))
@@ -1060,6 +1070,12 @@ impl App {
             })
         {
             return Ok(AppRunControl::Continue);
+        }
+        if matches!(&event, TuiEvent::Resize(_) | TuiEvent::Resume) {
+            self.chat_widget
+                .empty_state_animation
+                .borrow_mut()
+                .invalidate_window_size();
         }
         // Resume arrives after suspension; retain the last painted phase across hidden owners.
         if matches!(&event, TuiEvent::Resume) || !tui.is_owned_screen() || self.overlay.is_some() {
@@ -1113,14 +1129,28 @@ impl App {
                 .active_view_accepts_input_when_disconnected()
             && let TuiEvent::Key(key) = &event
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-            && key.modifiers.contains(KeyModifiers::CONTROL)
             && let KeyCode::Char(character) = key.code
-            && (character.eq_ignore_ascii_case(&'c')
-                || (character.eq_ignore_ascii_case(&'d')
-                    && self.chat_widget.composer_is_empty()
-                    && self.chat_widget.no_modal_or_popup_active()))
         {
-            return Ok(AppRunControl::Exit(ExitReason::UserRequested));
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && (character.eq_ignore_ascii_case(&'c')
+                    || (character.eq_ignore_ascii_case(&'d')
+                        && self.chat_widget.composer_is_empty()
+                        && self.chat_widget.no_modal_or_popup_active()))
+            {
+                return Ok(AppRunControl::Exit(ExitReason::UserRequested));
+            }
+            if crate::key_hint::ctrl(KeyCode::Char('r')).is_press(*key)
+                && self.overlay.is_none()
+                && self.can_retry_reconnect()
+                && !self.key_chord_matcher.is_pending()
+                && self.chat_widget.accepts_reconnect_shortcut()
+                && !self
+                    .chat_widget
+                    .active_view_is(agents_overview::AGENTS_OVERVIEW_VIEW_ID)
+            {
+                self.retry_reconnect();
+                return Ok(AppRunControl::Continue);
+            }
         }
         let screen_size = tui.screen_size_for_event(&event)?;
         let draws_history = matches!(
@@ -1598,13 +1628,14 @@ impl App {
             self.maybe_run_resize_reflow(tui, screen_size)?;
         }
         let hud = self.workspace_hud(tui, screen_size.into());
+        self.chat_widget.begin_steer_hint_draw();
+        let mut rendered_area = Rect::default();
         self.with_chat_widget_frame(screen_size.width, |desired_height, chat_widget| {
             let desired_height = if dashboard_visible {
                 screen_size.height
             } else {
                 desired_height
             };
-            let mut rendered_area = Rect::default();
             tui.draw_with_resize_reflow(desired_height, screen_size, hud, |frame| {
                 let area = frame.area();
                 rendered_area = area;
@@ -1617,9 +1648,10 @@ impl App {
                     frame.set_cursor_style(chat_widget.cursor_style(area));
                     frame.set_cursor_position((x, y));
                 }
-            })?;
-            Ok(rendered_area)
-        })
+            })
+        })?;
+        self.chat_widget.finish_steer_hint_draw();
+        Ok(rendered_area)
     }
 
     fn with_chat_widget_frame<T>(

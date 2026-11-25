@@ -41,6 +41,7 @@ use response_delivery::ResponseDelivery;
 
 use crate::CodexResponsesHeaders;
 use crate::PromptCacheKey;
+use crate::UsageAttributionPolicy;
 use crate::tools::ExecutedToolCalls;
 use async_channel::Sender;
 use codex_api::AgentIdentityTelemetry;
@@ -70,6 +71,7 @@ use codex_api::SseTelemetry;
 use codex_api::StreamOptions;
 use codex_api::TransportError;
 use codex_api::WebsocketTelemetry;
+pub use codex_api::X_CODEX_TURN_METADATA_HEADER;
 use codex_api::auth_header_telemetry;
 use codex_api::build_session_headers;
 use codex_api::create_text_param_for_request;
@@ -130,6 +132,7 @@ use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
 use crate::client_common::SamplingStream;
+use crate::client_common::provider_allows_service_tier;
 use crate::context::BaseInstructionsFragment;
 use crate::context::ContextualUserFragment;
 use crate::cyber_access_program;
@@ -169,7 +172,6 @@ pub const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
 pub const X_CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
 pub const X_CODEX_ROUTING_HINT_HEADER: &str = "x-codex-routing-hint";
 pub const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
-pub const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 pub const X_CODEX_PARENT_THREAD_ID_HEADER: &str = "x-codex-parent-thread-id";
 pub const X_CODEX_WINDOW_ID_HEADER: &str = "x-codex-window-id";
 pub const X_OPENAI_MEMGEN_REQUEST_HEADER: &str = "x-openai-memgen-request";
@@ -354,6 +356,7 @@ impl RequestRouteTelemetry {
 /// call site.
 #[derive(Debug, Clone)]
 pub struct ModelClient {
+    usage_attribution_policy: UsageAttributionPolicy,
     state: Arc<ModelClientState>,
     agent_identity_policy: AgentIdentityAuthPolicy,
     prompt_cache_key_policy: PromptCacheKey,
@@ -708,6 +711,7 @@ impl ModelClient {
             prompt_cache_key_policy: PromptCacheKey::default(),
             session_id_override: None,
             codex_responses_headers: None,
+            usage_attribution_policy: UsageAttributionPolicy::default(),
             event_sender: None,
             http_client_factory,
             restored_history: false,
@@ -749,7 +753,7 @@ impl ModelClient {
         prompt_cache_key: PromptCacheKey,
         session_id_override: Option<String>,
         event_sender: Sender<ProtocolEvent>,
-        codex_responses_headers: Option<Arc<CodexResponsesHeaders>>,
+        thread_extension_data: &codex_extension_api::ExtensionData,
         api_key_cyber_access_programs: cyber_access_program::ApiKeyCyberAccessPrograms,
         required_cyber_access_programs: Option<
             Arc<cyber_access_program::RequiredCyberAccessPrograms>,
@@ -758,7 +762,11 @@ impl ModelClient {
         self.prompt_cache_key_policy = prompt_cache_key;
         self.session_id_override = session_id_override;
         self.event_sender = Some(event_sender);
-        self.codex_responses_headers = codex_responses_headers;
+        self.codex_responses_headers = thread_extension_data.get::<CodexResponsesHeaders>();
+        self.usage_attribution_policy = thread_extension_data
+            .get::<UsageAttributionPolicy>()
+            .map(|policy| *policy)
+            .unwrap_or_default();
         self.api_key_cyber_access_programs = api_key_cyber_access_programs;
         self.required_cyber_access_programs = required_cyber_access_programs;
         self
@@ -1346,13 +1354,7 @@ impl ModelClient {
         let service_tier = model_info
             .service_tier_for_request(service_tier)
             .filter(|tier| {
-                // Bedrock requires an advertised tier, including for flex, which the
-                // generic OpenAI resolver permits without catalog support.
-                !self.state.provider.info().is_amazon_bedrock()
-                    || model_info
-                        .service_tiers
-                        .iter()
-                        .any(|supported| supported.id == *tier)
+                provider_allows_service_tier(self.state.provider.info(), model_info, tier)
             });
         if !include_internal {
             let captures_result_bodies = self.captures_result_bodies();
@@ -1619,7 +1621,11 @@ impl ModelClient {
         let start = Instant::now();
         let result = match tokio::time::timeout(
             websocket_connect_timeout,
-            ApiWebSocketResponsesClient::new(api_provider, api_auth).connect(
+            ApiWebSocketResponsesClient::new(
+                with_default_stream_exclusions(api_provider),
+                api_auth,
+            )
+            .connect(
                 http_client_factory,
                 headers,
                 codex_login::default_client::default_headers(),
@@ -1690,6 +1696,7 @@ impl ModelClient {
     ) -> ApiHeaderMap {
         let mut headers = build_responses_headers(
             self.state.beta_features_header.as_deref(),
+            self.usage_attribution_policy,
             /*turn_state*/ None,
         );
         add_originator_header(&mut headers, self.state.originator.as_str());
@@ -1766,6 +1773,7 @@ impl<'a> ResponsesHttpExecutor<'a> {
             extra_headers: {
                 let mut headers = build_responses_headers(
                     self.client.state.beta_features_header.as_deref(),
+                    self.client.usage_attribution_policy,
                     Some(turn_state),
                 );
                 add_originator_header(&mut headers, self.client.state.originator.as_str());
@@ -2232,7 +2240,7 @@ impl ResponsesHttpExecutor<'_> {
             }
             let client = ApiResponsesClient::new(
                 transport,
-                client_setup.api_provider,
+                with_default_stream_exclusions(client_setup.api_provider),
                 client_setup.api_auth,
             )
             .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
@@ -2947,13 +2955,18 @@ fn is_guardian_reviewer(responses_headers: &ApiHeaderMap) -> bool {
 ///
 /// - `x-codex-beta-features`: comma-separated beta feature keys enabled for the session.
 /// - `x-codex-turn-state`: sticky routing token captured earlier in the turn.
-/// - `x-codex-exclude` asks the server to omit the echoed tool catalog.
+/// - `x-codex-exclude`: response fields the client can omit from the stream.
 fn build_responses_headers(
     beta_features_header: Option<&str>,
+    usage_attribution_policy: UsageAttributionPolicy,
     turn_state: Option<&Arc<OnceLock<String>>>,
 ) -> ApiHeaderMap {
     let mut headers = ApiHeaderMap::new();
-    headers.insert("x-codex-exclude", HeaderValue::from_static("tools"));
+    let exclusions = match usage_attribution_policy {
+        UsageAttributionPolicy::Exclude => "tools,usage.attribution",
+        UsageAttributionPolicy::Retain => "tools",
+    };
+    headers.insert("x-codex-exclude", HeaderValue::from_static(exclusions));
     if let Some(value) = beta_features_header
         && !value.is_empty()
         && let Ok(header_value) = HeaderValue::from_str(value)
@@ -2967,6 +2980,20 @@ fn build_responses_headers(
         headers.insert(X_CODEX_TURN_STATE_HEADER, header_value);
     }
     headers
+}
+
+/// Apply Responses stream defaults after resolving provider headers so explicit exclusions win.
+fn with_default_stream_exclusions(mut provider: ApiProvider) -> ApiProvider {
+    // Text and custom tool input deltas don't need sequence numbers.
+    // Reasoning replay only needs the ciphertext on the finished item.
+    // Negotiate separately so older servers still recognize x-codex-exclude.
+    provider
+        .headers
+        .entry("x-codex-exclude-stream-fields")
+        .or_insert(HeaderValue::from_static(
+            "delta.sequence_number,reasoning.added.encrypted_content",
+        ));
+    provider
 }
 
 fn add_responses_lite_header(headers: &mut ApiHeaderMap, use_responses_lite: bool) {

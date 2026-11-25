@@ -298,7 +298,8 @@ pub(crate) struct AgentsOverviewThreadRefresh {
 #[derive(Debug, Default)]
 pub(crate) struct AgentPickerThreadRefresh {
     pub(crate) threads: Vec<Thread>,
-    pub(crate) archived_thread_ids: std::collections::HashSet<ThreadId>,
+    pub(crate) archived_threads:
+        std::collections::HashMap<ThreadId, crate::multi_agents::AgentMetadata>,
 }
 
 /// Source-backed replacement for the outgoing widget's width-bound streaming rows.
@@ -1097,7 +1098,11 @@ pub(crate) enum AppEvent {
     },
 
     /// Result of computing a `/diff` command.
-    DiffResult(PathUri, String),
+    DiffResult {
+        thread_id: Option<ThreadId>,
+        cwd: PathUri,
+        text: String,
+    },
 
     /// Open the app link view in the bottom pane.
     OpenAppLink {
@@ -1627,6 +1632,8 @@ pub(crate) enum AppEvent {
         model: String,
     },
 
+    /// Adopt the widget's active catalog without requesting another model list.
+    SyncModelCatalog,
     /// Fetch the current catalog even when cached models produce no picker.
     FetchModels {
         request_id: uuid::Uuid,

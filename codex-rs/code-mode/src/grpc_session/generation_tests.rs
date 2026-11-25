@@ -8,6 +8,7 @@ use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeNestedToolCall;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::CodeModeToolKind;
+use codex_code_mode_protocol::CodeModeToolResult;
 use codex_code_mode_protocol::CompletionReadySupport;
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::NotificationFuture;
@@ -42,7 +43,7 @@ impl CodeModeSessionDelegate for RecordingDelegate {
         _cancellation_token: CancellationToken,
     ) -> ToolInvocationFuture<'a> {
         self.calls.lock().expect("calls lock").push(invocation);
-        Box::pin(async { Ok(json!({ "ok": true })) })
+        Box::pin(async { Ok(CodeModeToolResult::from(json!({ "ok": true }))) })
     }
 
     fn notify<'a>(
@@ -141,7 +142,7 @@ async fn reconnect_maps_every_delegate_callback_to_its_generation() {
         delegate
             .invoke_tool(invocation.clone(), CancellationToken::new())
             .await,
-        Ok(json!({ "ok": true }))
+        Ok(CodeModeToolResult::from(json!({ "ok": true })))
     );
     assert_eq!(
         delegate

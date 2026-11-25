@@ -5,6 +5,7 @@ use crate::EvidenceCursor;
 use anyhow::Context;
 use board_host::PausedClockHost;
 use board_host::board_host;
+use codex_core::guardian_review::PendingReviewWrites;
 use codex_history::CodexHarnessMetadata;
 use codex_history::HistoryInitialization;
 use codex_history::ResponseItemEnvelope;
@@ -13,8 +14,6 @@ use codex_history::RetainedUserMessage;
 use codex_history::RolloutItem;
 use codex_history::UserInputOrigin;
 use codex_message_board::SubscriptionChange;
-use codex_message_board::SubscriptionRequest;
-use codex_message_board::SubscriptionTarget;
 use codex_message_board::UpsertChannelRequest;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -39,6 +38,112 @@ use tokio::sync::mpsc::error::TryRecvError;
 #[path = "../tests/common/board_host.rs"]
 mod board_host;
 
+#[test_case::test_case(false; "caller cancelled before recorder admission")]
+#[test_case::test_case(true; "caller cancelled with projection blocked")]
+#[tokio::test]
+async fn initial_cutoff_and_retry_wait_for_live_revocation(
+    during_projection: bool,
+) -> anyhow::Result<()> {
+    core_test_support::skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let test = test_codex()
+        .with_thread_extension(PendingReviewWrites::default())
+        .with_history_mode(ThreadHistoryMode::Paginated)
+        .build_with_auto_env(&server)
+        .await?;
+    test.codex
+        .inject_response_items(vec![user_message_item("Approve the release.")])
+        .await?;
+    let root = test.session_configured.thread_id;
+    let history = &test.thread_store;
+    let cursor = EvidenceCursor::from_now(history.as_ref(), root).await?;
+    let writes = test
+        .codex
+        .thread_extension_data()
+        .get::<PendingReviewWrites>()
+        .context("root write tracker")?;
+    let (evidence, mut writer) = RootEvidence::new(
+        Default::default(),
+        history.clone(),
+        cursor.clone(),
+        writes.clone(),
+    );
+    let before = test.codex.guardian_authorization_version().await;
+
+    // A local flush holds the writer lock while awaiting the recorder task.
+    // Leave it suspended so the next instruction becomes live before its append.
+    let mut flush = Box::pin(tokio::task::unconstrained(history.flush_thread(root)));
+    assert!(futures::poll!(&mut flush).is_pending());
+    // Start a group that has already checked for pending writes. Reviews
+    // arriving after the revocation must not inherit this group's result.
+    let mut batches = NamedTraceEvents::subscribe("guardian_v3.cutoff_batch");
+    let mut earlier = Box::pin(evidence.capture_cutoff());
+    assert!(futures::poll!(&mut earlier).is_pending());
+    batches.next().await?;
+    let mut revoke = Box::pin(
+        test.codex
+            .inject_response_items_for_turn(vec![user_message_item("Stop the release.")]),
+    );
+    tokio::select! {
+        result = &mut revoke => anyhow::bail!("revocation finished before releasing the writer: {result:?}"),
+        result = tokio::time::timeout(Duration::from_secs(/*secs*/ 10), async {
+            while test.codex.guardian_authorization_version().await == before {
+                tokio::task::yield_now().await;
+            }
+        }) => result?,
+    }
+    let initial = evidence.capture_cutoff();
+    let retry = evidence.request_catch_up();
+    tokio::pin!(initial, retry);
+    // Exercise a shared capture before admission and a lone retry during projection.
+    if !during_projection {
+        assert!(futures::poll!(&mut initial).is_pending());
+    }
+    assert!(futures::poll!(&mut retry).is_pending());
+
+    if during_projection {
+        assert!(test.codex.state_db().is_some());
+        let db = codex_state::open_thread_history_db(test.config.sqlite_config()).await?;
+        let lock = db.begin_with("BEGIN IMMEDIATE").await?;
+        flush.await?;
+        // Read the complete canonical record without flushing or waiting for SQLite.
+        tokio::select! {
+            result = &mut revoke => anyhow::bail!("revocation finished with projection blocked: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(/*secs*/ 10), async {
+                while cursor.capture(history.as_ref()).await?.records().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+                anyhow::Ok(())
+            }) => result??,
+        }
+        drop(revoke);
+        assert!(writes.wait().now_or_never().is_none());
+        lock.rollback().await?;
+    } else {
+        drop(revoke);
+        assert!(writes.wait().now_or_never().is_none());
+        flush.await?;
+    }
+    let routed = retry.await?;
+    let cutoff = initial.await?;
+    let capture = writer.try_recv()?;
+    let [record] = capture.snapshot.records() else {
+        anyhow::bail!("expected the revocation");
+    };
+    assert_eq!(
+        serde_json::to_value(record)?["original"]["payload"]["content"][0]["text"],
+        "Stop the release."
+    );
+    assert_eq!(capture.snapshot.cutoff(), cutoff);
+    capture.finish();
+    assert_eq!(routed.await?, cutoff);
+    earlier.await?;
+    batches.next().await?;
+    assert!(batches.next().now_or_never().is_none());
+    test.codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn skips_a_partial_delivery_once_across_wakes_and_catch_up() -> anyhow::Result<()> {
     core_test_support::skip_if_no_network!(Ok(()));
@@ -56,13 +161,18 @@ async fn skips_a_partial_delivery_once_across_wakes_and_catch_up() -> anyhow::Re
         HistoryInitialization::New,
     )
     .await?;
-    let (evidence, mut writer) = RootEvidence::new(Default::default(), history.clone(), cursor);
+    let (evidence, mut writer) = RootEvidence::new(
+        Default::default(),
+        history.clone(),
+        cursor,
+        Default::default(),
+    );
 
     // The initial rollout header advances the writer even without evidence to route.
     history
         .persist_thread(root, PersistContext::Standard)
         .await?;
-    evidence.enqueue(/*routed*/ None).await?;
+    evidence.enqueue(/*cutoff*/ None).await?;
     let first = writer.try_recv()?;
     assert!(first.snapshot.records().is_empty());
 
@@ -89,9 +199,27 @@ async fn skips_a_partial_delivery_once_across_wakes_and_catch_up() -> anyhow::Re
             items,
         })
         .await?;
+    // A request can go to a human after binding. Capturing its source position alone
+    // must leave the worker idle, even when there are unread originals.
+    let bound = evidence.capture_cutoff().await?;
+    assert!(matches!(writer.try_recv(), Err(TryRecvError::Empty)));
+    history
+        .append_items(AppendThreadItemsParams {
+            thread_id: root,
+            items: vec![RolloutItem::ResponseItem(ResponseItemEnvelope {
+                item: user_message_item("Later authorization"),
+                metadata: Some(CodexHarnessMetadata {
+                    user_input_order: Some(3),
+                    ..Default::default()
+                }),
+            })],
+        })
+        .await?;
+    history.flush_thread(root).await?;
     let mut warnings = NamedTraceEvents::subscribe("guardian_v3.evidence_skipped");
-    evidence.enqueue(/*routed*/ None).await?;
-    let routed = writer.try_recv()?.snapshot;
+    evidence.enqueue(Some(bound)).await?;
+    let capture = writer.try_recv()?;
+    let routed = &capture.snapshot;
     let [next] = routed.records() else {
         anyhow::bail!("expected only the complete delivery")
     };
@@ -100,14 +228,38 @@ async fn skips_a_partial_delivery_once_across_wakes_and_catch_up() -> anyhow::Re
     assert_eq!(next.id.ordinal, skipped + 1);
     warnings.next().await?;
 
-    evidence.enqueue(/*routed*/ None).await?;
+    // A second waiter at the same cutoff shares the writer's progress, even though
+    // a newer original is already durable.
+    let ready = evidence.request_through(Some(bound)).await?;
     assert!(matches!(writer.try_recv(), Err(TryRecvError::Empty)));
-
-    // A review at that very same position still needs a response from the writer.
-    let mut ready = evidence.request_catch_up().await?;
+    tokio::pin!(ready);
     assert!(futures::poll!(&mut ready).is_pending());
-    writer.try_recv()?.finish();
-    assert_eq!(ready.await?, routed.cutoff());
+    let cutoff = routed.cutoff();
+    capture.finish();
+    assert_eq!(ready.await?, cutoff);
+    let latest = evidence.request_catch_up().await?;
+    let later = writer.try_recv()?;
+    assert_eq!(later.snapshot.records().len(), 1);
+    assert!(later.snapshot.cutoff().end_ordinal_exclusive > cutoff.end_ordinal_exclusive);
+    let end = later.snapshot.cutoff();
+    {
+        // A later enqueue may hold the cursor while the queue is full.
+        let _guard = evidence.enqueued.try_lock()?;
+        let through = async |target| evidence.request_through(Some(target)).await?.await;
+        assert_eq!(
+            through(bound).now_or_never().context("already routed")??,
+            bound
+        );
+        let waiting = through(end);
+        tokio::pin!(waiting);
+        assert!(waiting.as_mut().now_or_never().is_none());
+        later.finish();
+        assert_eq!(
+            waiting.now_or_never().context("blocked after routing")??,
+            end
+        );
+    }
+    assert_eq!(latest.await?, end);
     assert!(warnings.next().now_or_never().is_none());
     test.codex.shutdown_and_wait().await?;
     Ok(())
@@ -127,7 +279,13 @@ async fn retries_unavailable_history_and_remembers_rejected_evidence() -> anyhow
         .persist_thread(root, PersistContext::Standard)
         .await?;
     let cursor = EvidenceCursor::from_now(history.as_ref(), root).await?;
-    let (evidence, _writer) = RootEvidence::new(Default::default(), history.clone(), cursor);
+    let delivered = cursor.position();
+    let (evidence, _writer) = RootEvidence::new(
+        Default::default(),
+        history.clone(),
+        cursor,
+        Default::default(),
+    );
 
     let path = test
         .session_configured
@@ -136,10 +294,22 @@ async fn retries_unavailable_history_and_remembers_rejected_evidence() -> anyhow
         .context("rollout path")?;
     let hidden = path.with_extension("unavailable");
     tokio::fs::rename(path, &hidden).await?;
-    let unavailable = evidence.enqueue(/*routed*/ None).await;
+    let unavailable = evidence.enqueue(/*cutoff*/ None).await;
+    let mut batches = NamedTraceEvents::subscribe("guardian_v3.cutoff_batch");
+    let (initial, retry) = tokio::join!(evidence.capture_cutoff(), evidence.request_catch_up());
     tokio::fs::rename(hidden, path).await?;
     assert!(unavailable.is_err());
-    evidence.enqueue(/*routed*/ None).await?;
+    assert_eq!(
+        initial
+            .err()
+            .context("expected a failed capture")?
+            .to_string(),
+        retry.err().context("expected a failed retry")?.to_string()
+    );
+    batches.next().await?;
+    assert!(batches.next().now_or_never().is_none());
+    assert_eq!(evidence.capture_cutoff().await?, delivered);
+    evidence.enqueue(/*cutoff*/ None).await?;
 
     history
         .append_items(AppendThreadItemsParams {
@@ -150,7 +320,7 @@ async fn retries_unavailable_history_and_remembers_rejected_evidence() -> anyhow
         })
         .await?;
     let rejected = evidence
-        .enqueue(/*routed*/ None)
+        .enqueue(/*cutoff*/ None)
         .await
         .err()
         .context("expected rejected evidence")?;
@@ -160,11 +330,85 @@ async fn retries_unavailable_history_and_remembers_rejected_evidence() -> anyhow
     // A fresh flush would now fail. The review must still get the original rejection.
     assert!(history.flush_thread(root).await.is_err());
     let error = evidence
-        .request_catch_up()
+        .capture_cutoff()
         .await
         .err()
         .context("expected a rejected cutoff")?;
     assert_eq!(error.to_string(), reason);
+    for cutoff in [None, Some(delivered)] {
+        let error = evidence
+            .request_through(cutoff)
+            .await
+            .err()
+            .context("expected a rejected cutoff")?;
+        assert_eq!(error.to_string(), reason);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn retries_share_a_queued_cutoff_and_skip_the_tail_read_when_alone() -> anyhow::Result<()> {
+    core_test_support::skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let test = test_codex()
+        .with_history_mode(ThreadHistoryMode::Paginated)
+        .build_with_auto_env(&server)
+        .await?;
+    let root = test.session_configured.thread_id;
+    let history = &test.thread_store;
+    history
+        .persist_thread(root, PersistContext::Standard)
+        .await?;
+    let (evidence, mut writer) = RootEvidence::new(
+        Default::default(),
+        history.clone(),
+        EvidenceCursor::start(root),
+        Default::default(),
+    );
+    let mut batches = NamedTraceEvents::subscribe("guardian_v3.cutoff_batch");
+
+    // Queue all three before the worker runs on this current-thread runtime.
+    let mut cancelled = Box::pin(evidence.capture_cutoff());
+    let mut initial = Box::pin(evidence.capture_cutoff());
+    let mut retry = Box::pin(evidence.request_catch_up());
+    assert!(futures::poll!(&mut cancelled).is_pending());
+    assert!(futures::poll!(&mut initial).is_pending());
+    assert!(futures::poll!(&mut retry).is_pending());
+    batches.next().await?;
+    drop(cancelled);
+
+    // A caller arriving after the flush starts needs another capture even at the same tail.
+    let late = evidence.capture_cutoff().await?;
+    let bound = initial.await?;
+    // Only the next, lone retry should see this revocation.
+    test.codex
+        .inject_response_items_for_turn(vec![user_message_item("Stop the release.")])
+        .await?;
+    let routed = retry.await?;
+    writer.try_recv()?.finish();
+    assert_eq!(routed.await?, bound);
+    assert_eq!(late, bound);
+    batches.next().await?;
+    assert!(batches.next().now_or_never().is_none());
+
+    // A caller that cancels while queued must not force a tail read for the retry.
+    let mut cancelled = Box::pin(evidence.capture_cutoff());
+    assert!(futures::poll!(&mut cancelled).is_pending());
+    drop(cancelled);
+    let routed = evidence.request_catch_up().await?;
+    let capture = writer.try_recv()?;
+    let [record] = capture.snapshot.records() else {
+        anyhow::bail!("expected the revocation");
+    };
+    assert_eq!(
+        serde_json::to_value(record)?["original"]["payload"]["content"][0]["text"],
+        "Stop the release."
+    );
+    let end = capture.snapshot.cutoff();
+    capture.finish();
+    assert_eq!(routed.await?, end);
+    assert!(batches.next().now_or_never().is_none());
+    test.codex.shutdown_and_wait().await?;
     Ok(())
 }
 
@@ -193,6 +437,7 @@ async fn catch_up_waits_for_committed_delivery_and_allows_later_posts(
     };
     std::fs::write(home.path().join("config.toml"), settings)?;
     let test = test_codex()
+        .with_thread_extension(PendingReviewWrites::default())
         .with_home(home)
         .with_history_mode(ThreadHistoryMode::Paginated)
         .with_model_info_override("gpt-5.6-luna", |_| {})
@@ -286,7 +531,7 @@ async fn catch_up_waits_for_committed_delivery_and_allows_later_posts(
             .await?;
         Ok(original)
     };
-    // Create the channels through the housekeeper and subscribe through the reviewer's handle.
+    // Create the channels through the housekeeper and subscribe the live reviewer.
     let _seed_route = mount_sse_once(
         &server,
         sse(vec![
@@ -302,19 +547,16 @@ async fn catch_up_waits_for_committed_delivery_and_allows_later_posts(
         .home()
         .join("message_board_guardian_1.sqlite");
     assert_eq!(tokio::fs::try_exists(database).await?, !in_memory);
+    let binding = thread
+        .get::<crate::ActorReviewer>()
+        .context("attached reviewer")?
+        .binding(Arc::clone(board))?;
+    let inbox = &binding.inbox;
     for channel in ["release", "releases-copy"] {
-        board
-            .set_subscription(
-                root,
-                SubscriptionRequest {
-                    target: SubscriptionTarget::Channel(channel.into()),
-                    target_agent: None,
-                    change: SubscriptionChange::Subscribe,
-                },
-            )
+        inbox
+            .set_subscription(channel.into(), SubscriptionChange::Subscribe)
             .await?;
     }
-    let inbox = evidence.delivery.inbox(root);
     let _first_route = mount_sse_once(
         &server,
         sse(vec![
@@ -330,7 +572,8 @@ async fn catch_up_waits_for_committed_delivery_and_allows_later_posts(
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let first_original = append_user_message(2, "Stop the release.").await?;
     let wait = Duration::from_secs(15);
-    let mut first = evidence.request_catch_up().await?;
+    let first = evidence.request_catch_up().await?;
+    tokio::pin!(first);
     tokio::time::timeout(wait, host.started.notified()).await?;
     assert!(futures::poll!(&mut first).is_pending());
     assert_eq!(inbox.len(), 0);
@@ -378,26 +621,24 @@ async fn catch_up_waits_for_committed_delivery_and_allows_later_posts(
 }
 
 #[tokio::test]
-async fn a_pending_post_survives_unsubscribe_and_is_admitted_once_per_conversation()
+async fn committed_posts_reach_current_subscribers_once_across_channel_retries()
 -> anyhow::Result<()> {
     use crate::EvidenceId;
+    use crate::inbox::ActorInbox;
     use crate::inbox::LiveDelivery;
-    use codex_message_board::AgentMessageBoard;
+    use codex_guardian_reviewer::ReviewDeadline;
     use codex_message_board::AppendRequest;
+    use codex_message_board::LocalAgentMessageBoard;
     use codex_message_board::PostDestination;
     use codex_protocol::AgentPath;
     use codex_protocol::ThreadId;
     use codex_protocol::protocol::TruncationPolicy;
-    use codex_state::SqliteConfig;
     use serde_json::json;
     use std::future::ready;
+    use std::sync::atomic::Ordering;
+    use tokio_util::sync::CancellationToken;
 
     let root = ThreadId::new();
-    let directory = tempfile::tempdir()?;
-    let storage = crate::local_board(
-        SqliteConfig::new_for_testing(directory.path().to_path_buf().try_into()?),
-        root.into(),
-    );
     let subscriber = ThreadId::new();
     let subscriber_path = AgentPath::root()
         .join("subscriber")
@@ -406,89 +647,107 @@ async fn a_pending_post_survives_unsubscribe_and_is_admitted_once_per_conversati
         (root, AgentPath::root()),
         (subscriber, subscriber_path),
     ]);
-    let writer = storage.read_write().open(host.clone()).await?;
-    let reader = storage.read_only().open(host.clone()).await?;
-    writer
-        .upsert_channel(
-            root,
-            UpsertChannelRequest {
-                channel_name: "release".into(),
-                description: String::new().try_into()?,
-            },
-        )
-        .await?;
-    let subscribe = async |actor, change| {
-        reader
-            .set_subscription(
-                actor,
-                SubscriptionRequest {
-                    target: SubscriptionTarget::Channel("release".into()),
-                    target_agent: None,
-                    change,
+    let writer = LocalAgentMessageBoard::open_in_memory(
+        &crate::local_board_options(),
+        root.into(),
+        host.clone(),
+    )
+    .await?;
+    let reader = writer.read_only_handle();
+    for channel in ["release", "audit"] {
+        writer
+            .upsert_channel(
+                root,
+                UpsertChannelRequest {
+                    channel_name: channel.into(),
+                    description: String::new().try_into()?,
                 },
             )
+            .await?;
+    }
+    let delivery = Arc::new(LiveDelivery::new(root));
+    let inbox = delivery.register(subscriber);
+    let subscribe = async |inbox: &Arc<ActorInbox>| {
+        inbox
+            .set_subscription("release".into(), SubscriptionChange::Subscribe)
             .await
     };
-    let append = async |ordinal, text: &str| {
-        writer
-            .append_with_subscribers(
-                root,
+    let cancellation = CancellationToken::new();
+    let append = async |ordinal, channel: &str, text: &str| {
+        let id = EvidenceId { ordinal };
+        delivery
+            .append(
+                &writer,
                 AppendRequest {
-                    request_id: format!("source-{ordinal}"),
-                    destination: PostDestination::Channel("release".into()),
+                    request_id: id.request_id(channel)?,
+                    destination: PostDestination::Channel(channel.into()),
                     text: serde_json::to_string(
                         &json!({"id":{"ordinal":ordinal}, "original":text}),
                     )?,
                 },
+                id,
+                ReviewDeadline::Unlimited,
+                &cancellation,
             )
             .await
-            .map_err(anyhow::Error::from)
     };
 
-    assert!(append(1, "before subscription").await?.1.is_empty());
-    subscribe(root, SubscriptionChange::Subscribe).await?;
+    append(/*ordinal*/ 1, "release", "before subscription").await?;
+    subscribe(&inbox).await?;
     let large = "é".repeat(20_010);
-    let (post, recipients) = append(2, &large).await?;
-    assert_eq!(recipients, [root]);
-    let delivery = LiveDelivery::new(root);
-    delivery.publish(
-        EvidenceId { ordinal: 2 },
-        recipients
-            .into_iter()
-            .map(|actor| (actor, post.message_id))
-            .collect(),
-    )?;
-    // The subscription was already persisted before anyone attached to this inbox.
-    let inbox = delivery.inbox(root);
+    append(/*ordinal*/ 2, "release", &large).await?;
     let through = inbox.len();
     assert_eq!(through, 1);
+    let audit_only = delivery.register(ThreadId::new());
+    for subscriber in [&inbox, &audit_only] {
+        subscriber
+            .set_subscription("audit".into(), SubscriptionChange::Subscribe)
+            .await?;
+    }
     let mut wake = inbox.subscribe();
-    subscribe(subscriber, SubscriptionChange::Subscribe).await?;
-    let (second, recipients) = append(3, "later").await?;
-    assert_eq!(recipients.len(), 2);
-    delivery.publish(
-        EvidenceId { ordinal: 3 },
-        recipients
-            .into_iter()
-            .map(|actor| (actor, second.message_id))
-            .collect(),
-    )?;
-    wake.changed().await?;
+    let root_inbox = delivery.register(root);
+    subscribe(&root_inbox).await?;
+    let revoke = async |channel: &str| append(/*ordinal*/ 3, channel, "stop the release").await;
+    revoke("release").await?;
+    host.fail_clock.store(true, Ordering::SeqCst);
+    assert!(revoke("audit").await.is_err());
+    assert!(audit_only.queued_posts().is_empty());
     assert_eq!(*wake.borrow_and_update(), 2);
-    assert_eq!(delivery.inbox(subscriber).len(), 1);
-    subscribe(root, SubscriptionChange::Unsubscribe).await?;
-    let (post, recipients) = append(4, "after unsubscribe").await?;
-    assert_eq!(recipients, [subscriber]);
-    assert_eq!(append(4, "after unsubscribe").await?, (post, Vec::new()));
+    assert_eq!(root_inbox.len(), 1);
+    host.fail_clock.store(false, Ordering::SeqCst);
+
+    // The root subscribes again after reload. Only the surviving child followed
+    // release at the first write and still has that inbox when audit succeeds.
+    root_inbox.close();
+    let reloaded_inbox = delivery.register(root);
+    assert!(
+        reloaded_inbox
+            .subscribed_channels(&Default::default())?
+            .results
+            .is_empty()
+    );
+    subscribe(&reloaded_inbox).await?;
+    revoke("release").await?;
+    assert!(audit_only.queued_posts().is_empty());
+    revoke("audit").await?;
+    assert!(matches!(audit_only.queued_posts().as_slice(), [(3, _)]));
+    assert!(!wake.has_changed()?);
+    assert_eq!(root_inbox.len(), 0);
+    assert_eq!(reloaded_inbox.len(), 0);
+    inbox
+        .set_subscription("release".into(), SubscriptionChange::Unsubscribe)
+        .await?;
+    append(/*ordinal*/ 4, "release", "after reload").await?;
+    assert_eq!(reloaded_inbox.len(), 1);
     assert!(host.notifications.lock().unwrap().is_empty());
 
     let mut delivered = 0;
     let policy = TruncationPolicy::Bytes(64 * 1024);
     assert!(
         inbox
-            .deliver(root, &reader, &mut delivered, through, policy, |_| ready(
-                Err(anyhow::anyhow!("reviewer busy"))
-            ))
+            .deliver(subscriber, &reader, &mut delivered, through, policy, |_| {
+                ready(Err(anyhow::anyhow!("reviewer busy")))
+            })
             .await
             .is_err()
     );
@@ -501,13 +760,20 @@ async fn a_pending_post_survives_unsubscribe_and_is_admitted_once_per_conversati
     };
     for target in [through, inbox.len(), inbox.len()] {
         inbox
-            .deliver(root, &reader, &mut delivered, target, policy, &mut accept)
+            .deliver(
+                subscriber,
+                &reader,
+                &mut delivered,
+                target,
+                policy,
+                &mut accept,
+            )
             .await?;
     }
     let mut replacement = 0;
     inbox
         .deliver(
-            root,
+            subscriber,
             &reader,
             &mut replacement,
             inbox.len(),
@@ -516,7 +782,7 @@ async fn a_pending_post_survives_unsubscribe_and_is_admitted_once_per_conversati
         )
         .await?;
     let first = json!({"id":{"ordinal":2}, "original":large});
-    let next = json!({"id":{"ordinal":3}, "original":"later"});
+    let next = json!({"id":{"ordinal":3}, "original":"stop the release"});
     let expected = |sources| {
         crate::sampling::context_input(
             "guardian_original_evidence",

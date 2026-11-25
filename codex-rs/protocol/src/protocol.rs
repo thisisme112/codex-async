@@ -31,6 +31,7 @@ use crate::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use crate::config_types::WindowsSandboxLevel;
 use crate::dynamic_tools::DynamicToolCallOutputContentItem;
 use crate::dynamic_tools::DynamicToolCallRequest;
+use crate::dynamic_tools::DynamicToolCallResult;
 use crate::dynamic_tools::DynamicToolResponse;
 use crate::dynamic_tools::DynamicToolSpec;
 use crate::error::Result as CodexResult;
@@ -921,6 +922,12 @@ pub enum Op {
         /// Tool output payload.
         response: DynamicToolResponse,
     },
+    /// Reply from a client that supports structured dynamic tool results.
+    #[debug("DynamicToolResult {{ id: {id:?}, success: {} }}", response.success())]
+    DynamicToolResult {
+        id: String,
+        response: DynamicToolCallResult,
+    },
 
     /// Request MCP servers to reinitialize and refresh cached tool lists.
     RefreshMcpServers,
@@ -1172,7 +1179,9 @@ impl Op {
             Self::ResolveElicitation { .. } => "resolve_elicitation",
             Self::UserInputAnswer { .. } => "user_input_answer",
             Self::RequestPermissionsResponse { .. } => "request_permissions_response",
-            Self::DynamicToolResponse { .. } => "dynamic_tool_response",
+            Self::DynamicToolResponse { .. } | Self::DynamicToolResult { .. } => {
+                "dynamic_tool_response"
+            }
             Self::RefreshMcpServers => "refresh_mcp_servers",
             Self::ReloadUserConfig => "reload_user_config",
             Self::Compact => "compact",
@@ -2393,11 +2402,6 @@ pub struct ErrorEvent {
     pub message: String,
     #[serde(default)]
     pub codex_error_info: Option<CodexErrorInfo>,
-    /// Host-only file identities proven rejected against the submitted request.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(skip)]
-    #[ts(skip)]
-    pub rejected_audio_file_ids: Vec<String>,
     /// Sensitive explanation and steering are delivered live but never enter rollout storage.
     #[serde(skip)]
     #[schemars(skip)]
@@ -2564,8 +2568,19 @@ pub struct ThreadSettingsAppliedEvent {
     pub thread_settings: ThreadSettingsSnapshot,
 }
 
+/// A child with a spawn override keeps the ordinary tier for its descendants.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+pub struct SpawnServiceTierOverride {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub inherited_service_tier: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
 pub struct ThreadSettingsSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub spawn_service_tier_override: Option<SpawnServiceTierOverride>,
     pub model: String,
     pub model_provider_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4266,6 +4281,10 @@ pub struct McpStartupUpdateEvent {
     pub environment_id: Option<String>,
     /// Current startup status.
     pub status: McpStartupStatus,
+    /// Time spent initializing this server, when reporting a measured startup outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null", optional)]
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
@@ -6358,7 +6377,6 @@ mod tests {
             misalignment: None,
             message: "rollback failed".into(),
             codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
-            rejected_audio_file_ids: Vec::new(),
         };
         assert!(!event.affects_turn_status());
     }
@@ -6371,7 +6389,6 @@ mod tests {
             codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable {
                 turn_kind: NonSteerableTurnKind::Review,
             }),
-            rejected_audio_file_ids: Vec::new(),
         };
         assert!(!event.affects_turn_status());
     }
@@ -6382,7 +6399,6 @@ mod tests {
             misalignment: None,
             message: "generic".into(),
             codex_error_info: Some(CodexErrorInfo::Other),
-            rejected_audio_file_ids: Vec::new(),
         };
         assert!(event.affects_turn_status());
     }
@@ -6392,7 +6408,6 @@ mod tests {
         let event = ErrorEvent {
             message: "This request violated the misalignment policy.".to_string(),
             codex_error_info: Some(CodexErrorInfo::MisalignmentPolicyViolation),
-            rejected_audio_file_ids: Vec::new(),
             misalignment: Some(MisalignmentErrorDetails {
                 error_type: Some("unauthorized_data_transfer".to_string()),
                 detailed_explanation: Some("Sensitive customer explanation".to_string()),
@@ -6419,22 +6434,6 @@ mod tests {
         assert!(!debug.contains("Sensitive customer explanation"));
         assert!(!debug.contains("Sensitive customer steering"));
         assert!(!debug.contains("sensitive-review-target"));
-    }
-
-    #[test]
-    fn rejected_audio_identity_round_trips_for_host_recovery() {
-        let event = ErrorEvent {
-            message: "invalid recording".to_string(),
-            codex_error_info: Some(CodexErrorInfo::BadRequest),
-            rejected_audio_file_ids: vec!["file_audio".to_string()],
-            misalignment: None,
-        };
-
-        let serialized = serde_json::to_value(&event).expect("serialize error event");
-        assert_eq!(serialized["rejected_audio_file_ids"], json!(["file_audio"]));
-        let restored: ErrorEvent =
-            serde_json::from_value(serialized).expect("deserialize error event");
-        assert_eq!(restored.rejected_audio_file_ids, vec!["file_audio"]);
     }
 
     #[test]
@@ -6926,12 +6925,14 @@ mod tests {
                     error: "boom".to_string(),
                     reason: Some(McpStartupFailureReason::ReauthenticationRequired),
                 },
+                duration_ms: Some(1_250),
             }),
         };
 
         let value = serde_json::to_value(&event)?;
         assert_eq!(value["msg"]["type"], "mcp_startup_update");
         assert_eq!(value["msg"]["server"], "srv");
+        assert_eq!(value["msg"]["duration_ms"], 1_250);
         assert_eq!(value["msg"]["status"]["state"], "failed");
         assert_eq!(value["msg"]["status"]["error"], "boom");
         assert_eq!(

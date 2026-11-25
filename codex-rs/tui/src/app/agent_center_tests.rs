@@ -31,6 +31,35 @@ pub(super) fn screen(view: &AgentsOverviewView, width: u16, height: u16) -> Stri
 }
 
 #[tokio::test]
+async fn live_center_home_and_end_preserve_selection_across_refreshes() {
+    let mut app = make_test_app().await;
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    app.app_event_tx = AppEventSender::new(tx);
+    let thread = overview_thread(
+        ThreadId::from_u128(/*value*/ 42),
+        /*parent_thread_id*/ None,
+        "Task",
+        ThreadStatus::Idle,
+    );
+    let state = &app.agents_overview.view_state;
+    state.lock().unwrap().has_more = true;
+    let view = || app.agents_overview_view(vec![thread.clone()], /*selected_thread_id*/ None);
+    let mut center = view();
+    center.handle_key_event(KeyCode::End.into());
+    assert!(screen(&view(), /*width*/ 88, /*height*/ 14).contains("›   Show more"));
+    let mut center = view();
+    center.handle_key_event(KeyCode::Home.into());
+    assert!(!screen(&view(), /*width*/ 88, /*height*/ 14).contains("›   Show more"));
+    let mut center = view();
+    center.handle_key_event(KeyCode::End.into());
+    view().handle_key_event(KeyCode::Enter.into());
+    assert!(
+        std::iter::from_fn(|| events.try_recv().ok())
+            .any(|event| matches!(event, AppEvent::ShowMoreAgentsOverview))
+    );
+}
+
+#[tokio::test]
 async fn live_center_keeps_status_order_across_progress_refreshes() {
     let mut app = make_test_app_with_chat().await;
     app.agents_overview.view_state.lock().unwrap().grouping = AgentsOverviewGrouping::Status;
@@ -1331,6 +1360,13 @@ async fn workspace_navigation_preserves_the_draft_and_reading_position() -> Resu
     use crossterm::event::MouseButton::Left;
     use crossterm::event::MouseEventKind::Down;
     use crossterm::event::MouseEventKind::Drag;
+    use crossterm::event::MouseEventKind::Moved;
+    let mut pointers = Vec::new();
+    for column in [divider.x, center.right(), center.right() + 1] {
+        crate::boxed_future!(app.handle_tui_event(&mut tui, &mut server, mouse(Moved, column)))
+            .await?;
+        pointers.push(tui.link_hover.shape);
+    }
     tui.screen_size_for_event(&TuiEvent::Resize(three_panes))?;
     crate::boxed_future!(app.handle_tui_event(&mut tui, &mut server, mouse(Down(Left), divider.x)))
         .await?;
@@ -1375,6 +1411,28 @@ async fn workspace_navigation_preserves_the_draft_and_reading_position() -> Resu
 
     app.open_agents_overview(&server);
     app.sidebar_mut().hide();
+    crate::app::test_support::side_frame(&mut app, &mut tui, three_panes)?;
+    let resized = center.right() + 4;
+    for event in [
+        mouse(Down(Left), center.right()),
+        mouse(Drag(Left), resized),
+    ] {
+        crate::boxed_future!(app.handle_tui_event(&mut tui, &mut server, event)).await?;
+        pointers.push(tui.link_hover.shape);
+    }
+    insta::assert_snapshot!(format!("{pointers:?}"), @"[Resize, Resize, Default, Resize, Resize]");
+    let release = mouse(crossterm::event::MouseEventKind::Up(Left), resized);
+    crate::boxed_future!(app.handle_tui_event(&mut tui, &mut server, release)).await?;
+    crate::app::test_support::side_frame(&mut app, &mut tui, three_panes)?;
+    assert_eq!(
+        app.conversation_frame.command_center.unwrap().right(),
+        resized
+    );
+    assert_eq!(tui.link_hover.shape, crate::tui::PointerShape::Resize);
+    for event in [mouse(Down(Left), resized), TuiEvent::FocusLost] {
+        crate::boxed_future!(app.handle_tui_event(&mut tui, &mut server, event)).await?;
+    }
+    assert_eq!(tui.link_hover.shape, crate::tui::PointerShape::Default);
     crate::boxed_future!(app.handle_tui_event(
         &mut tui,
         &mut server,

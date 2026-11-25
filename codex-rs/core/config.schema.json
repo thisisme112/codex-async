@@ -934,6 +934,9 @@
             "code_mode_interrupt": {
               "type": "boolean"
             },
+            "code_mode_mcp_result_dedup": {
+              "type": "boolean"
+            },
             "code_mode_only": {
               "type": "boolean"
             },
@@ -1010,6 +1013,9 @@
               "type": "boolean"
             },
             "default_mode_request_user_input": {
+              "type": "boolean"
+            },
+            "defer_image_generation": {
               "type": "boolean"
             },
             "defer_mailbox_preemption": {
@@ -1091,6 +1097,9 @@
               "type": "boolean"
             },
             "guardian_include_additional_context": {
+              "type": "boolean"
+            },
+            "guardian_native_action_framing": {
               "type": "boolean"
             },
             "guardian_native_multi_agent_history": {
@@ -1412,6 +1421,9 @@
               "type": "boolean"
             },
             "standalone_web_search": {
+              "type": "boolean"
+            },
+            "statsig_gates": {
               "type": "boolean"
             },
             "steer": {
@@ -3520,6 +3532,10 @@
           "description": "Exposes `model` and `reasoning_effort` on the multi-agent v2 spawn tool and adds corresponding guidance to root and subagent usage hints.",
           "type": "boolean"
         },
+        "expose_spawn_agent_service_tier": {
+          "description": "Allow V1 and V2 `spawn_agent` to select a `service_tier` for one child. Defaults to false.",
+          "type": "boolean"
+        },
         "hide_spawn_agent_metadata": {
           "type": "boolean"
         },
@@ -5057,8 +5073,12 @@
     },
     "SendMessageToUserAsyncConfigToml": {
       "additionalProperties": false,
-      "description": "Controls which agents can send async user messages.",
+      "description": "Controls which agents can send async user messages and how they call the tool.",
       "properties": {
+        "direct_only": {
+          "description": "Keep async user messages top-level only (default). Set to false to follow the session's tool mode.",
+          "type": "boolean"
+        },
         "root_agent": {
           "description": "Sets the root agent's feature flag, just like the plain boolean shorthand. The model catalog can still enable the tool for the root when this is false.",
           "type": "boolean"
@@ -5535,8 +5555,8 @@
           "type": "boolean"
         },
         "collapse_turn_details": {
-          "default": false,
-          "description": "Summarize tool calls and collapse completed turns in the full-screen transcript. Defaults to `false`.",
+          "default": true,
+          "description": "Summarize tool calls and collapse completed turns in the full-screen transcript. Defaults to `true`.",
           "type": "boolean"
         },
         "copy_on_select": {
@@ -8337,6 +8357,9 @@
         "code_mode_interrupt": {
           "type": "boolean"
         },
+        "code_mode_mcp_result_dedup": {
+          "type": "boolean"
+        },
         "code_mode_only": {
           "type": "boolean"
         },
@@ -8413,6 +8436,9 @@
           "type": "boolean"
         },
         "default_mode_request_user_input": {
+          "type": "boolean"
+        },
+        "defer_image_generation": {
           "type": "boolean"
         },
         "defer_mailbox_preemption": {
@@ -8494,6 +8520,9 @@
           "type": "boolean"
         },
         "guardian_include_additional_context": {
+          "type": "boolean"
+        },
+        "guardian_native_action_framing": {
           "type": "boolean"
         },
         "guardian_native_multi_agent_history": {
@@ -8815,6 +8844,9 @@
           "type": "boolean"
         },
         "standalone_web_search": {
+          "type": "boolean"
+        },
+        "statsig_gates": {
           "type": "boolean"
         },
         "steer": {

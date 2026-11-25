@@ -157,7 +157,7 @@ async fn daybreak_refusal_offers_enable_for_the_next_turn() {
         daybreak_availability: Default::default(),
         cyber: vec![codex_protocol::turn_input::CyberAccessProgram::DaybreakBlue],
     });
-    chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![model]));
+    set_test_model_catalog(&mut chat, vec![model]);
 
     chat.thread_usage.replaying_turn_completion = true;
     chat.on_cyber_policy_error();
@@ -262,7 +262,7 @@ async fn daybreak_refusal_offers_enable_for_the_next_turn() {
         daybreak_availability: Default::default(),
         cyber: vec![codex_protocol::turn_input::CyberAccessProgram::DaybreakBlue],
     });
-    chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![daybreak.clone()]));
+    set_test_model_catalog(&mut chat, vec![daybreak.clone()]);
     chat.set_model("gpt-5.6-sol");
     chat.daybreak_enabled = true;
     handle_turn_started(&mut chat, "daybreak-recourse");
@@ -310,7 +310,7 @@ async fn daybreak_refusal_offers_enable_for_the_next_turn() {
         daybreak_availability: Default::default(),
         cyber: vec![codex_protocol::turn_input::CyberAccessProgram::Standard],
     });
-    chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![astra]));
+    set_test_model_catalog(&mut chat, vec![astra]);
     chat.set_model("gpt-6-astra");
     handle_turn_started(&mut chat, "astra-recourse");
     safety_recourse::on_metadata(
@@ -348,7 +348,7 @@ async fn daybreak_refusal_offers_enable_for_the_next_turn() {
     assert!(!picker.contains("Enable Daybreak"));
     chat.handle_key_event(KeyCode::Esc.into());
 
-    chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![daybreak]));
+    set_test_model_catalog(&mut chat, vec![daybreak]);
     chat.set_model("gpt-5.6-sol");
     chat.daybreak_enabled = false;
     chat.set_parent_owned_thread();
@@ -821,9 +821,6 @@ async fn prefetch_rate_limits_is_gated_on_chatgpt_auth_provider() {
     // Conversely, a local OpenAI provider cannot enable usage for a different server.
     chat.config.model_provider.requires_openai_auth = true;
     chat.requires_openai_auth = false;
-    assert!(!chat.should_prefetch_rate_limits());
-
-    chat.prefetch_rate_limits();
     assert!(!chat.should_prefetch_rate_limits());
 }
 
@@ -2685,6 +2682,44 @@ async fn idle_commit_ticks_do_not_restore_status_without_commentary_completion()
 }
 
 #[tokio::test]
+async fn stop_hook_retry_restores_working_after_final_answer() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    handle_turn_started(&mut chat, "turn-1");
+    complete_assistant_message(&mut chat, "msg-1", "Done.", Some(MessagePhase::FinalAnswer));
+
+    let prompt = ServerNotification::ItemCompleted(ItemCompletedNotification::new(
+        String::new(),
+        "turn-1".into(),
+        AppServerThreadItemPayload::HookPrompt {
+            id: "prompt-1".into(),
+            fragments: vec![codex_app_server_protocol::HookPromptFragment {
+                text: "Include test results.".into(),
+                hook_run_id: "stop-1".into(),
+            }],
+        },
+        /*started_at_ms*/ None,
+        /*completed_at_ms*/ 0,
+    ));
+    chat.handle_server_notification(prompt.clone(), /*replay_kind*/ None);
+    assert_chatwidget_snapshot!(
+        "stop_hook_retry_working",
+        hook_status_frame(&chat, /*width*/ 60)
+    );
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let replay = ReplayKind::ThreadSnapshot;
+    replay_turn_started(&mut chat, replay);
+    replay_agent_message(&mut chat, "msg-1", "Done.", replay);
+    assert!(!chat.bottom_pane.status_indicator_visible());
+    chat.handle_server_notification(prompt.clone(), Some(replay));
+    assert!(chat.bottom_pane.status_indicator_visible());
+
+    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
+    chat.handle_server_notification(prompt, Some(replay));
+    assert!(!chat.bottom_pane.status_indicator_visible());
+}
+
+#[tokio::test]
 async fn final_answer_completion_restores_status_indicator_for_pending_steer() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
@@ -2831,7 +2866,7 @@ async fn ambient_pet_stays_hidden_until_a_pet_is_selected() {
         /*x*/ 0, /*y*/ 0, /*width*/ 60, /*height*/ 20,
     );
     let draw = chat
-        .ambient_pet_draw(area, area.bottom())
+        .ambient_pet_draw(area, area.bottom(), /*shortcut_hud_area*/ None)
         .expect("ambient pet draw request");
     assert_eq!(draw.x, 51);
     assert_eq!(draw.y, 14);
@@ -2845,7 +2880,7 @@ async fn ambient_pet_stays_hidden_until_a_pet_is_selected() {
     handle_turn_started(&mut chat, "turn-1");
     handle_agent_reasoning_delta(&mut chat, "**Thinking**");
     let draw_with_status = chat
-        .ambient_pet_draw(area, area.bottom())
+        .ambient_pet_draw(area, area.bottom(), /*shortcut_hud_area*/ None)
         .expect("ambient pet draw request with status");
     assert_eq!(draw_with_status.y, draw.y);
     assert_eq!(
@@ -2868,13 +2903,21 @@ async fn ambient_pet_screen_bottom_anchor_uses_terminal_bottom() {
     );
     let composer_bottom_y = 20;
     let default_draw = chat
-        .ambient_pet_draw(terminal_area, composer_bottom_y)
+        .ambient_pet_draw(
+            terminal_area,
+            composer_bottom_y,
+            /*shortcut_hud_area*/ None,
+        )
         .expect("composer-anchored pet draw request");
     assert_eq!(default_draw.y, 14);
 
     chat.local_settings.tui.pet_anchor = TuiPetAnchor::ScreenBottom;
     let screen_bottom_draw = chat
-        .ambient_pet_draw(terminal_area, composer_bottom_y)
+        .ambient_pet_draw(
+            terminal_area,
+            composer_bottom_y,
+            /*shortcut_hud_area*/ None,
+        )
         .expect("screen-bottom anchored pet draw request");
     assert_eq!(screen_bottom_draw.y, 18);
 }
@@ -3033,27 +3076,39 @@ async fn ambient_pet_draw_uses_terminal_screen_area_not_short_inline_viewport() 
     use ratatui::layout::Rect;
 
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    enable_test_ambient_pet(&mut chat);
+    let (tx, mut frames) = tokio::sync::broadcast::channel(1);
+    chat.ambient_pet = Some(crate::pets::test_ambient_pet(
+        FrameRequester::new(tx),
+        /*animations_enabled*/ true,
+    ));
+    tokio::time::pause();
+    handle_turn_started(&mut chat, "pet-turn");
+    chat.pre_draw_tick();
 
-    assert!(
-        chat.ambient_pet_draw(
-            Rect::new(
-                /*x*/ 0, /*y*/ 21, /*width*/ 80, /*height*/ 3,
-            ),
-            /*composer_bottom_y*/ 24
-        )
-        .is_none(),
-        "a normal short inline viewport cannot fit the ambient pet"
+    let screen = Rect::new(
+        /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 24,
     );
+    let short = Rect::new(
+        /*x*/ 0, /*y*/ 21, /*width*/ 80, /*height*/ 3,
+    );
+    assert!(
+        chat.ambient_pet_draw(short, screen.bottom(), /*shortcut_hud_area*/ None)
+            .is_none()
+    );
+    assert!(
+        chat.ambient_pet_draw(screen, screen.bottom(), Some(screen))
+            .is_none()
+    );
+    let timeout = std::time::Duration::from_secs(1);
+    assert!(tokio::time::timeout(timeout, frames.recv()).await.is_err());
 
     let draw = chat
-        .ambient_pet_draw(
-            Rect::new(
-                /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 24,
-            ),
-            /*composer_bottom_y*/ 24,
-        )
+        .ambient_pet_draw(screen, screen.bottom(), /*shortcut_hud_area*/ None)
         .expect("full terminal screen has room for the ambient pet");
+    tokio::time::timeout(timeout, frames.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(draw.x, 71);
     assert_eq!(draw.y, 18);
 }
@@ -4608,7 +4663,7 @@ async fn status_line_model_with_reasoning_speed_footer_snapshots() {
             description: String::new(),
         },
     ]);
-    chat.model_catalog = Arc::new(ModelCatalog::new(vec![preset]));
+    set_test_model_catalog(&mut chat, vec![preset]);
 
     for (tier_id, tier_name, snapshot) in [
         (

@@ -4,11 +4,13 @@ use crate::agent::api::AgentControl;
 use crate::config::ConstraintResult;
 use crate::context::ContextualUserFragment;
 use crate::context::GuardianReviewEvidence;
+use crate::cyber_access_program::ContinuationCyberAccessProgram;
 use crate::elicitation::ElicitationRegistration;
 use crate::session::SessionIo;
 use crate::session::SessionSettingsUpdate;
 use crate::session::Submission;
 use crate::session::emit_subagent_session_started;
+use crate::session::inject::plaintext_agent_messages;
 use crate::session::inject::validate_injected_response_item;
 use crate::session::new_submission_id;
 use crate::session::session::AppServerClientMetadata;
@@ -28,7 +30,6 @@ use codex_history::RolloutItem;
 use codex_models_manager::ModelsManagerConfig;
 use codex_otel::SessionTelemetry;
 use codex_otel::current_span_w3c_trace_context;
-use codex_protocol::AgentPath;
 use codex_protocol::RequestCountry;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ApprovalsReviewer;
@@ -41,7 +42,6 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::ActivePermissionProfile;
-use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ProfileWorkspaceRoot;
 use codex_protocol::models::ResponseItem;
@@ -52,7 +52,6 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::Event;
-use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SandboxPolicy;
@@ -948,6 +947,19 @@ impl CodexThread {
         task.turn_context.turn_metadata_state.root_turn_id()
     }
 
+    /// Returns the explicit program captured for continuations of the named active turn.
+    pub async fn active_turn_continuation_program(
+        &self,
+        expected_turn_id: &str,
+    ) -> Option<Arc<ContinuationCyberAccessProgram>> {
+        let active = self.session.active_turn.lock().await;
+        let task = active.as_ref()?.task.as_ref()?;
+        if task.turn_context.sub_id != expected_turn_id {
+            return None;
+        }
+        task.turn_context.extension_data.get()
+    }
+
     pub async fn set_app_server_client_info(
         &self,
         app_server_client_name: Option<String>,
@@ -1156,22 +1168,47 @@ impl CodexThread {
         Ok(())
     }
 
-    /// Review the final injected tool call without executing it.
+    /// Review the supplied tool call without executing it.
     pub async fn guardian_review(
         &self,
+        tool_call: &ResponseItem,
+        cancellation: &CancellationToken,
+    ) -> CodexResult<crate::guardian_review::GuardianReviewResult> {
+        self.guardian_review_with_root_evidence(
+            tool_call,
+            /*root_evidence*/ None,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Use the supplied parent evidence only for this review of the injected history.
+    pub async fn guardian_review_with_root_evidence(
+        &self,
+        tool_call: &ResponseItem,
+        root_evidence: Option<codex_app_server_protocol::GuardianRootEvidence>,
         cancellation: &CancellationToken,
     ) -> CodexResult<crate::guardian_review::GuardianReviewResult> {
         if self.session.active_turn.lock().await.is_some() {
             return Err(CodexErr::InvalidRequest("thread has an active turn".into()));
         }
+        if root_evidence.is_some()
+            && (!self.config().await.ephemeral
+                || matches!(self.session_source(), SessionSource::SubAgent(_)))
+        {
+            return Err(CodexErr::InvalidRequest(
+                "recorded worker review requires an ephemeral non-subagent thread".into(),
+            ));
+        }
         let history = self.session.clone_history().await;
-        let tool_call = history.raw_items().next_back().cloned().ok_or_else(|| {
-            CodexErr::InvalidRequest(
-                "expected a final plaintext exec_command, apply_patch, request_permissions, or MCP call"
-                    .into(),
-            )
-        })?;
-        crate::guardian::review_tool_call(&self.session, history, &tool_call, cancellation).await
+        crate::guardian::review_tool_call(
+            &self.session,
+            history,
+            tool_call,
+            root_evidence,
+            cancellation,
+        )
+        .await
     }
 
     /// Inject raw Responses items. Plaintext agent-mail batches in a native MAv2
@@ -1191,35 +1228,7 @@ impl CodexThread {
         // mixed history and multipart/encrypted items on the raw injection path.
         if !config.multi_agent_v2.disable_native_tools
             && !items.is_empty()
-            && let Some(messages) = items
-                .iter()
-                .map(|item| {
-                    let ResponseItem::AgentMessage {
-                        id,
-                        author,
-                        recipient,
-                        content,
-                        internal_chat_message_metadata_passthrough,
-                    } = item
-                    else {
-                        return None;
-                    };
-                    let [AgentMessageInputContent::InputText { text }] = content.as_slice() else {
-                        return None;
-                    };
-                    Some(InterAgentCommunication {
-                        id: id.clone(),
-                        author: AgentPath::try_from(author.as_str()).ok()?,
-                        recipient: AgentPath::try_from(recipient.as_str()).ok()?,
-                        other_recipients: Vec::new(),
-                        content: text.clone(),
-                        encrypted_content: None,
-                        internal_chat_message_metadata_passthrough:
-                            internal_chat_message_metadata_passthrough.clone(),
-                        trigger_turn: false,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()
+            && let Some(messages) = plaintext_agent_messages(&items)
             && match self.multi_agent_version() {
                 Some(version) => version,
                 None => self.session.resolve_multi_agent_version_for_model(
@@ -1248,13 +1257,21 @@ impl CodexThread {
         self.inject_response_items_with_retention(items).await
     }
 
-    /// Inject Responses items with explicit, persisted retention policies.
+    /// Inject Responses items with persisted retention policies. Ordinary native-root
+    /// agent mail can wake through the mailbox scheduler after the durable checkpoint.
     pub async fn inject_response_items_with_retention(
         &self,
         items: Vec<impl Into<InjectedResponseItem>>,
     ) -> CodexResult<()> {
-        self.record_injected_items(items).await?;
-        self.checkpoint_preparation().await?;
+        let items: Vec<InjectedResponseItem> = items.into_iter().map(Into::into).collect();
+        let agent_mail = items
+            .iter()
+            .all(|item| item.retention == ItemRetention::Unspecified)
+            && plaintext_agent_messages(items.iter().map(|item| &item.item)).is_some();
+        let recorded_through = self.record_injected_items(items).await?;
+        self.session
+            .checkpoint_client_injection(agent_mail.then_some(recorded_through))
+            .await?;
         Ok(())
     }
 
@@ -1280,13 +1297,13 @@ impl CodexThread {
         &self,
         items: Vec<ResponseItem>,
     ) -> CodexResult<()> {
-        self.record_injected_items(items).await
+        self.record_injected_items(items).await.map(|_| ())
     }
 
     async fn record_injected_items(
         &self,
         items: Vec<impl Into<InjectedResponseItem>>,
-    ) -> CodexResult<()> {
+    ) -> CodexResult<u64> {
         if items.is_empty() {
             return Err(CodexErr::InvalidRequest(
                 "items must not be empty".to_string(),
@@ -1319,10 +1336,10 @@ impl CodexThread {
         }
 
         let turn_context = self.session.history_injection_context().await?;
-        self.session
+        Ok(self
+            .session
             .inject_client_response_items(items, &turn_context)
-            .await;
-        Ok(())
+            .await)
     }
 
     pub fn rollout_path(&self) -> Option<PathBuf> {
@@ -1442,6 +1459,13 @@ impl CodexThread {
             .models_manager
             .get_model_info(model, config)
             .await
+    }
+
+    /// Captures local settings for thread views and input ownership checks.
+    /// The service tier is the configured selection. Use [`Self::config_snapshot`]
+    /// when the tier must be validated against the selected model.
+    pub async fn configured_snapshot(&self) -> ThreadConfigSnapshot {
+        self.session.configured_snapshot().await
     }
 
     pub async fn config_snapshot(&self) -> ThreadConfigSnapshot {
@@ -1577,13 +1601,19 @@ impl CodexThread {
             .authorization_version(history.as_ref())
     }
 
-    /// Captures root originals and authorization before request-size preparation.
-    pub async fn guardian_root_snapshot(&self) -> Option<GuardianRootSnapshot> {
-        self.session
-            .services
-            .agent_control
-            .get_guardian_package(self.session.thread_id)
-            .await
+    /// Subscribes to coalesced committed changes to this runtime's Guardian evidence.
+    /// Release the watch borrow before calling Core or awaiting other work.
+    pub fn subscribe_guardian_evidence_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.thread_extension_data()
+            .get_or_init(GuardianReviewEvidence::default)
+            .changes
+            .subscribe()
+    }
+
+    /// Captures root originals and authorization before request-size preparation. A configured
+    /// host provider's failure is returned rather than treated as absent evidence.
+    pub async fn guardian_root_snapshot(&self) -> CodexResult<Option<GuardianRootSnapshot>> {
+        self.session.guardian_root_snapshot().await
     }
 
     /// Refresh the thread's layer-backed user config state from a caller-supplied

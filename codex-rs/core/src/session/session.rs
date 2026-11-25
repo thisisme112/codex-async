@@ -16,6 +16,7 @@ use crate::agents_md_manager::SessionInstructions;
 use crate::config::ConstraintError;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
+use crate::guardian_review::PendingReviewWrites;
 use crate::hook_mcp_executor::CoreHookMcpExecutor;
 use crate::mcp_tool_call::McpToolApprovalContext;
 use crate::responses_metadata::CodexResponsesMetadata;
@@ -76,6 +77,8 @@ pub(crate) struct Session {
     pub(crate) context_ids: ThreadContextIds,
     pub(crate) agent_runtime: AgentRuntimeServices,
     pub(crate) outcome_reporting: Option<AgentOutcomeReporting>,
+    /// Installed by a thread-start contributor and fixed for this session's lifetime.
+    pub(super) pending_review_writes: Option<Arc<PendingReviewWrites>>,
     pub(crate) installation_id: String,
     pub(super) tx_event: Sender<Event>,
     /// Installed by Guardian before its first review; forwards items and cancellation without
@@ -88,7 +91,7 @@ pub(crate) struct Session {
     pub(super) initial_context_publication: Semaphore,
     /// Orders accepted settings commits and their persisted events with compaction checkpoints.
     /// Keep this separate from `state` so storage I/O does not block runtime state access.
-    pub(super) thread_settings_persistence: Semaphore,
+    pub(super) thread_settings_persistence: Arc<Semaphore>,
     pub(super) code_mode_message_tasks: CodeModeMessageTasks,
     /// Serializes rebuild/apply cycles for the running proxy; each cycle
     /// rebuilds from the current SessionState while holding this lock.
@@ -334,6 +337,7 @@ impl SessionConfiguration {
         environment_selections: &[TurnEnvironmentSelection],
     ) -> ThreadSettingsSnapshot {
         ThreadSettingsSnapshot {
+            spawn_service_tier_override: self.step_settings.spawn_service_tier_override.clone(),
             model: self.step_settings.collaboration_mode.model().to_string(),
             model_provider_id: self.original_config_do_not_use.model_provider_id.clone(),
             service_tier: self.step_settings.service_tier.clone(),
@@ -1111,7 +1115,8 @@ impl Session {
         {
             thread_extension_data.insert(crate::agent::helper_daybreak::Enrollment::Root);
         }
-        thread_extension_data.insert(crate::context::GuardianReviewEvidence::default());
+        let guardian_evidence = Arc::new(crate::context::GuardianReviewEvidence::default());
+        thread_extension_data.insert_arc(Arc::clone(&guardian_evidence));
         // Kick off independent async setup tasks in parallel to reduce startup latency.
         //
         // - initialize thread persistence with new or resumed session info
@@ -1633,6 +1638,9 @@ impl Session {
                     retention,
                 ),
             );
+            state
+                .history
+                .attach_guardian_evidence_changes(Arc::downgrade(&guardian_evidence));
             if matches!(initial_history, InitialHistory::Resumed(_)) {
                 state.persisted_dynamic_tools = initial_history
                     .get_dynamic_tools()
@@ -1789,7 +1797,9 @@ impl Session {
                             mcp_runtime.restore_resource_origin_checkpoint(checkpoint);
                         }
                     }
-                    RolloutItem::EventMsg(event) => mcp_runtime.observe_event(event),
+                    RolloutItem::EventMsg { event, .. } => {
+                        mcp_runtime.observe_event(event);
+                    }
                     RolloutItem::DynamicToolsUpdated { .. }
                     | RolloutItem::SessionMeta(_)
                     | RolloutItem::ResponseItem(_)
@@ -1870,8 +1880,6 @@ impl Session {
                 };
             let executed_tool_calls =
                 crate::state::ExecutedToolCalls::new(&config.features, &initial_history);
-            let codex_responses_headers =
-                thread_extension_data.get::<crate::CodexResponsesHeaders>();
             // Ephemeral title requests use request-level effort even when managed settings
             // enable overrides. The client-supplied tag selects cache behavior, not permissions.
             let title_request = config.ephemeral
@@ -1927,7 +1935,7 @@ impl Session {
                 )
                 .or(fork_cache_key),
                 tx_event.clone(),
-                codex_responses_headers,
+                &thread_extension_data,
                 crate::cyber_access_program::ApiKeyCyberAccessPrograms::from_config(&config),
                 required_cyber_access_programs,
             );
@@ -2035,6 +2043,7 @@ impl Session {
                 context_ids,
                 agent_runtime,
                 outcome_reporting,
+                pending_review_writes: services.thread_extension_data.get(),
                 installation_id,
                 tx_event: tx_event.clone(),
                 parent_observer_event_tx: OnceLock::new(),
@@ -2042,7 +2051,7 @@ impl Session {
                 last_terminal_agent_status: Default::default(),
                 state: Mutex::new(state),
                 initial_context_publication: Semaphore::new(/*permits*/ 1),
-                thread_settings_persistence: Semaphore::new(/*permits*/ 1),
+                thread_settings_persistence: Arc::new(Semaphore::new(/*permits*/ 1)),
                 code_mode_message_tasks: CodeModeMessageTasks::default(),
                 managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
                 features: config.features.clone(),

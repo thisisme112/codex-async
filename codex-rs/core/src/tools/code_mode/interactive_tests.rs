@@ -64,7 +64,7 @@ async fn idle_prompt_defers_registration_and_keeps_response_owner() {
     session
         .notify_user_input_response(&turn.sub_id, response.clone())
         .await;
-    assert_eq!(future.await.unwrap().response, response);
+    assert_eq!(future.await.unwrap(), response);
     assert!(!*session.subscribe_elicitation_pause_state().borrow());
     session
         .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)

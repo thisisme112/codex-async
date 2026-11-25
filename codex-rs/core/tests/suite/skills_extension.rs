@@ -2739,7 +2739,6 @@ async fn assert_catalog_model_switch(max_context_tokens: Option<usize>) -> Resul
         environment: "test".to_string(),
         service_name: "skills-model-switch".to_string(),
         service_version: env!("CARGO_PKG_VERSION").to_string(),
-        codex_home: codex_home.path().to_path_buf(),
         exporter: OtelExporter::None,
         trace_exporter: OtelExporter::None,
         metrics_exporter: OtelExporter::OtlpHttp {
@@ -3644,7 +3643,7 @@ async fn production_turn_keeps_rebalanced_catalogs_stable_after_compaction_and_r
     let executor_url = format!("ws://{executor_address}");
     drop(listener);
     let runtime_paths = codex_exec_server::ExecServerRuntimeOptions::new(
-        std::env::current_exe()?,
+        core_test_support::exec_server_helper_exe()?,
         /*codex_linux_sandbox_exe*/ None,
     )?;
     let http_client_factory = test.config.http_client_factory();

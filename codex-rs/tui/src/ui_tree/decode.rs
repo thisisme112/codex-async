@@ -37,11 +37,13 @@ impl std::str::FromStr for UiTree {
                     }
                 }
                 UiNode::Text { children, .. }
+                | UiNode::Code { children }
                 | UiNode::Bold { children }
                 | UiNode::Italic { children }
                 | UiNode::Underline { children }
                 | UiNode::Link { children, .. }
-                | UiNode::Row { children, .. } => {
+                | UiNode::Row { children, .. }
+                | UiNode::Col { children, .. } => {
                     pending.extend(children.iter().flatten().map(|child| (child, depth + 1)));
                 }
             }

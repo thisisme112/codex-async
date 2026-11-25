@@ -658,9 +658,9 @@ async fn guardian_review_recovers_after_compaction(
                 enabled: !with_parent_checkpoint,
                 use_history_notes_extension: true,
                 reminder_threshold_tokens: 6_144,
-                reminder_message_template: "{n_remaining} tokens remain.".to_string(),
-                guidance_message: "Save state before resetting context.".to_string(),
-                auto_compact_fallback_prompt: "Save important state.".to_string(),
+                reminder_message_template: "{n_remaining} tokens remain.".into(),
+                guidance_message: "Save state before resetting context.".into(),
+                auto_compact_fallback_prompt: "Save important state.".into(),
                 auto_compact_fallback_buffer_tokens: 16_384,
             });
         })
@@ -699,7 +699,7 @@ async fn guardian_review_recovers_after_compaction(
         .await;
     }
     let command = json!({
-        "cmd": "true",
+        "cmd": "printf POST_COMPACTION_APPROVED",
         "sandbox_permissions": "require_escalated",
         "justification": "Read the internal samples the user authorized.",
     });
@@ -782,6 +782,20 @@ async fn guardian_review_recovers_after_compaction(
         })
         .collect::<Vec<_>>();
     assert_eq!(guardian_requests.len(), 3);
+    let verdict_format = json!({
+        "type": "json_schema",
+        "name": "codex_output_schema",
+        "strict": false,
+        "schema": codex_guardian_reviewer::guardian_output_schema(),
+    });
+    assert_eq!(
+        guardian_requests
+            .iter()
+            .map(|request| request.body_json()["text"]["format"].clone())
+            .collect::<Vec<_>>(),
+        vec![verdict_format.clone(); guardian_requests.len()],
+        "reviews before and after compaction must retain the verdict format"
+    );
     assert_eq!(
         guardian_requests[0].body_json()["client_metadata"]["thread_id"]
             == guardian_requests[1].body_json()["client_metadata"]["thread_id"],
@@ -803,6 +817,14 @@ async fn guardian_review_recovers_after_compaction(
     assert_eq!(
         compact_requests.len(),
         usize::from(!with_parent_checkpoint) + compaction_errors.len(),
+    );
+    assert_eq!(
+        compact_requests
+            .iter()
+            .map(|request| request.body_json()["text"]["format"].clone())
+            .collect::<Vec<_>>(),
+        vec![verdict_format; compact_requests.len()],
+        "compaction and retries must preserve the verdict format"
     );
     if let Some(compact_request) = compact_requests.first() {
         assert!(
@@ -881,6 +903,16 @@ async fn guardian_review_recovers_after_compaction(
             }
         }
     }
+
+    assert!(
+        requests
+            .last()
+            .expect("parent continuation after the reviews")
+            .function_call_output("exec-second")
+            .to_string()
+            .contains("POST_COMPACTION_APPROVED"),
+        "the verdict after compaction must approve execution"
+    );
 
     Ok(())
 }
@@ -1314,7 +1346,10 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
     let guardian_context_windows = guardian_rollout
         .into_iter()
         .filter_map(|line| match line.item {
-            RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => Some(event.model_context_window),
+            RolloutItem::EventMsg {
+                event: EventMsg::TurnStarted(event),
+                ..
+            } => Some(event.model_context_window),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1369,7 +1404,7 @@ async fn guardian_node_repl_policy_follows_production_approval_path(
                 .auto_review = Some(AutoReviewMessages {
                 policy: None,
                 policy_template: None,
-                node_repl_policy: node_repl_policy.map(str::to_string),
+                node_repl_policy: node_repl_policy.map(Into::into),
                 rejection_instructions: None,
                 timeout_instructions: None,
             });
@@ -1384,7 +1419,7 @@ async fn guardian_node_repl_policy_follows_production_approval_path(
                 .auto_review = Some(AutoReviewMessages {
                 policy: None,
                 policy_template: None,
-                node_repl_policy: Some("Acting-model REPL policy.".to_string()),
+                node_repl_policy: Some("Acting-model REPL policy.".into()),
                 rejection_instructions: None,
                 timeout_instructions: None,
             });
@@ -1895,8 +1930,8 @@ async fn guardian_reviews_delayed_and_new_actions_after_catalog_refresh() -> Res
         .as_mut()
         .unwrap()
         .auto_review = Some(AutoReviewMessages {
-        policy: Some("refreshed policy".to_string()),
-        policy_template: Some("refreshed template: {{ tenant_policy_config }}".to_string()),
+        policy: Some("refreshed policy".into()),
+        policy_template: Some("refreshed template: {{ tenant_policy_config }}".into()),
         node_repl_policy: None,
         rejection_instructions: None,
         timeout_instructions: None,
@@ -2186,7 +2221,12 @@ async fn guardian_session_is_reused_for_consecutive_tool_reviews_without_prewarm
     let permission_section = [
         "\n>>> PARENT TURN PERMISSION CONTEXT START\n".to_string(),
         format!(
-            "The active permission profile for environment \"local\" denies reading these paths/globs. These are policy restrictions; do not approve escalation whose purpose is to read them.\n- path `{}`\n- glob `{}`\n",
+            "The active permission profile for environment \"local\" denies reading these \
+             paths/globs. These are policy restrictions; do not approve escalation whose purpose \
+             is to read them. Approval can grant read and write access across the rest of the \
+             filesystem, including repository metadata. The command stays sandboxed with the same \
+             read denials. A command can encounter a blocked read incidentally and still \
+             complete its intended operation.\n- path `{}`\n- glob `{}`\n",
             fs::canonicalize(&secret_file)?.display(),
             test.config.cwd.join("guardian-*.key").display(),
         ),
@@ -2512,7 +2552,7 @@ async fn guardian_denial_rejects_tool_call_with_rationale(
                 policy: None,
                 policy_template: None,
                 node_repl_policy: None,
-                rejection_instructions: Some("Reviewer-only rejection instructions.".to_string()),
+                rejection_instructions: Some("Reviewer-only rejection instructions.".into()),
                 timeout_instructions: None,
             });
         })
@@ -2526,7 +2566,7 @@ async fn guardian_denial_rejects_tool_call_with_rationale(
                 policy: None,
                 policy_template: None,
                 node_repl_policy: None,
-                rejection_instructions: rejection_instructions.map(str::to_string),
+                rejection_instructions: rejection_instructions.map(Into::into),
                 timeout_instructions: None,
             });
         })
@@ -2855,7 +2895,7 @@ async fn guardian_timeout_rejects_tool_call_with_acting_model_instructions(
                 policy_template: None,
                 node_repl_policy: None,
                 rejection_instructions: None,
-                timeout_instructions: timeout_instructions.map(str::to_string),
+                timeout_instructions: timeout_instructions.map(Into::into),
             });
         })
         .with_config(|config| {
