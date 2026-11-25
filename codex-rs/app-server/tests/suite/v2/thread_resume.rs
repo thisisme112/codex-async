@@ -13,6 +13,7 @@ use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
+use app_test_support::create_request_user_input_sse_response;
 use app_test_support::rollout_path;
 use app_test_support::test_absolute_path;
 use app_test_support::to_response;
@@ -25,6 +26,7 @@ use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
+use codex_app_server_protocol::CyberAccessProgram;
 use codex_app_server_protocol::DeprecationNoticeNotification;
 use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::FileChangeRequestApprovalResponse;
@@ -82,6 +84,7 @@ use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::ARCHIVED_SESSIONS_SUBDIR;
+use codex_core::test_support::all_model_presets;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_features::Feature;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
@@ -867,9 +870,10 @@ async fn thread_resume_restores_startup_and_updated_runtime_workspace_roots() ->
         .into_iter()
         .rev()
         .filter_map(|item| match item {
-            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
-                Some(event.thread_settings.runtime_workspace_roots)
-            }
+            RolloutItem::EventMsg {
+                event: EventMsg::ThreadSettingsApplied(event),
+                ..
+            } => Some(event.thread_settings.runtime_workspace_roots),
             _ => None,
         })
         .take(/*n*/ 3)
@@ -1054,15 +1058,14 @@ sandbox = "unelevated"
         let expected_thread_id = ThreadId::from_string(&thread_id)?;
         let (items, _, _) = RolloutRecorder::load_rollout_items(&path).await?;
         let persisted = items.into_iter().rev().find_map(|item| match item {
-            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
-                if event.thread_id == Some(expected_thread_id) =>
-            {
-                Some((
-                    event.thread_settings.cwd,
-                    event.thread_settings.runtime_workspace_roots,
-                    event.thread_settings.permission_profile,
-                ))
-            }
+            RolloutItem::EventMsg {
+                event: EventMsg::ThreadSettingsApplied(event),
+                ..
+            } if event.thread_id == Some(expected_thread_id) => Some((
+                event.thread_settings.cwd,
+                event.thread_settings.runtime_workspace_roots,
+                event.thread_settings.permission_profile,
+            )),
             _ => None,
         });
         let (persisted_cwd, persisted_roots, permission_profile) =
@@ -1567,8 +1570,10 @@ async fn thread_resume_preserves_goal_first_and_fork_approvals_reviewer() -> Res
             items
                 .into_iter()
                 .filter_map(|item| match item {
-                    RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) =>
-                        event.thread_id,
+                    RolloutItem::EventMsg {
+                        event: EventMsg::ThreadSettingsApplied(event),
+                        ..
+                    } => event.thread_id,
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -1842,10 +1847,12 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
     );
     let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout_path).await?;
     let mode = items.iter().rev().find_map(|item| match item {
-        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
-            if event
-                .thread_id
-                .is_some_and(|id| id.to_string() == thread_id) =>
+        RolloutItem::EventMsg {
+            event: EventMsg::ThreadSettingsApplied(event),
+            ..
+        } if event
+            .thread_id
+            .is_some_and(|id| id.to_string() == thread_id) =>
         {
             Some(event.thread_settings.collaboration_mode.clone())
         }
@@ -1900,7 +1907,10 @@ async fn thread_resume_restores_collaboration_mode_from_legacy_turn_context() ->
     let (items, _, _) = RolloutRecorder::load_rollout_items(&fixture.rollout_file_path).await?;
     assert!(!items.iter().any(|item| matches!(
         item,
-        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_))
+        RolloutItem::EventMsg {
+            event: EventMsg::ThreadSettingsApplied(_),
+            ..
+        }
     )));
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -3397,6 +3407,7 @@ async fn thread_resume_rejects_archived_session_by_id() -> Result<()> {
 #[tokio::test]
 async fn thread_resume_keeps_tool_paused_goal_paused() -> Result<()> {
     let server = create_mock_responses_server_sequence(vec![
+        create_request_user_input_sse_response("confirm-goal")?,
         responses::sse(vec![
             responses::ev_response_created("create-goal"),
             responses::ev_function_call(
@@ -3417,7 +3428,10 @@ async fn thread_resume_keeps_tool_paused_goal_paused() -> Result<()> {
     let codex_home = TempDir::new()?;
     mock_responses_config(&server.uri())
         .enable_feature(Feature::Goals)
+        .enable_feature(Feature::DefaultModeRequestUserInput)
+        .enable_feature(Feature::StepModelSwitching)
         .write(codex_home.path())?;
+    let collector = super::auth_storage_originator::configure_collector(codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -3425,19 +3439,39 @@ async fn thread_resume_keeps_tool_paused_goal_paused() -> Result<()> {
         .build_initialized()
         .await?;
 
+    let model = all_model_presets()
+        .iter()
+        .find(|model| {
+            model.show_in_picker
+                && model.default_reasoning_effort == ReasoningEffort::Medium
+                && model
+                    .supported_reasoning_efforts
+                    .iter()
+                    .any(|level| level.effort == ReasoningEffort::High)
+        })
+        .expect("a bundled model defaults to medium and supports high effort");
     let start_id = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("gpt-5.2-codex".to_string()),
+            model: Some(model.id.clone()),
             ..Default::default()
         })
         .await?;
     let ThreadStartResponse { thread, .. } =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
 
-    let turn_id = mcp
+    // Before the first turn, /goal inherits the model default.
+    let set_id = mcp
+        .send_raw_request(
+            "thread/goal/set",
+            Some(json!({"threadId": thread.id, "objective": "initial goal", "status": "complete"})),
+        )
+        .await?;
+    let _: ThreadGoalSetResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(set_id)).await??;
+
+    let start_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
-            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "Create a goal to keep polishing, then pause it.".to_string(),
                 text_elements: Vec::new(),
@@ -3445,11 +3479,32 @@ async fn thread_resume_keeps_tool_paused_goal_paused() -> Result<()> {
             ..Default::default()
         })
         .await?;
-    let _turn_resp: JSONRPCResponse = timeout(
+    let TurnStartResponse { turn } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
+    let request = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
+        mcp.read_stream_until_request_message(),
     )
     .await??;
+    let ServerRequest::ToolRequestUserInput { request_id, .. } = request else {
+        anyhow::bail!("expected request_user_input, received {request:?}");
+    };
+    // Only the active turn changes. The next step calls create_goal at high
+    // while the thread still defaults to medium.
+    let update_id = mcp
+        .send_raw_request(
+            "turn/settings/update",
+            Some(json!({"threadId": thread.id, "turnId": turn.id, "effort": "high"})),
+        )
+        .await?;
+    let outcome: serde_json::Value =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(update_id)).await??;
+    assert_eq!(outcome, json!({"status": "applied"}));
+    mcp.send_response(
+        request_id,
+        json!({"answers": {"confirm_path": {"answers": ["Yes (Recommended)"]}}}),
+    )
+    .await?;
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),
@@ -3491,6 +3546,40 @@ async fn thread_resume_keeps_tool_paused_goal_paused() -> Result<()> {
             .any(|method| method == "turn/started"),
         "paused goal should not continue after thread resume"
     );
+
+    assert!(
+        timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully())
+            .await??
+            .success()
+    );
+    let mut efforts = Vec::new();
+    for request in collector.received_requests().await.expect("OTLP requests") {
+        let payload: serde_json::Value = request.body_json()?;
+        let points = payload["resourceMetrics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|resource| resource["scopeMetrics"].as_array().into_iter().flatten())
+            .flat_map(|scope| scope["metrics"].as_array().into_iter().flatten())
+            .filter(|metric| metric["name"] == "codex.goal.created")
+            .flat_map(|metric| metric["sum"]["dataPoints"].as_array().into_iter().flatten());
+        for point in points {
+            let effort = point["attributes"]
+                .as_array()
+                .expect("attributes")
+                .iter()
+                .find(|tag| tag["key"] == "reasoning_effort")
+                .expect("goal creation should include reasoning effort");
+            efforts.push(
+                effort["value"]["stringValue"]
+                    .as_str()
+                    .expect("effort")
+                    .to_string(),
+            );
+        }
+    }
+    efforts.sort();
+    assert_eq!(efforts, ["high", "medium"]);
 
     Ok(())
 }
@@ -3857,6 +3946,15 @@ async fn thread_goal_set_edits_objective_without_resetting_usage() -> Result<()>
 
 #[tokio::test]
 async fn thread_goal_keeps_original_root_until_external_objective_edit() -> Result<()> {
+    check_thread_goal_continuation_program(/*enrolled*/ true).await
+}
+
+#[tokio::test]
+async fn thread_goal_continuation_respects_daybreak_opt_out() -> Result<()> {
+    check_thread_goal_continuation_program(/*enrolled*/ false).await
+}
+
+async fn check_thread_goal_continuation_program(enrolled: bool) -> Result<()> {
     let (release_original_turn, original_turn_gate) = oneshot::channel();
     let (release_edited_turn, edited_turn_gate) = oneshot::channel();
     let (server, _response_completions) = start_streaming_sse_server(vec![
@@ -3894,19 +3992,52 @@ async fn thread_goal_keeps_original_root_until_external_objective_edit() -> Resu
                 /*total_tokens*/ 100,
             ),
         ])),
+        ungated_goal_response(responses::sse(vec![
+            responses::ev_response_created("replacement-goal-continuation"),
+            responses::ev_completed_with_tokens(
+                "replacement-goal-continuation",
+                /*total_tokens*/ 100,
+            ),
+        ])),
     ])
     .await;
     let codex_home = TempDir::new()?;
-    mock_responses_config(server.uri())
-        .enable_feature(Feature::Goals)
-        .enable_feature(Feature::UntrustedAsToolOutput)
-        .write(codex_home.path())?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!(
+            r#"
+model = "gpt-5.4"
+approval_policy = "never"
+openai_base_url = "{}/v1"
+cli_auth_credentials_store = "file"
+
+[features]
+goals = true
+untrusted_as_tool_output = true
+daybreak_program_propagation = true
+enable_request_compression = false
+"#,
+            server.uri()
+        ),
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-test-token").plan_type("pro"),
+        AuthCredentialsStoreMode::File,
+    )?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_managed_config()
         .build_initialized()
         .await?;
-    let thread = mcp.start_thread(ThreadStartParams::default()).await?.thread;
+    let thread = mcp
+        .start_thread(ThreadStartParams {
+            daybreak_program_propagation_enrolled: Some(enrolled),
+            ..Default::default()
+        })
+        .await?
+        .thread;
+    assert_eq!(thread.daybreak_program_propagation_enrolled, Some(enrolled));
 
     let start_id = mcp
         .send_turn_start_request(TurnStartParams {
@@ -3915,6 +4046,7 @@ async fn thread_goal_keeps_original_root_until_external_objective_edit() -> Resu
                 text: "create the original goal".to_string(),
                 text_elements: Vec::new(),
             }],
+            cyber_access_program: Some(CyberAccessProgram::DaybreakBlue),
             ..Default::default()
         })
         .await?;
@@ -4013,8 +4145,58 @@ async fn thread_goal_keeps_original_root_until_external_objective_edit() -> Resu
         .await??;
     }
 
+    let clear_id = mcp
+        .send_raw_request("thread/goal/clear", Some(json!({"threadId": thread.id})))
+        .await?;
+    let clear: ThreadGoalClearResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(clear_id)).await??;
+    assert!(clear.cleared);
+
+    let replacement_id = mcp
+        .send_raw_request(
+            "thread/goal/set",
+            Some(json!({
+                "threadId": thread.id,
+                "objective": "a different goal",
+                "tokenBudget": 100,
+            })),
+        )
+        .await?;
+    let replacement: ThreadGoalSetResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(replacement_id)).await??;
+    assert_eq!(replacement.goal.objective, "a different goal");
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
     let requests = server.requests().await;
-    assert_eq!(requests.len(), 8);
+    assert_eq!(requests.len(), 9);
+    // Explicit requests retain their program regardless of enrollment; automatic goal turns
+    // propagate it only for enrolled threads, including after an objective edit.
+    let programs = requests
+        .iter()
+        .map(|request| {
+            let body: serde_json::Value = serde_json::from_slice(request)?;
+            Ok(body["access_programs"]["cyber"].as_str().map(str::to_owned))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let continuation_program = enrolled.then_some("daybreak_blue");
+    assert_eq!(
+        programs.iter().map(Option::as_deref).collect::<Vec<_>>(),
+        [
+            Some("daybreak_blue"),
+            Some("daybreak_blue"),
+            Some("daybreak_blue"),
+            None,
+            continuation_program,
+            continuation_program,
+            continuation_program,
+            continuation_program,
+            None,
+        ]
+    );
     let reopened_original_request = serde_json::from_slice::<serde_json::Value>(&requests[2])?;
     assert_eq!(
         reopened_original_request["client_metadata"]["turn_id"].as_str(),
@@ -4044,7 +4226,9 @@ async fn thread_goal_keeps_original_root_until_external_objective_edit() -> Resu
             .contains(objective)
     );
     let mut wire_item = objective.as_object().expect("goal context item").clone();
-    wire_item.remove("id"); // Generated for each run.
+    // The snapshot covers the tool output. These fields carry per-run identifiers and timing.
+    wire_item.remove("id");
+    wire_item.remove("internal_chat_message_metadata_passthrough");
     wire_item.sort_keys();
     insta::assert_snapshot!(
         "model_written_goal_as_untrusted_tool_output",
@@ -5199,7 +5383,7 @@ async fn thread_resume_checkpoints_settings_without_advancing_recency() -> Resul
     let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout.rollout_file_path).await?;
     assert!(items.iter().any(|item| matches!(
         item,
-        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+        RolloutItem::EventMsg { event: EventMsg::ThreadSettingsApplied(event), .. }
             if event.thread_id == Some(expected_thread_id)
     )));
 
@@ -6362,9 +6546,10 @@ async fn thread_resume_with_overrides_preserves_recency_and_checkpoints_model() 
     let expected_thread_id = ThreadId::from_string(&resumed_thread.id)?;
     let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout_file_path).await?;
     let persisted_model = items.iter().rev().find_map(|item| match item {
-        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
-            if event.thread_id == Some(expected_thread_id) =>
-        {
+        RolloutItem::EventMsg {
+            event: EventMsg::ThreadSettingsApplied(event),
+            ..
+        } if event.thread_id == Some(expected_thread_id) => {
             Some(event.thread_settings.model.as_str())
         }
         _ => None,
@@ -6413,7 +6598,10 @@ async fn thread_resume_does_not_checkpoint_unchanged_settings() -> Result<()> {
     let settings_before_resume = items
         .into_iter()
         .filter_map(|item| match item {
-            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => Some(event),
+            RolloutItem::EventMsg {
+                event: EventMsg::ThreadSettingsApplied(event),
+                ..
+            } => Some(event),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -6432,7 +6620,10 @@ async fn thread_resume_does_not_checkpoint_unchanged_settings() -> Result<()> {
     let settings_after_resume = items
         .into_iter()
         .filter_map(|item| match item {
-            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => Some(event),
+            RolloutItem::EventMsg {
+                event: EventMsg::ThreadSettingsApplied(event),
+                ..
+            } => Some(event),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -6535,6 +6726,8 @@ async fn thread_resume_surfaces_cloud_config_bundle_load_errors() -> Result<()> 
     let refresh_token_url = format!("{}/oauth/token", server.uri());
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
+        // Startup falls back to defaults after the 401 and ignores config.toml.
+        .with_args(&["-c", &format!("chatgpt_base_url={chatgpt_base_url:?}")])
         .with_env_overrides(&[
             ("OPENAI_API_KEY", None),
             (

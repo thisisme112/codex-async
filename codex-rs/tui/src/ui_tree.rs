@@ -47,6 +47,10 @@ pub(crate) enum UiNode {
         props: RowProps,
         children: Vec<Option<UiNode>>,
     },
+    Col {
+        props: ColProps,
+        children: Vec<Option<UiNode>>,
+    },
     Bold {
         children: Vec<Option<UiNode>>,
     },
@@ -56,8 +60,23 @@ pub(crate) enum UiNode {
     Underline {
         children: Vec<Option<UiNode>>,
     },
+    /// An inline span with preserved whitespace and its own theme colors.
+    Code {
+        children: Vec<Option<UiNode>>,
+    },
     #[serde(untagged)]
     String(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(export_to = "statusline.d.ts"))]
+pub(crate) struct ColProps {
+    /// Blank terminal rows between flex items, as a non-negative JavaScript-safe integer.
+    /// Adjacent strings form one item. Separate elements each take a slot, even when empty.
+    #[serde(deserialize_with = "decode::gap")]
+    #[cfg_attr(test, ts(type = "number"))]
+    gap: u64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -78,6 +97,10 @@ pub(crate) struct TextProps {
     italic: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     underline: Option<bool>,
+    /// Preserve spaces and tabs across styled children.
+    #[serde(rename = "preserveWhitespace", skip_serializing_if = "is_default")]
+    #[cfg_attr(test, ts(as = "Option<bool>", optional))]
+    preserve_whitespace: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

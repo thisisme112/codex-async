@@ -88,6 +88,7 @@ pub use session_archive_commands::run_session_archive_command;
 pub use session_queue_commands::run_session_queue_command;
 use std::fs::OpenOptions;
 use std::io::IsTerminal;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -206,7 +207,6 @@ mod pager_overlay;
 mod projectless;
 pub(crate) mod public_widgets;
 mod render;
-mod resize_reflow_cap;
 mod resume_permissions;
 mod resume_picker;
 mod screen_reader;
@@ -245,7 +245,7 @@ mod temporary_structured_request;
 mod terminal_capabilities;
 mod terminal_hyperlinks;
 mod terminal_palette;
-mod terminal_probe;
+use terminal_capabilities::terminal_probe;
 mod terminal_size_telemetry;
 mod terminal_title;
 mod terminal_visualization_instructions;
@@ -299,6 +299,7 @@ use crate::startup_hooks_review::load_startup_hooks_review_entry;
 use crate::startup_hooks_review::maybe_run_startup_hooks_review;
 use crate::tui::Tui;
 pub use cli::Cli;
+pub use cli::ResumeApprovalPreset;
 use codex_arg0::Arg0DispatchPaths;
 pub use markdown_render::render_markdown_text;
 pub use public_widgets::composer_input::ComposerAction;
@@ -1063,6 +1064,7 @@ async fn cloud_config_bundle_for_app_server_target(
     bootstrap_config: &ConfigTomlLoadResult,
     codex_home: &Path,
     embedded_network_policy: &codex_app_server_client::EmbeddedNetworkPolicy,
+    resolution: Option<&codex_config::ConfigServerResolution>,
 ) -> std::io::Result<CloudConfigBundleLoader> {
     managed_config_bundle_loader_for_storage(
         embedded_network_policy
@@ -1071,6 +1073,7 @@ async fn cloud_config_bundle_for_app_server_target(
             )),
         bootstrap_config.config_layer_stack.requirements_toml(),
         /*enable_codex_api_key_env*/ false,
+        resolution,
     )
     .await
 }
@@ -1505,6 +1508,10 @@ async fn run_ratatui_app(
                         embedded_network_policy.bind_bootstrap_auth(initial_config.auth_config()),
                         initial_config.config_layer_stack.requirements_toml(),
                         /*enable_codex_api_key_env*/ false,
+                        // The server may have started requiring OAuth during onboarding.
+                        cloud_config_bundle
+                            .config_server_resolution()
+                            .filter(|resolution| resolution.resolved.oauth.is_some()),
                     )
                     .await?;
                 }
@@ -2069,6 +2076,14 @@ async fn run_ratatui_app(
                 trust_decision_was_made = true;
             }
         } else if consent.should_exit {
+            // Startup cannot return to the overview's reconnect loop until bootstrap completes.
+            if let codex_app_server_client::AppServerRequestHandle::Remote(handle) =
+                app_server.request_handle()
+                && handle.is_closed()
+            {
+                shutdown_startup_session(Some(app_server), &mut terminal_restore_guard).await;
+                color_eyre::eyre::bail!(onboarding::SETUP_CONNECTION_LOST);
+            }
             if !uses_remote_workspace {
                 config = load_config_or_exit_with_fallback_cwd(
                     cli_kv_overrides.clone(),
@@ -2104,6 +2119,11 @@ async fn run_ratatui_app(
             "codex.tui.fullscreen_transcript",
             /*inc*/ 1,
             &[("enabled", &config.tui_fullscreen_transcript.to_string())],
+        );
+        let _ = metrics.counter(
+            "codex.tui.collapse_turn_details",
+            /*inc*/ 1,
+            &[("enabled", &config.tui_collapse_turn_details.to_string())],
         );
     }
 
@@ -2147,6 +2167,56 @@ async fn run_ratatui_app(
     let should_prompt_windows_sandbox_nux_at_startup = trust_decision_was_made;
     #[cfg(not(target_os = "windows"))]
     let should_prompt_windows_sandbox_nux_at_startup = false;
+
+    let initial_resume_config = if let Some(preset) = &cli.resume_approval_preset {
+        if !matches!(
+            session_selection,
+            resume_picker::SessionSelection::Resume(_)
+        ) {
+            color_eyre::eyre::bail!("No conversation selected to resume with --approve-for-me.");
+        }
+        if app_server.thread_params_mode() != ThreadParamsMode::Embedded {
+            return Err(color_eyre::eyre::eyre!(
+                "Permission overrides are not supported when resuming a remote task."
+            ));
+        }
+        // Resolve the preset under the destination's trust and managed requirements.
+        // Keep it out of the launch config used by /new and subsequent /resume commands.
+        let mut scoped_overrides = overrides.clone();
+        if preset.overrides_root_permissions {
+            scoped_overrides.sandbox_mode = None;
+            scoped_overrides.approval_policy = None;
+        }
+        let scoped_config = startup_draft
+            .run_until(
+                &mut tui,
+                load_config_with_worktree_source_policy(
+                    preset
+                        .config
+                        .parse_overrides()
+                        .map_err(color_eyre::Report::msg)?,
+                    scoped_overrides,
+                    loader_overrides.clone(),
+                    cloud_config_bundle.clone(),
+                    strict_config,
+                    Some(config.cwd.to_path_buf()),
+                    managed_worktree.as_ref(),
+                ),
+            )
+            .await??;
+        if let Some(warning) = add_dir_warning_message(
+            &cli.add_dir,
+            &scoped_config.permissions.effective_permission_profile(),
+            scoped_config.cwd.as_path(),
+        ) {
+            return Err(color_eyre::eyre::eyre!(
+                "Error adding directories: {warning}"
+            ));
+        }
+        Some(Box::new(scoped_config))
+    } else {
+        None
+    };
 
     let Cli {
         prompt,
@@ -2326,6 +2396,7 @@ async fn run_ratatui_app(
         prompt,
         images,
         session_selection,
+        initial_resume_config,
         feedback,
         is_first_run,
         should_prompt_windows_sandbox_nux_at_startup,
@@ -2350,13 +2421,10 @@ async fn run_ratatui_app(
     app_result
 }
 
-#[expect(
-    clippy::print_stderr,
-    reason = "TUI should no longer be displayed, so we can write to stderr."
-)]
 fn report_restore_error(result: color_eyre::Result<()>) {
     if let Err(err) = result {
-        eprintln!(
+        let _ = writeln!(
+            std::io::stderr().lock(),
             "failed to restore terminal. Run `reset` or restart your terminal to recover: {err}"
         );
     }

@@ -103,8 +103,7 @@ fn submit_prompt(app: &mut App, prompt: &str) {
 
 fn drain_active_thread_events(app: &mut App) {
     while let Some(event) = app
-        .active_thread_rx
-        .as_mut()
+        .active_thread_rx_mut()
         .and_then(|receiver| receiver.try_recv().ok())
     {
         app.handle_thread_event_now(event);
@@ -851,6 +850,8 @@ goals = true
                 .cloned()
                 .map(Into::into)
                 .collect(),
+            // This scenario switches the thread to OpenAI before retrying.
+            Some("openai".to_string()),
         ));
     }
     app.config.model_catalog = Some(model_catalog);

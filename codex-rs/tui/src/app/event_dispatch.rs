@@ -91,6 +91,18 @@ impl App {
         if self.reconnect.offline && matches!(event, AppEvent::Exit(ExitMode::ShutdownFirst)) {
             return Ok(AppRunControl::Exit(ExitReason::UserRequested));
         }
+        if self.reconnect.offline && matches!(event, AppEvent::OpenFeedback) {
+            let thread = self.current_displayed_thread_id().map_or_else(
+                || "Thread ID unavailable.".to_string(),
+                |id| format!("Thread ID {id}"),
+            );
+            self.transcript_view.jump_to_latest();
+            self.chat_widget.add_info_message(
+                thread,
+                Some("Reconnect and retry /feedback.".into()),
+            );
+            return Ok(AppRunControl::Continue);
+        }
         if self.reconnect.offline
             && !matches!(
                 &event,
@@ -1063,8 +1075,8 @@ impl App {
                 self.chat_widget.restore_user_message_to_composer(prompt);
                 self.chat_widget.set_queue_autosend_suppressed(/*suppressed*/ true);
                 self.abort_thread_event_listener(thread_id);
-                if let Some(mut rx) = self.active_thread_rx.take() {
-                    while let Ok(event) = rx.try_recv() {
+                if let Some(channel) = self.thread_event_channels.get_mut(&thread_id) {
+                    while let Ok(event) = channel.receiver.try_recv() {
                         if let ThreadBufferedEvent::Notification(notification) = event {
                             self.chat_widget.handle_server_notification(*notification, Some(ReplayKind::ThreadSnapshot));
                         }
@@ -1240,7 +1252,8 @@ impl App {
                 self.transcript_view.jump_to_latest();
                 tui.frame_requester().schedule_frame();
             }
-            AppEvent::InsertHistoryCell(cell) => {
+            AppEvent::InsertHistoryCell(mut cell) => {
+                self.prepare_collab_history(app_server, cell.as_mut());
                 self.insert_history_cell(tui, cell);
             }
             AppEvent::TurnTipReady { thread_id, turn_id } => {
@@ -1726,8 +1739,8 @@ impl App {
                 self.enqueue_thread_history_entry_response(thread_id, event)
                     .await?;
             }
-            AppEvent::DiffResult(cwd, text) => {
-                if &cwd != self.chat_widget.session_cwd() {
+            AppEvent::DiffResult { thread_id, cwd, text } => {
+                if thread_id != self.chat_widget.thread_id() || &cwd != self.chat_widget.session_cwd() {
                     return Ok(AppRunControl::Continue);
                 }
                 // Clear the in-progress state in the bottom pane
@@ -2791,9 +2804,13 @@ impl App {
             AppEvent::PermissionProfilesLoaded { request_id, result } => {
                 self.chat_widget.on_permission_profiles_loaded(request_id, result);
             }
+            AppEvent::SyncModelCatalog => {
+                self.model_catalog = self.chat_widget.model_catalog();
+            }
             AppEvent::FetchModels { request_id } => {
                 if self.chat_widget.model_popup_request_is_current(request_id) {
-                    app_server.fetch_models(request_id, self.app_event_tx.clone());
+                    self.model_catalog = self.chat_widget.model_catalog();
+                    app_server.fetch_models(request_id, self.model_catalog.provider(), self.app_event_tx.clone());
                 }
             }
             AppEvent::ModelsLoaded { request_id, result: Ok(models) }
@@ -2823,7 +2840,9 @@ impl App {
                 let catalog = self.chat_widget.model_catalog();
                 if !Arc::ptr_eq(&self.model_catalog, &catalog) {
                     self.model_catalog = catalog;
-                    app_server.set_available_models(self.model_catalog.try_list_models()?);
+                    if self.model_catalog.is_default_provider() {
+                        app_server.set_available_models(self.model_catalog.try_list_models()?);
+                    }
                     self.sync_active_thread_service_tier_to_cached_session().await;
                 }
             }

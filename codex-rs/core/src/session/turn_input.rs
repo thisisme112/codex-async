@@ -28,8 +28,8 @@ use crate::WithTurnExtensionData;
 use crate::agent::helper_daybreak::turn::HelperTurnAdmission;
 use crate::context::ContextualUserFragment;
 use crate::context::GuardianSenderMessages;
+use crate::context::world_state::AdditionalContextState;
 use crate::state::ActiveTurn;
-use crate::state::AdditionalContextFormat;
 use crate::state::TurnState;
 use crate::tasks::RegularTask;
 use codex_features::Feature;
@@ -156,6 +156,7 @@ impl PreparedTurnInputSettings {
         kind: TurnStartKind,
     ) -> CodexResult<Option<Arc<TurnContext>>> {
         let TurnStartOptions {
+            inferred_workspace_kind,
             turn_trigger,
             final_output_json_schema,
             direct_only_tool_namespaces,
@@ -215,6 +216,11 @@ impl PreparedTurnInputSettings {
                 replacement: Some(inherited_client_metadata),
                 ..Default::default()
             });
+        if let Some(kind) = inferred_workspace_kind {
+            turn_context
+                .turn_metadata_state
+                .set_inferred_workspace_kind(kind);
+        }
         if let Some(turn_trigger) = turn_trigger {
             turn_context
                 .turn_metadata_state
@@ -864,31 +870,23 @@ impl Session {
         else {
             return;
         };
-        let input = self.state.lock().await.additional_context.extend(
-            BTreeMap::from([(
+        let section = AdditionalContextState::new(
+            &BTreeMap::from([(
                 key.to_owned(),
                 AdditionalContextEntry::new(value, AdditionalContextKind::Untrusted),
             )]),
-            self.additional_context_format(),
+            self.enabled(Feature::UntrustedAsToolOutput),
             &task.turn_context.session_telemetry,
             &self.context_ids,
-        );
-        if !input.is_empty() {
-            self.input_queue
-                .extend_pending_input_for_turn_state(
-                    &turn.turn_state,
-                    input.into_iter().map(TurnInput::ResponseItem).collect(),
-                )
-                .await;
-        }
-    }
-
-    pub(super) fn additional_context_format(&self) -> AdditionalContextFormat {
-        if self.enabled(Feature::UntrustedAsToolOutput) {
-            AdditionalContextFormat::ToolOutputs
-        } else {
-            AdditionalContextFormat::Messages
-        }
+        )
+        .extending();
+        // Tool-produced context belongs after tool results and before the next prompt.
+        task.turn_context
+            .extension_data
+            .get_or_init(super::turn::PendingToolContext::default)
+            .lock()
+            .await
+            .push(section);
     }
 
     /// Called under the active-turn lock when registering a task (or a realtime transcript turn).
@@ -900,6 +898,7 @@ impl Session {
         let mut state = self.state.lock().await;
         state.last_started_turn_id = Some(turn_id.to_owned());
         if let Some(attribution) = attribution {
+            state.pending_recorded_mail_sequence = 0;
             state.turn_attribution = Some(attribution);
         }
     }
@@ -912,6 +911,17 @@ impl Session {
         let mut active_turn = self.active_turn.lock().await;
         if active_turn.is_some() || self.turn_starts_closed() {
             return None;
+        }
+        if !self.input_queue.has_pending_mailbox_items().await {
+            let mut state = self.state.lock().await;
+            // An intervening turn may already have sampled the durable injection.
+            if state.pending_recorded_mail_sequence == 0
+                || state.pending_recorded_mail_sequence
+                    <= crate::context_manager::sampled_through(state.history.annotated_items())
+            {
+                state.pending_recorded_mail_sequence = 0;
+                return None;
+            }
         }
         let has_trigger_turn = self.input_queue.has_trigger_turn_mailbox_items().await;
         if !has_trigger_turn

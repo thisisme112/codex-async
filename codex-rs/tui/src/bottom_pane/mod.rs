@@ -273,6 +273,7 @@ pub(crate) use chat_composer::ChatComposer;
 pub(crate) use chat_composer::ChatComposerConfig;
 pub(crate) use chat_composer::ClipboardPasteTarget;
 pub(crate) use chat_composer::ComposerDraftSnapshot;
+pub(crate) use chat_composer::DisconnectedCommandState;
 pub(crate) use chat_composer::InputResult;
 pub(crate) use chat_composer::KillBufferSnapshot;
 pub(crate) use chat_composer::QueuedInputAction;
@@ -1873,6 +1874,10 @@ impl BottomPane {
         self.composer.is_empty()
     }
 
+    pub(crate) fn accepts_reconnect_shortcut(&self) -> bool {
+        self.composer.accepts_reconnect_shortcut()
+    }
+
     pub(crate) fn composer_is_vim_enabled(&self) -> bool {
         self.composer.is_vim_enabled()
     }
@@ -1883,6 +1888,10 @@ impl BottomPane {
 
     pub(crate) fn is_task_running(&self) -> bool {
         self.is_task_running
+    }
+
+    pub(crate) fn take_painted_steer_hint(&self) -> bool {
+        self.pending_input_preview.painted_steer_hint.take()
     }
 
     pub(crate) fn should_interrupt_running_task(&self, key_event: KeyEvent) -> bool {

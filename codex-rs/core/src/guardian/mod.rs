@@ -97,8 +97,12 @@ pub(crate) use codex_guardian_reviewer::GUARDIAN_MAX_NODE_REPL_TOOL_RESULT_TOKEN
 /// MCP elicitations use their live invocation's issuing step when available, otherwise turn inputs.
 #[derive(Clone)]
 pub(crate) struct GuardianReviewContext {
+    /// Parent evidence supplied for a direct review of recorded worker history.
+    root_evidence: Option<Arc<codex_app_server_protocol::GuardianRootEvidence>>,
     pub(crate) request_country: RequestCountry,
     pub(crate) serving_assessment: Option<Arc<ServingAssessment>>,
+    /// Observational serving probe; never an approval decision.
+    pub(crate) guardian_probe: Option<bool>,
     /// The latest response ID and its connection affinity when review was requested.
     pub(crate) parent_response: Option<Arc<ParentResponse>>,
     /// A host-verified, still-running tool invocation that requested this nested review.
@@ -147,7 +151,9 @@ impl GuardianReviewContext {
         Self {
             request_country: settings.request_country().clone(),
             serving_assessment: None,
+            guardian_probe: None,
             review_execution: None,
+            root_evidence: None,
             enclosing_invocation_id: None,
             parent_response: turn.extension_data.get::<ParentResponse>(),
             environments: environments.clone(),
@@ -176,7 +182,9 @@ impl From<&Arc<StepContext>> for GuardianReviewContext {
         Self {
             request_country: step.settings.request_country().clone(),
             serving_assessment: step.serving_assessment.clone(),
+            guardian_probe: step.guardian_probe,
             review_execution: None,
+            root_evidence: None,
             enclosing_invocation_id: None,
             parent_response: step.turn.extension_data.get::<ParentResponse>(),
             turn: Arc::clone(&step.turn),
@@ -197,7 +205,9 @@ impl From<Arc<TurnContext>> for GuardianReviewContext {
         Self {
             request_country: turn.initial_settings.request_country().clone(),
             serving_assessment: None,
+            guardian_probe: None,
             review_execution: None,
+            root_evidence: None,
             enclosing_invocation_id: None,
             parent_response: turn.extension_data.get::<ParentResponse>(),
             environments: turn.initial_environments.clone(),

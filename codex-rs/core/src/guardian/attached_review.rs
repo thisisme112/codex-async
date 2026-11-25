@@ -15,7 +15,6 @@ use codex_analytics::GuardianReviewSessionKind;
 use codex_guardian_context::ComposedContext;
 use codex_guardian_reviewer::GuardianReviewSessionOutcome;
 use codex_guardian_reviewer::SessionDisposition;
-use codex_protocol::protocol::GuardianAssessmentOutcome;
 use codex_protocol::user_input::UserInput;
 use tokio::sync::Mutex;
 
@@ -132,6 +131,7 @@ impl AttachedApproval {
                 action,
                 permissions.as_ref(),
                 config.spawn_config.guardian_context_budgeting(),
+                approval.context.frame_native_agent_actions(),
             )
             .map_err(|err| GuardianReviewSessionOutcome::PromptBuildFailed(err.into()))?;
             let request = review_turn(
@@ -173,22 +173,19 @@ impl AttachedApproval {
             let (runtime, authorization, turn) = prepared??;
             // Let the runner interrupt and drain the turn before it finalizes a provisional denial.
             let (turn, _) = runtime
-                .run_sync_verdict(&approval.context, turn, deadline, Some(cancel), &mut analytics)
+                .run_sync_verdict(
+                    &approval.context,
+                    turn,
+                    deadline,
+                    Some(cancel),
+                    &mut analytics,
+                )
                 .await?;
             let stale = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(GuardianReviewSessionOutcome::Aborted),
                 _ = deadline.wait() => {
-                    // An interrupted second sample may still carry the first denial.
-                    let recovered_denial = match &turn.outcome {
-                        GuardianReviewSessionOutcome::Completed(Ok(Some(response))) if !turn.turn_completed => {
-                            response.assessment().is_ok_and(|assessment| {
-                                assessment.outcome == GuardianAssessmentOutcome::Deny
-                            })
-                        }
-                        _ => false,
-                    };
-                    if !recovered_denial {
+                    if !turn.outcome.is_recovered_denial() {
                         return Err(GuardianReviewSessionOutcome::TimedOut);
                     }
                     None
