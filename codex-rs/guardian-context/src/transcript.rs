@@ -31,6 +31,7 @@ use crate::SectionHistory;
 use crate::SectionInput;
 use crate::SectionScope;
 use crate::TranscriptContent;
+use crate::audio_transcripts::collect_audio_transcript;
 
 pub(crate) const TRANSCRIPT_OMISSION_NOTICE: &str = "Some conversation entries were omitted.";
 
@@ -63,6 +64,8 @@ pub struct ConversationTranscriptOptions {
     /// Preserve calls in this MAv2 namespace for synchronous backend decryption.
     /// `None` keeps the existing text transcript; `functions` selects the default namespace.
     pub native_multi_agent_namespace: Option<String>,
+    /// Distinguish the pending native agent action from historical tool calls.
+    pub frame_native_agent_actions: bool,
 }
 
 impl Default for ConversationTranscriptOptions {
@@ -72,6 +75,7 @@ impl Default for ConversationTranscriptOptions {
             include_tool_outputs: true,
             include_reasoning: false,
             native_multi_agent_namespace: None,
+            frame_native_agent_actions: false,
         }
     }
 }
@@ -182,6 +186,11 @@ fn collect_transcript_for_review(
         .filter(|context| !crate::retained_instructions::has_legacy_order(context));
 
     for (item, source) in history.items_with_sources() {
+        entries.extend(
+            history
+                .audio_transcripts_for(item)
+                .filter_map(|transcript| collect_audio_transcript(transcript, &config.options)),
+        );
         let is_enclosing_call = matches!(
             item,
             ResponseItem::FunctionCall { call_id, .. }
@@ -275,7 +284,11 @@ fn collect_transcript_for_review(
             {
                 (
                     ConversationTranscriptEntryKind::ToolCall(format!("tool {name} call")),
-                    TRANSCRIPT_OMISSION_NOTICE.to_owned(),
+                    if config.options.frame_native_agent_actions {
+                        "See the current approval request.".to_owned()
+                    } else {
+                        TRANSCRIPT_OMISSION_NOTICE.to_owned()
+                    },
                 )
             }
             ResponseItem::FunctionCall {
