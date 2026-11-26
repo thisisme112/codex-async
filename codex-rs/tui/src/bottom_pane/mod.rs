@@ -268,11 +268,11 @@ pub(crate) enum CancellationEvent {
     NotHandled,
 }
 
-use crate::bottom_pane::prompt_args::parse_slash_name;
 pub(crate) use chat_composer::ChatComposer;
 pub(crate) use chat_composer::ChatComposerConfig;
 pub(crate) use chat_composer::ClipboardPasteTarget;
 pub(crate) use chat_composer::ComposerDraftSnapshot;
+pub(crate) use chat_composer::DisconnectedCommandState;
 pub(crate) use chat_composer::InputResult;
 pub(crate) use chat_composer::KillBufferSnapshot;
 pub(crate) use chat_composer::QueuedInputAction;
@@ -1873,6 +1873,10 @@ impl BottomPane {
         self.composer.is_empty()
     }
 
+    pub(crate) fn accepts_reconnect_shortcut(&self) -> bool {
+        self.composer.accepts_reconnect_shortcut()
+    }
+
     pub(crate) fn composer_is_vim_enabled(&self) -> bool {
         self.composer.is_vim_enabled()
     }
@@ -1885,19 +1889,16 @@ impl BottomPane {
         self.is_task_running
     }
 
-    pub(crate) fn should_interrupt_running_task(&self, key_event: KeyEvent) -> bool {
-        let is_agent_command = self
-            .composer_text()
-            .lines()
-            .next()
-            .and_then(parse_slash_name)
-            .is_some_and(|(name, _, _)| matches!(name, "agents" | "subagents"));
+    pub(crate) fn take_painted_steer_hint(&self) -> bool {
+        self.pending_input_preview.painted_steer_hint.take()
+    }
 
+    pub(crate) fn should_interrupt_running_task(&self, key_event: KeyEvent) -> bool {
         self.keymap.chat.interrupt_turn.is_pressed(key_event)
             && !(self.shortcut_overlay_visible()
                 && key_hint::plain(KeyCode::Esc).is_press(key_event))
             && self.is_task_running
-            && !(is_agent_command && key_event.code == KeyCode::Esc)
+            && !(key_event.code == KeyCode::Esc && self.composer.is_agent_command())
             && self.no_modal_or_popup_active()
             && !self.composer_should_handle_vim_insert_escape(key_event)
     }
@@ -2682,6 +2683,7 @@ impl BottomPane {
             let composer: RenderableItem<'_> = if let Some(questions) = question_editor {
                 RenderableItem::Borrowed(questions.as_ref())
             } else if options.max_height.is_none()
+                && options.stream_interrupt_key.is_none()
                 && options.image_previews.is_none()
                 && options.textarea_right_reserve == 0
                 && options.warning_count == 0

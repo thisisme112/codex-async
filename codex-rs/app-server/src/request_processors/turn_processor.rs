@@ -16,7 +16,6 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageReference as CoreImageReference;
-use codex_protocol::protocol::RealtimeConversationVersion;
 use codex_protocol::protocol::TurnEnvironmentRequests;
 use codex_protocol::protocol::TurnSettingsUpdate;
 use codex_protocol::protocol::TurnSettingsUpdateOutcome;
@@ -216,16 +215,23 @@ impl TurnRequestProcessor {
             EnsureConversationListenerResult::Attached => {}
             EnsureConversationListenerResult::ConnectionClosed => return Ok(None),
         }
-        let result =
-            thread
-                .guardian_review(cancellation)
-                .await
-                .map_err(|err| match err.details() {
-                    CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
-                    _ => internal_error(format!("Guardian review failed: {err}")),
-                })?;
+        // Older servers silently ignore rootEvidence. Acknowledge it on success so clients
+        // can distinguish a worker review from one that used only the injected history.
+        let used_root_evidence = params.root_evidence.is_some();
+        let result = thread
+            .guardian_review_with_root_evidence(
+                &params.tool_call,
+                params.root_evidence,
+                cancellation,
+            )
+            .await
+            .map_err(|err| match err.details() {
+                CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
+                _ => internal_error(format!("Guardian review failed: {err}")),
+            })?;
         Ok(Some(
             ThreadGuardianReviewResponse {
+                used_root_evidence,
                 call_id: result.call_id,
                 assessment: ThreadGuardianAssessment {
                     outcome: result.assessment.outcome,
@@ -473,6 +479,24 @@ impl TurnRequestProcessor {
         Ok((thread_id, thread))
     }
 
+    async fn thread_workspace_kind(&self, thread: &CodexThread) -> Option<String> {
+        let db = thread.state_db()?;
+        let thread_id = thread.startup_metadata().thread_id;
+        // Saving a new thread consumes its staged assignment, so read staging first.
+        let staged_project_id = self
+            .thread_manager
+            .thread_store()
+            .read_pending_thread_metadata(thread_id)
+            .await
+            .ok()?
+            .and_then(|patch| patch.project_id.flatten());
+        let assigned = db
+            .thread_has_project(thread_id, staged_project_id.as_deref())
+            .await
+            .ok()?;
+        Some(if assigned { "project" } else { "projectless" }.to_owned())
+    }
+
     async fn ensure_direct_input_allowed(
         &self,
         request_id: &ConnectionRequestId,
@@ -647,6 +671,14 @@ impl TurnRequestProcessor {
             .inspect_err(|error| {
                 self.track_error_response(&request_id, error, /*error_type*/ None);
             })?;
+        // TUI composer prompts carry a client message ID. Helper requests omit it.
+        let inferred_workspace_kind = if app_server_client_name.as_deref() == Some("codex-tui")
+            && params.client_user_message_id.is_some()
+        {
+            self.thread_workspace_kind(&thread).await
+        } else {
+            None
+        };
         Self::set_app_server_client_info(
             thread.as_ref(),
             app_server_client_name,
@@ -729,6 +761,7 @@ impl TurnRequestProcessor {
                 TurnInputRequest::new(input)
                     .with_thread_settings(thread_settings)
                     .on_start(TurnStartOptions {
+                        inferred_workspace_kind,
                         turn_trigger: params.turn_trigger,
                         parent_turn_id: params.parent_turn_id,
                         root_turn_id: params.root_turn_id,
@@ -1343,8 +1376,6 @@ impl TurnRequestProcessor {
                 Some("initialItems")
             } else if params.model.is_some() {
                 Some("model")
-            } else if params.voice.is_some() {
-                Some("voice")
             } else if params.delegation_ack_filler.is_some() {
                 Some("delegationAckFiller")
             } else {
@@ -1361,23 +1392,6 @@ impl TurnRequestProcessor {
             .await?
         else {
             return Ok(None);
-        };
-        let voice = match params.voice {
-            Some(voice) => Some(Some(voice)),
-            None if !attaches_existing_call
-                && params.version == Some(RealtimeConversationVersion::V3) =>
-            {
-                let current = thread.config().await;
-                let latest = Box::pin(self.config_manager.load_latest_config_with_session_layers(
-                    &current.config_layer_stack,
-                    &current.cwd,
-                ))
-                .await
-                .map_err(|error| config_load_error(&error))?;
-                // Preserve a cleared preference instead of inheriting the thread's old voice.
-                Some(latest.realtime.voice)
-            }
-            None => None,
         };
         self.submit_core_op(
             request_id,
@@ -1428,7 +1442,6 @@ impl TurnRequestProcessor {
                     }
                 }),
                 version: params.version,
-                voice,
             }),
         )
         .await

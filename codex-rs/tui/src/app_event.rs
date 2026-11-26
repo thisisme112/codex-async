@@ -298,7 +298,8 @@ pub(crate) struct AgentsOverviewThreadRefresh {
 #[derive(Debug, Default)]
 pub(crate) struct AgentPickerThreadRefresh {
     pub(crate) threads: Vec<Thread>,
-    pub(crate) archived_thread_ids: std::collections::HashSet<ThreadId>,
+    pub(crate) archived_threads:
+        std::collections::HashMap<ThreadId, crate::multi_agents::AgentMetadata>,
 }
 
 /// Source-backed replacement for the outgoing widget's width-bound streaming rows.
@@ -1097,7 +1098,11 @@ pub(crate) enum AppEvent {
     },
 
     /// Result of computing a `/diff` command.
-    DiffResult(PathUri, String),
+    DiffResult {
+        thread_id: Option<ThreadId>,
+        cwd: PathUri,
+        text: String,
+    },
 
     /// Open the app link view in the bottom pane.
     OpenAppLink {
@@ -1414,6 +1419,8 @@ pub(crate) enum AppEvent {
     FollowTranscript,
 
     InsertHistoryCell(Box<dyn HistoryCell>),
+    /// Finish a command whose running cell has already been committed to history.
+    CompleteBackgroundCommand(Box<crate::exec_cell::ExecCell>),
     /// FIFO barrier after the completed turn's history insertions.
     TurnTipReady {
         thread_id: ThreadId,
@@ -1577,7 +1584,6 @@ pub(crate) enum AppEvent {
     /// Show the cyber auto-review notice after the model selection confirmation.
     CyberModelAutoReviewNotice,
 
-    /// Read the owning server preference before showing the voice picker.
     OpenRealtimeSettings,
     OpenRealtimeSoundDevices,
     OpenRealtimeVoices,
@@ -1600,9 +1606,16 @@ pub(crate) enum AppEvent {
         channel: Option<codex_config::config_toml::MicrophoneChannels>,
     },
 
-    /// Save the voice for subsequent conversations through the app server.
+    RealtimeVoicesLoaded {
+        origin: Option<ThreadId>,
+        result: anyhow::Result<codex_app_server_protocol::AccountVoiceSettingsReadResponse>,
+    },
     PersistRealtimeVoiceSelection {
-        voice: codex_protocol::protocol::RealtimeVoice,
+        voice: codex_app_server_protocol::AccountVoiceOption,
+    },
+    RealtimeVoiceSaved {
+        origin: Option<ThreadId>,
+        result: anyhow::Result<String>,
     },
 
     /// Toggle the service tier staged for the next Cloud submission.
@@ -1627,6 +1640,8 @@ pub(crate) enum AppEvent {
         model: String,
     },
 
+    /// Adopt the widget's active catalog without requesting another model list.
+    SyncModelCatalog,
     /// Fetch the current catalog even when cached models produce no picker.
     FetchModels {
         request_id: uuid::Uuid,
