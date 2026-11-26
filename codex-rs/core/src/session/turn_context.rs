@@ -365,7 +365,12 @@ pub(crate) struct NewTurnContextOptions {
     pub(crate) prompt_cache_ttl: Option<crate::PromptCacheTtl>,
     pub(crate) cyber_access_program: Option<CyberAccessProgram>,
     pub(crate) helper_admission: Option<crate::agent::helper_daybreak::turn::HelperTurnAdmission>,
+    pub(crate) goal_daybreak: Option<crate::GoalDaybreakSnapshot>,
 }
+
+/// Unrecorded input shared with cleanup, even after the active task is detached.
+#[derive(Clone)]
+struct PendingInitialInput(Vec<TurnInput>);
 
 /// The context needed for a single turn of the thread.
 #[derive(Debug)]
@@ -452,6 +457,17 @@ enum TurnContextBuildMode {
 }
 
 impl TurnContext {
+    pub(crate) fn park_initial_input(&self, input: Vec<TurnInput>) {
+        let previous = self.extension_data.insert(PendingInitialInput(input));
+        debug_assert!(previous.is_none());
+    }
+
+    pub(crate) fn take_initial_input(&self) -> Option<Vec<TurnInput>> {
+        self.extension_data
+            .remove::<PendingInitialInput>()
+            .map(|input| Arc::unwrap_or_clone(input).0)
+    }
+
     /// Returns the resolved causal root for this admitted turn.
     pub(crate) fn root_turn_id(&self) -> String {
         self.turn_metadata_state
@@ -1529,6 +1545,9 @@ impl Session {
         }
         if let Some(admission) = options.helper_admission {
             admission.capture_intent(self, &mut turn_context).await;
+        }
+        if let Some(snapshot) = options.goal_daybreak {
+            snapshot.apply(self, &mut turn_context);
         }
         // Tool observers retain this turn's selection even after a later turn starts.
         if let Some(program) = turn_context.cyber_access_program {

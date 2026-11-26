@@ -1,4 +1,3 @@
-use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -16,6 +15,7 @@ use image::imageops::FilterType;
 use ratatui::layout::Rect;
 
 use super::sixel;
+use crate::terminal_capabilities::images::wrap_graphics_command;
 
 const ESC: &str = "\x1b";
 const ST: &str = "\x1b\\";
@@ -58,7 +58,7 @@ impl FromStr for ProtocolSelection {
 }
 
 pub fn kitty_delete_image(image_id: u32) -> String {
-    wrap_for_tmux_if_needed(&format!("{ESC}_Ga=d,d=I,i={image_id},q=2;{ST}"))
+    wrap_graphics_command(&format!("{ESC}_Ga=d,d=I,i={image_id},q=2;{ST}"))
 }
 
 #[derive(Clone, Copy)]
@@ -96,7 +96,7 @@ impl KittyPlacement {
 pub(crate) fn kitty_move_image(id: u32, area: ratatui::layout::Rect) -> String {
     let (columns, rows) = (area.width, area.height);
     // Lowercase i removes placements but keeps the uploaded pixel data.
-    wrap_for_tmux_if_needed(&format!(
+    wrap_graphics_command(&format!(
         "{ESC}_Ga=d,d=i,i={id},q=2;{ST}{ESC}_Ga=p,i={id},c={columns},r={rows},C=1,q=2;{ST}"
     ))
 }
@@ -125,11 +125,11 @@ pub fn kitty_transmit_png_with_id(
                 "{ESC}_Ga=T,t=d,f=100,c={columns},r={rows},q=2{image_id},m={more_flag},C=1;{chunk}{ST}",
             ));
         } else {
-            command.push_str(&format!("{ESC}_Gm={more_flag};{chunk}{ST}"));
+            command.push_str(&format!("{ESC}_Gm={more_flag},q=2;{chunk}{ST}"));
         }
     }
 
-    Ok(wrap_for_tmux_if_needed(&command))
+    Ok(wrap_graphics_command(&command))
 }
 
 pub fn kitty_transmit_png_file_with_id(
@@ -146,7 +146,7 @@ pub fn kitty_transmit_png_file_with_id(
     let command =
         format!("{ESC}_Ga=T,t=f,f=100,c={columns},r={rows},q=2{image_id},C=1;{payload}{ST}");
 
-    Ok(wrap_for_tmux_if_needed(&command))
+    Ok(wrap_graphics_command(&command))
 }
 
 fn kitty_image_id_arg(placement: KittyPlacement) -> String {
@@ -154,15 +154,6 @@ fn kitty_image_id_arg(placement: KittyPlacement) -> String {
         KittyPlacement::Cursor(id) => format!(",i={id}"),
         KittyPlacement::Virtual(id) => format!(",i={id},U=1"),
     }
-}
-
-fn wrap_for_tmux_if_needed(command: &str) -> String {
-    if env::var_os("TMUX").is_none() {
-        return command.to_string();
-    }
-
-    let escaped = command.replace(ESC, "\x1b\x1b");
-    format!("{ESC}Ptmux;{escaped}{ST}")
 }
 
 pub fn sixel_frame(frame_path: &Path, cache_dir: &Path, height_px: u16) -> Result<PathBuf> {
@@ -219,6 +210,26 @@ mod tests {
         assert!(command.starts_with("\x1b_Ga=T,t=d,f=100,c=4,r=3,q=2,i=7,m=0,C=1;"));
         assert!(command.contains("cG5n"));
         assert!(command.ends_with("\x1b\\"));
+
+        // Base64 encoding expands this payload to three chunks.
+        fs::write(&path, vec![0; 2 * KITTY_CHUNK_SIZE]).unwrap();
+        let command = kitty_transmit_png_with_id(
+            &path,
+            /*columns*/ 4,
+            /*rows*/ 3,
+            KittyPlacement::Cursor(7),
+        )
+        .unwrap();
+        let headers = command
+            .split("\x1b_G")
+            .skip(1)
+            .map(|chunk| chunk.split_once(';').unwrap().0)
+            .collect::<Vec<_>>();
+        insta::assert_snapshot!(headers.join("\n"), @r"
+        a=T,t=d,f=100,c=4,r=3,q=2,i=7,m=1,C=1
+        m=1,q=2
+        m=0,q=2
+        ");
     }
 
     #[test]
@@ -226,7 +237,7 @@ mod tests {
     fn tmux_passthrough_wraps_and_escapes_control_sequence() {
         let _guard = EnvVarGuard::new("TMUX", Some("session"));
         assert_eq!(
-            wrap_for_tmux_if_needed("\x1b_Gx;\x1b\\"),
+            wrap_graphics_command("\x1b_Gx;\x1b\\"),
             "\x1bPtmux;\x1b\x1b_Gx;\x1b\x1b\\\x1b\\"
         );
     }
@@ -248,13 +259,25 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn auto_protocol_is_disabled_inside_tmux() {
-        let _guard = EnvVarGuard::new("TMUX", Some("session"));
-
+    fn auto_protocol_requires_virtual_placements_inside_tmux() {
+        const CHILD: &str = "CODEX_TUI_IMAGE_PLACEMENT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for (key, value) in [("TMUX", "session"), ("TMUX_PANE", "%0")] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "pets::image_protocol::tests::auto_protocol_requires_virtual_placements_inside_tmux"])
+                    .env(CHILD, "1")
+                    .env_remove("TMUX")
+                    .env_remove("TMUX_PANE")
+                    .env(key, value)
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "{key} placement check failed");
+            }
+            return;
+        }
         assert_eq!(
             ProtocolSelection::Auto.resolve(),
-            PetImageSupport::Unsupported(PetImageUnsupportedReason::Tmux)
+            PetImageSupport::Unsupported(PetImageUnsupportedReason::RequiresVirtualPlacement)
         );
     }
 

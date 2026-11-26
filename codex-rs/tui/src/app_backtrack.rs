@@ -210,12 +210,12 @@ impl App {
             Overlay::new_transcript(
                 self.transcript_cells.clone(),
                 self.keymap.pager.clone(),
-                self.local_settings
-                    .copy_on_select(&codex_terminal_detection::terminal_info()),
+                self.local_settings.copy_on_select(),
                 self.local_settings
                     .tui
                     .mouse_scroll_speed
                     .unwrap_or(/*default*/ 1.0),
+                tui.terminal.bidi_layout,
             )
             .with_copy_on_select_clear_selection(
                 self.local_settings.tui.copy_on_select_clear_selection,

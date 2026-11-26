@@ -32,7 +32,12 @@ fn elements_round_trip_and_require_explicit_row_spacing() {
     ] {
         assert!(parse(json!({"type":"link","props":{"href":href},"children":[]})).is_err());
     }
-    for (gap, expected) in [(0, "AB"), (1, "A B"), (2, "A  B"), (MAX_GAP, "A  …")] {
+    for (gap, expected) in [
+        (0, "AB"),
+        (1, "A B"),
+        (2, "A  B"),
+        (MAX_SAFE_INTEGER, "A  …"),
+    ] {
         let row = tree(json!({"type":"row","props":{"gap":gap},"children":["A","B"]}));
         assert_eq!(painted_rows(&row, Size::new(4, 1)), [expected]);
     }
@@ -216,6 +221,110 @@ fn preserved_text_keeps_spacing_across_inline_styles_and_wraps() {
             .modifier
             .contains(ratatui::style::Modifier::BOLD)
     );
+}
+
+#[test]
+fn clamping_text_reserves_space_for_following_fields() {
+    let node = tree(json!({"type":"col","props":{"gap":0},"children":[
+        {"type":"text","props":{"maxLines":2,"preserveWhitespace":true},"children":["aa  bb cc dd ee"]},
+        "ok"
+    ]}));
+    insta::assert_snapshot!(painted_rows(&node, Size::new(5, 3)).join("\n"), @"aa bb\ncc d…\nok");
+    assert_eq!(
+        painted_rows(&node, Size::new(8, 3)),
+        ["aa bb cc", "dd ee", "ok"]
+    );
+    assert_eq!(painted_rows(&node, Size::new(5, 1)), ["aa b…"]);
+    assert_eq!(painted_rows(&node, Size::new(3, 2)), ["aa", "bb…"]);
+    let word = tree(json!({"type":"text","props":{"maxLines":2},"children":["123456789"]}));
+    assert_eq!(painted_rows(&word, Size::new(4, 3)), ["1234", "567…"]);
+    let job = tree(json!({"type":"text","props":{"maxLines":2},"children":["job-123"]}));
+    assert_eq!(painted_rows(&job, Size::new(3, 2)), ["job", "-1…"]);
+    for invalid in [
+        json!(0),
+        json!(-1),
+        json!(1.5),
+        json!(null),
+        json!(9007199254740992u64),
+    ] {
+        assert!(parse(json!({"type":"text","props":{"maxLines":invalid},"children":[]})).is_err());
+    }
+}
+
+#[test]
+fn viewport_overflow_cannot_reclaim_padding_already_used_by_a_clamp() {
+    let node = tree(json!({"type":"col","props":{"gap":0},"children":[
+        {"type":"row","props":{"gap":0},"children":[
+            {"type":"text","props":{"maxLines":1},"children":[
+                {"type":"row","props":{"gap":1,"justify":"end","wrap":"wrap"},"children":[
+                    {"type":"text","children":["X"]}, {"type":"text","children":["Y"]}
+                ]}
+            ]},
+            "B"
+        ]},
+        "C"
+    ]}));
+    assert_eq!(painted_rows(&node, Size::new(3, 1)), ["X……"]);
+    assert_eq!(painted_rows(&node, Size::new(3, 2)), ["X…B", "C"]);
+    assert_eq!(painted_rows(&node, Size::new(4, 2)), ["X YB", "C"]);
+}
+
+#[test]
+fn clamped_link_keeps_whole_graphemes_and_an_unlinked_marker() {
+    let href = "https://example.com/";
+    let node = tree(json!({"type":"link","props":{"href":href},"children":[
+        {"type":"text","props":{"maxLines":1},"children":["a界\nb"]}
+    ]}));
+    let bounds = Size::new(3, 3);
+    assert_eq!(node.measure(bounds), Size::new(2, 1));
+    assert_eq!(
+        painted_rows(&node, bounds),
+        [format!(
+            "{}…",
+            crate::terminal_hyperlinks::osc8_hyperlink(href, "a")
+        )]
+    );
+}
+
+#[test]
+fn empty_horizontal_box_keeps_its_flex_slot_and_separates_text_blocks() {
+    let empty = json!({"type":"box","props":{"direction":"row","gap":0},"children":[]});
+    let children = json!(["A", empty, "B"]);
+    for props in [json!({"gap":1}), json!({"gap":1,"justify":"start"})] {
+        let row = tree(json!({"type":"row","props":props,"children":children}));
+        assert_eq!(painted_rows(&row, Size::new(9, 1)), ["A  B"]);
+    }
+    let block = tree(json!({"type":"text","children":children}));
+    assert_eq!(painted_rows(&block, Size::new(9, 3)), ["A", "B"]);
+}
+
+#[test]
+fn box_defaults_to_a_column_and_uses_row_options_in_row_direction() {
+    let make = |props: Value| json!({"type":"box","props":props,"children":["a","b",null,{"type":"text","children":["c"]}]});
+    let bounds = Size::new(5, 4);
+    for props in [json!({"gap":1}), json!({"direction":"col","gap":1})] {
+        let value = make(props);
+        assert_eq!(
+            serde_json::to_value(parse(value.clone()).unwrap()).unwrap(),
+            value
+        );
+        assert_eq!(painted_rows(&tree(value), bounds), ["ab", "", "c"]);
+    }
+    let row = make(json!({"direction":"row","gap":1,"wrap":"wrap","justify":"end"}));
+    assert_eq!(
+        painted_rows(&tree(row.clone()), Size::new(2, 3)),
+        ["ab", " c"]
+    );
+    let nested = tree(json!({"type":"text","children":["x",row,"y"]}));
+    insta::assert_snapshot!(painted_rows(&nested, bounds).join("\n"), @"x\n ab c\ny");
+    for props in [
+        json!({}),
+        json!({"direction":"vertical","gap":0}),
+        json!({"direction":"col","gap":0,"justify":"end"}),
+        json!({"gap":-1}),
+    ] {
+        assert!(parse(make(props)).is_err());
+    }
 }
 
 #[test]
@@ -805,7 +914,7 @@ fn col_stacks_rows_after_wrapping_and_skips_absent_children() {
         ["model", "main", "", "75% 1k"]
     );
     let clipped = tree(
-        json!({"type":"col","props":{"gap":MAX_GAP},"children":[{"type":"text","children":["a"]},{"type":"text","children":["b"]}]}),
+        json!({"type":"col","props":{"gap":MAX_SAFE_INTEGER},"children":[{"type":"text","children":["a"]},{"type":"text","children":["b"]}]}),
     );
     assert_eq!(painted_rows(&clipped, Size::new(5, 3)), ["a", "", "…"]);
 }
@@ -1352,6 +1461,52 @@ fn blank_nested_row_keeps_its_height_without_displacing_a_wide_sibling() {
 }
 
 #[test]
+fn clamped_word_shrinks_to_keep_its_sibling_visible() {
+    let node = tree(json!({"type":"row","props":{"gap":1},"children":[
+        {"type":"text","props":{"maxLines":1},"children":["abcdefghij"]}, "!"
+    ]}));
+    assert_eq!(painted_rows(&node, Size::new(8, 1)), ["abcde… !"]);
+    assert_eq!(painted_rows(&node, Size::new(3, 1)), ["… !"]);
+    assert_eq!(painted_rows(&node, Size::new(1, 1)), ["…"]);
+}
+
+#[test]
+fn blank_clamp_keeps_its_sibling_end_aligned_without_a_marker() {
+    let node = tree(
+        json!({"type":"row","props":{"gap":0,"justify":"end"},"children":[
+            {"type":"text","props":{"maxLines":1},"children":["\n\n"]}, "ok"
+        ]}),
+    );
+    assert_eq!(painted_rows(&node, Size::new(5, 1)), ["   ok"]);
+    assert_eq!(painted_rows(&node, Size::new(2, 1)), ["ok"]);
+}
+
+#[test]
+fn clamped_blank_text_keeps_its_height_in_a_zero_width_slot() {
+    let node = tree(json!({
+        "type": "row", "props": {"gap": 0}, "children": [
+            {"type": "text", "props": {"maxLines": 2}, "children": ["\n\n\n"]},
+            "A"
+        ]
+    }));
+    assert_eq!(painted_rows(&node, Size::new(1, 3)), ["A", ""]);
+}
+
+#[test]
+fn spacer_only_wrapping_row_stays_in_its_zero_width_slot() {
+    let spacer = json!({"type": "spacer"});
+    for children in [json!([spacer]), json!([spacer, spacer])] {
+        let node = tree(json!({
+            "type": "row", "props": {"gap": 0}, "children": [
+                {"type": "row", "props": {"gap": 1, "wrap": "wrap"}, "children": children},
+                "A"
+            ]
+        }));
+        assert_eq!(painted_rows(&node, Size::new(1, 1)), ["A"]);
+    }
+}
+
+#[test]
 fn trailing_gap_keeps_the_aligned_glyph_at_the_viewport_edge() {
     let node = tree(json!({
         "type":"row","props":{"gap":1},"children":[
@@ -1452,4 +1607,333 @@ fn clipped_code_tab_styles_the_marker_only_when_it_paints_cells() {
         assert_eq!(marker.symbol(), "…");
         assert_eq!(marker.style(), buf[(width - 2, 0)].style());
     }
+}
+
+#[test]
+fn spacer_is_an_empty_leaf() {
+    for input in [
+        json!({"type":"spacer"}),
+        json!({"type":"spacer","children":[]}),
+    ] {
+        let node = parse(input).unwrap();
+        assert_eq!(
+            serde_json::to_value(&node).unwrap(),
+            json!({"type":"spacer"})
+        );
+        assert_eq!(node.prepare().measure(Size::new(8, 3)), Size::default());
+    }
+    for input in [
+        json!({"type":"spacer","children":[null]}),
+        json!({"type":"spacer","children":["text"]}),
+        json!({"type":"spacer","props":{"minSize":1}}),
+    ] {
+        assert!(parse(input).is_err());
+    }
+}
+
+#[test]
+fn spacers_share_each_bands_spare_width_before_justification() {
+    let spacer = json!({"type":"spacer"});
+    let node = tree(
+        json!({"type":"box","props":{"direction":"row","gap":1,"wrap":"wrap","justify":"end"},
+        "children":["A",spacer,"B",spacer,"C"]}),
+    );
+    insta::assert_snapshot!(painted_rows(&node, Size::new(10, 3)).join("\n"), @"A    B   C");
+    assert_eq!(painted_rows(&node, Size::new(7, 3)), ["A  B  C"]);
+    assert_eq!(painted_rows(&node, Size::new(4, 3)), ["A  B", "   C"]);
+    let row = tree(json!({"type":"row","props":{"gap":0},"children":["a", "b", spacer, "界\nx"]}));
+    assert_eq!(painted_rows(&row, Size::new(8, 1)), ["ab   界…"]);
+}
+
+#[test]
+fn spacers_share_height_only_in_stretched_columns() {
+    let spacer = json!({"type":"spacer"});
+    let col = json!({"type":"col","props":{"gap":0},"children":["A",spacer,"B",spacer,"C"]});
+    assert_eq!(
+        painted_rows(&tree(col.clone()), Size::new(8, 8)),
+        ["A", "B", "C"]
+    );
+    let row = tree(json!({"type":"row","props":{"gap":0},"children":[col,"1\n2\n3\n4\n5\n6"]}));
+    assert_eq!(
+        painted_rows(&row, Size::new(8, 6)),
+        ["A1", " 2", " 3", "B4", " 5", "C6"]
+    );
+    assert_eq!(painted_rows(&row, Size::new(8, 3)), ["A1", " 2", " 3…"]);
+    let huge = tree(json!({"type":"row","props":{"gap":0},"children":[col,
+        {"type":"col","props":{"gap":MAX_SAFE_INTEGER},"children":["1",spacer,"2"]}]}));
+    assert_eq!(painted_rows(&huge, Size::new(8, 3)), ["A1", "", "…"]);
+}
+
+#[test]
+fn spacer_paints_the_row_fill_through_its_allocated_width() {
+    let node = tree(
+        json!({"type":"row","props":{"gap":1,"background":"red"},"children":["A",{"type":"spacer"}]}),
+    );
+    let area = Rect::new(0, 0, 8, 1);
+    let mut buf = Buffer::empty(area);
+    node.render(area, &Theme::default(), &mut buf, /*plain_style*/ None);
+    assert!(
+        buf.content()
+            .iter()
+            .all(|c| c.bg == ratatui::style::Color::Red)
+    );
+}
+
+#[test]
+fn zero_width_spacer_keeps_vertical_overflow_safe() {
+    let s = json!({"type":"spacer"});
+    let node = tree(json!({"type":"row","props":{"gap":0},"children":[s,"界\nx",s]}));
+    assert_eq!(painted_rows(&node, Size::new(2, 1)), ["…"]);
+    assert_eq!(painted_rows(&node, Size::new(3, 1)), ["界…"]);
+}
+
+#[test]
+fn stretch_reaches_columns_through_nested_row_bands() {
+    let col = json!({"type":"col","props":{"gap":0},"children":["A",{"type":"spacer"},"B"]});
+    let nested = json!({"type":"row","props":{"gap":0,"wrap":"wrap"},"children":[col,col]});
+    let node = tree(json!({"type":"row","props":{"gap":0},"children":[nested,"1\n2\n3\n4\n5\n6"]}));
+    assert_eq!(
+        painted_rows(&node, Size::new(2, 6)),
+        ["A1", " 2", "B3", "A4", " 5", "B6"]
+    );
+}
+
+#[test]
+fn wrapped_spacer_bands_share_a_taller_siblings_height() {
+    let spacer = json!({"type":"spacer"});
+    let inner = json!({"type":"row","props":{"gap":0,"wrap":"wrap"},"children":["A",spacer,"B",spacer,"C"]});
+    let node = tree(json!({"type":"row","props":{"gap":0},"children":[inner,"1\n2\n3\n4\n5\n6"]}));
+    assert_eq!(
+        painted_rows(&node, Size::new(2, 6)),
+        ["A1", " 2", "B3", " 4", "C5", " 6"]
+    );
+}
+
+#[test]
+fn spacer_keeps_ordinary_gaps_on_authored_blank_lines() {
+    let node = tree(
+        json!({"type":"row","props":{"gap":1,"background":"red"},"children":["A\n\nB",{"type":"spacer"},"C\n\nD"]}),
+    );
+    let area = Rect::new(0, 0, 8, 3);
+    let mut buf = Buffer::empty(area);
+    node.render(area, &Theme::default(), &mut buf, /*plain_style*/ None);
+    assert_eq!(buf[(4, 1)].bg, ratatui::style::Color::Red);
+}
+
+#[test]
+fn badge_is_one_sanitized_inline_box() {
+    let badge = json!({"type":"badge","children":[" \u{1b}[31mok\u{1b}[0m \t \n"]});
+    let node = tree(json!({"type":"text","children":["A",badge,"B"]}));
+    insta::assert_snapshot!(painted_rows(&node,Size::new(6,3)).join("\n"), @"A ok B");
+    assert_eq!(painted_rows(&node, Size::new(4, 3)), ["A", " ok", "B"]);
+    let node = tree(
+        json!({"type":"code","children":["a",{"type":"badge","children":["  a\t \nb  "]},"c"]}),
+    );
+    assert_eq!(painted_rows(&node, Size::new(7, 1)), ["a a b c"]);
+    let node = tree(
+        json!({"type":"row","props":{"gap":0},"children":[{"type":"badge","children":[""]},"X"]}),
+    );
+    assert_eq!(painted_rows(&node, Size::new(3, 1)), ["  X"]);
+}
+
+#[test]
+fn badge_labels_count_toward_tree_limits() {
+    let badge = |children: Value| json!({"type":"badge","children":children});
+    for children in [
+        json!([]),
+        json!(["a", "b"]),
+        json!([null]),
+        json!(["a".repeat(MAX_TEXT_BYTES + 1)]),
+    ] {
+        assert!(parse(badge(children)).is_err());
+    }
+    let mut node = badge(json!(["ok"]));
+    for _ in 0..15 {
+        node = json!({"type":"bold","children":[node]});
+    }
+    assert!(parse(node.clone()).is_ok());
+    assert!(parse(json!({"type":"bold","children":[node]})).is_err());
+    let badges = vec![badge(json!(["ok"])); 128];
+    assert!(parse(json!({"type":"text","children":badges})).is_err());
+}
+
+#[test]
+fn semantic_badge_paints_its_gutters_and_keeps_the_surrounding_style() {
+    let palette = crate::terminal_probe::DefaultColors {
+        fg: (255, 255, 255),
+        bg: (0, 0, 0),
+    };
+    crate::terminal_palette::with_test_default_colors(palette, || {
+        let mut styles = Vec::new();
+        for color in ["secondary", "info", "success", "warning", "danger"] {
+            let node = tree(
+                json!({"type":"bold","children":["A",{"type":"badge","props":{"color":color},"children":["ok"]},"B"]}),
+            );
+            let area = Rect::new(0, 0, 6, 1);
+            let mut buf = Buffer::empty(area);
+            node.render(area, &Theme::default(), &mut buf, /*plain_style*/ None);
+            let style = buf[(2, 0)].style();
+            for x in 1..5 {
+                assert_eq!(buf[(x, 0)].style(), style);
+            }
+            assert_eq!(buf[(0, 0)].style(), buf[(5, 0)].style());
+            assert_ne!(style.fg, style.bg);
+            assert!(!styles.contains(&style));
+            styles.push(style);
+        }
+    });
+}
+
+#[test]
+fn linked_and_plain_badges_share_colors_but_keep_distinct_underlines() {
+    use ratatui::style::Modifier;
+
+    let badge = json!({"type":"badge","children":["ok"]});
+    let link = json!({"type":"link","props":{"href":"https://example.com"},"children":[badge]});
+    for (children, linked, plain) in [(json!([link, badge]), 1, 5), (json!([badge, link]), 5, 1)] {
+        let node = tree(json!({"type":"text","children":children}));
+        let area = Rect::new(0, 0, 8, 1);
+        let mut buf = Buffer::empty(area);
+        node.render(area, &Theme::default(), &mut buf, /*plain_style*/ None);
+        let linked = &buf[(linked, 0)];
+        let plain = &buf[(plain, 0)];
+        assert_eq!((linked.fg, linked.bg), (plain.fg, plain.bg));
+        assert!(linked.modifier.contains(Modifier::UNDERLINED));
+        assert!(!plain.modifier.contains(Modifier::UNDERLINED));
+    }
+}
+
+#[test]
+fn badge_uses_a_measurable_surface_for_its_fill() {
+    use ratatui::style::Color as TermColor;
+
+    let mut theme = Theme::default();
+    theme.settings.foreground = Some("#cdd6f4".parse().unwrap());
+    theme.settings.background = Some("#1e1e2e".parse().unwrap());
+    let colors = |theme: &Theme, background: Option<&str>, role: &str| {
+        let badge = json!({"type":"badge","props":{"color":role},"children":["X"]});
+        let node = match background {
+            Some(bg) => {
+                tree(json!({"type":"row","props":{"gap":0,"background":bg},"children":[badge]}))
+            }
+            None => tree(badge),
+        };
+        let area = Rect::new(0, 0, 3, 1);
+        let mut buf = Buffer::empty(area);
+        node.render(area, theme, &mut buf, /*plain_style*/ None);
+        let cell = &buf[(1, 0)];
+        (cell.fg, cell.bg)
+    };
+    let palette = crate::terminal_probe::DefaultColors {
+        fg: (255, 255, 255),
+        bg: (16, 16, 16),
+    };
+    for (palette, surface) in [(Some(palette), "#101010"), (None, "#1e1e2e")] {
+        crate::terminal_palette::with_test_default_colors(palette, || {
+            let secondary = |bg| colors(&theme, bg, "secondary");
+            assert_eq!(secondary(Some("white")), secondary(Some(surface)));
+            assert_eq!(secondary(None), secondary(Some(surface)));
+            assert_ne!(secondary(Some("white")), secondary(Some("#c0c0c0")));
+            assert_eq!(
+                colors(&theme, Some("#008000"), "success"),
+                (TermColor::Green, TermColor::Reset)
+            );
+        });
+    }
+    theme.settings.background = None;
+    crate::terminal_palette::with_test_default_colors(/*colors*/ None, || {
+        assert_eq!(
+            colors(&theme, Some("white"), "secondary"),
+            (TermColor::Reset, TermColor::Reset)
+        );
+    });
+}
+
+#[test]
+fn badge_text_and_fill_follow_theme_changes_on_the_painted_surface() {
+    use crate::terminal_palette::rgb_color;
+    use syntect::highlighting::StyleModifier;
+    use syntect::highlighting::ThemeItem;
+
+    let palette = crate::terminal_probe::DefaultColors {
+        fg: (0, 0, 0),
+        bg: (255, 255, 255),
+    };
+    crate::terminal_palette::with_test_default_colors(palette, || {
+        for (role, scope) in [
+            ("secondary", None),
+            ("info", Some("codex.accent")),
+            ("success", Some("markup.inserted.diff")),
+            ("warning", Some("markup.changed.diff")),
+            ("danger", Some("markup.deleted")),
+        ] {
+            let node = tree(
+                json!({"type":"row","props":{"gap":0,"background":"#101010"},"children":[
+                    {"type":"badge","props":{"color":role},"children":["X"]}
+                ]}),
+            );
+            let mut theme = Theme::default();
+            let name = format!("codex.{role}");
+            // Paint with a conventional scope, then override it on the same prepared tree.
+            for (scope, value) in [(scope, "#ffcc88"), (Some(name.as_str()), "#88ccff")] {
+                let color: syntect::highlighting::Color = value.parse().unwrap();
+                if let Some(scope) = scope {
+                    theme.scopes.push(ThemeItem {
+                        scope: scope.parse().unwrap(),
+                        style: StyleModifier {
+                            foreground: Some(color),
+                            ..Default::default()
+                        },
+                    });
+                } else {
+                    theme.settings.foreground = Some(color);
+                }
+                let area = Rect::new(0, 0, 3, 1);
+                let mut buf = Buffer::empty(area);
+                node.render(area, &theme, &mut buf, /*plain_style*/ None);
+                let rgb = (color.r, color.g, color.b);
+                let fill = crate::color::blend(rgb, (16, 16, 16), /*alpha*/ 0.15);
+                let cell = &buf[(1, 0)];
+                assert_eq!(
+                    (cell.fg, cell.bg),
+                    (rgb_color(rgb), rgb_color(fill)),
+                    "{role}"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn clamped_text_reserves_room_for_a_whole_trailing_badge() {
+    let node = tree(
+        json!({"type":"text","props":{"maxLines":1},"children":["A",{"type":"badge","children":["ok"]},"B"]}),
+    );
+    assert_eq!(painted_rows(&node, Size::new(5, 1)), ["A…"]);
+    assert_eq!(painted_rows(&node, Size::new(6, 1)), ["A ok B"]);
+    let node = tree(json!({"type":"badge","children":["A\rB"]}));
+    assert_eq!(painted_rows(&node, Size::new(8, 1)), [" A B"]);
+}
+
+#[test]
+fn clipped_badge_accounts_for_previous_row_children() {
+    let badge = json!({"type":"badge","children":["ok"]});
+    let row = json!({"type":"row","props":{"gap":0},"children":["A",badge]});
+    let centered = json!({"type":"row","props":{"gap":0,"justify":"center"},"children":[badge]});
+    for (line, width, expected) in [(row, 5, "A…"), (centered, 6, "  ok …")] {
+        let col = json!({"type":"col","props":{"gap":0},"children":[line,"B"]});
+        let footer = tree(col.clone());
+        let clamped = tree(json!({"type":"text","props":{"maxLines":1},"children":[col]}));
+        assert_eq!(painted_rows(&footer, Size::new(width, 1)), [expected]);
+        assert_eq!(painted_rows(&clamped, Size::new(width, 2)), [expected]);
+    }
+}
+
+#[test]
+fn clipping_only_the_badge_gutter_keeps_the_whole_label() {
+    let badge = json!({"type":"badge","children":["界"]});
+    assert_eq!(painted_rows(&tree(badge.clone()), Size::new(3, 1)), [" 界"]);
+    let row = tree(json!({"type":"row","props":{"gap":0},"children":["A",badge]}));
+    assert_eq!(painted_rows(&row, Size::new(4, 1)), ["A 界"]);
+    assert_eq!(painted_rows(&row, Size::new(3, 1)), ["A…"]);
 }

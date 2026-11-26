@@ -81,11 +81,8 @@ mod history_hydration_tests;
 mod permission_shortcuts_tests;
 mod plugin_catalog;
 mod rate_limits;
-#[path = "tests/realtime_handoff_e2e.rs"]
 mod realtime_handoff_e2e;
-#[path = "tests/realtime_requests.rs"]
 mod realtime_requests;
-#[path = "tests/realtime_start.rs"]
 mod realtime_start;
 #[path = "tests/reasoning_resume_tests.rs"]
 mod reasoning_resume_tests;
@@ -104,6 +101,8 @@ mod session_lifecycle_requests;
 mod side_chat_policy_tests;
 #[path = "tests/sidebar_chooser_hover_tests.rs"]
 mod sidebar_chooser_hover_tests;
+#[path = "tests/sidebar_file_path_tests.rs"]
+mod sidebar_file_path_tests;
 mod startup;
 #[path = "tests/startup_frame_tests.rs"]
 mod startup_frame_tests;
@@ -4864,7 +4863,6 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     tui.terminal = terminal_at(wide);
     keys!(toggle);
     let path = app.local_settings.user_config_path.clone();
-    let before = std::fs::read(&path).ok();
     let divider_at = |tui: &tui::Tui, y| {
         (0..wide.width)
             .find(|&x| tui.terminal.previous_buffer()[(x, y)].symbol() == "│")
@@ -4872,6 +4870,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     };
     let mut previews = Vec::new();
     for with_image in [false, true] {
+        let before = std::fs::read(&path).ok();
         if with_image {
             let image_path = app.config.codex_home.join("divider.png");
             image::RgbaImage::from_pixel(8, 16, image::Rgba([80, 30, 20, 255]))
@@ -4937,7 +4936,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
             .await?;
         } else {
             assert!(columns.iter().all(|x| *x == divider - 1));
-            // A fresh transcript press cancels a drag whose release was lost.
+            // A fresh press ends a drag whose release was lost, keeping its last width.
             for kind in [MouseEventKind::Down(left), MouseEventKind::Up(left)] {
                 boxed_future!(app.handle_tui_event(
                     &mut tui,
@@ -4946,7 +4945,20 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
                 ))
                 .await?;
             }
-            assert_eq!(std::fs::read(&path).ok(), before);
+            side_frame(&mut app, &mut tui, wide)?;
+            assert_eq!(divider_at(&tui, 0), divider - 1);
+            // The release position wins even if no intervening motion was delivered.
+            for (kind, x) in [
+                (MouseEventKind::Down(left), divider - 1),
+                (MouseEventKind::Up(left), divider),
+            ] {
+                boxed_future!(app.handle_tui_event(
+                    &mut tui,
+                    &mut app_server,
+                    mouse(kind, x, /*row*/ 4)
+                ))
+                .await?;
+            }
             side_frame(&mut app, &mut tui, wide)?;
             assert_eq!(divider_at(&tui, 0), divider);
         }
@@ -5166,12 +5178,12 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     // A command already running at handoff belongs before replies received while parked.
     let turn = "command-turn";
     let cwd = app.config.cwd.clone();
-    let command = |status| ThreadItemPayload::CommandExecution {
-        id: "cmd".into(),
-        command: "echo sidebar-check".into(),
+    let command = |id: &str, status| ThreadItemPayload::CommandExecution {
+        id: id.into(),
+        command: format!("echo {id}"),
         cwd: cwd.clone().into(),
         status,
-        source: Default::default(),
+        source: codex_app_server_protocol::CommandExecutionSource::UnifiedExecStartup,
         command_actions: Vec::new(),
         model_context: None,
         sandbox_type: None,
@@ -5183,15 +5195,20 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         duration_ms: None,
     };
     use codex_app_server_protocol::CommandExecutionStatus;
-    for event in [
-        turn_started_notification(parent, turn),
-        ServerNotification::ItemStarted(ItemStartedNotification::new(
+    app.enqueue_thread_notification(parent, turn_started_notification(parent, turn))
+        .await?;
+    // The second launch commits the first row before focus switches.
+    let commands = [
+        ("background", CommandExecutionStatus::Failed),
+        ("sidebar-check", CommandExecutionStatus::Completed),
+    ];
+    for (id, _) in &commands {
+        let event = ServerNotification::ItemStarted(ItemStartedNotification::new(
             parent.to_string(),
             turn.into(),
-            command(CommandExecutionStatus::InProgress),
+            command(id, CommandExecutionStatus::InProgress),
             /*started_at_ms*/ 0,
-        )),
-    ] {
+        ));
         app.enqueue_thread_notification(parent, event).await?;
     }
     keys!(prefix, side);
@@ -5203,23 +5220,31 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     )
     .await?;
     side_frame(&mut app, &mut tui, size)?;
-    app.enqueue_thread_notification(
-        parent,
-        ServerNotification::ItemCompleted(
-            codex_app_server_protocol::ItemCompletedNotification::new(
-                parent.to_string(),
-                turn.into(),
-                command(CommandExecutionStatus::Completed),
-                /*started_at_ms*/ None,
-                /*completed_at_ms*/ 0,
+    for (id, status) in commands {
+        app.enqueue_thread_notification(
+            parent,
+            ServerNotification::ItemCompleted(
+                codex_app_server_protocol::ItemCompletedNotification::new(
+                    parent.to_string(),
+                    turn.into(),
+                    command(id, status),
+                    /*started_at_ms*/ None,
+                    /*completed_at_ms*/ 0,
+                ),
             ),
-        ),
-    )
-    .await?;
+        )
+        .await?;
+    }
     let finished = side_frame(&mut app, &mut tui, size)?;
     let (_, after_command) = finished
         .split_once("Ran echo sidebar-check")
         .unwrap_or_else(|| panic!("{finished}"));
+    // Compact activity groups show the latest command. Inspect the earlier row in place.
+    let pane = &app.side_companions[&parent_thread_id];
+    insta::assert_snapshot!(
+        lines_to_single_string(&pane.cells[pane.parked_tail - 1].transcript_lines(/*width*/ 80)),
+        @"$ echo background\n✗ (1) • 0ms"
+    );
     assert!(after_command.contains("Command finished."), "{finished}");
     assert_eq!(
         finished.matches("echo sidebar-check").count(),
@@ -5650,13 +5675,13 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     let buffer = tui.terminal.previous_buffer();
     let style = |x| buffer[(x, chooser.y)].style();
     assert_eq!([close_x - 1, close_x + 1].map(style), [style(close_x); 2]);
-    for kind in [down, release] {
-        boxed_future!(app.handle_tui_event(
-            &mut tui,
-            &mut app_server,
-            mouse(kind, close_x + 1, chooser.y)
-        ))
-        .await?;
+    // Rex reports focus again between the press and release of a single click.
+    for event in [
+        mouse(down, close_x + 1, chooser.y),
+        TuiEvent::FocusGained,
+        mouse(release, close_x + 1, chooser.y),
+    ] {
+        boxed_future!(app.handle_tui_event(&mut tui, &mut app_server, event)).await?;
     }
     let frame = side_frame(&mut app, &mut tui, even)?;
     let dialog = frame
@@ -9138,6 +9163,7 @@ async fn make_test_app() -> Box<App> {
         provider_writes: HashMap::new(),
         realtime_call_client: Arc::default(),
         feature_write_lock: Arc::default(),
+        voice_settings_pending: false,
         config_notification_test_generation: 0,
         config_notification_test_pending: None,
         model_catalog: chat_widget.model_catalog(),
@@ -9202,7 +9228,7 @@ async fn make_test_app() -> Box<App> {
             platform_default: true,
             ssh: false,
             wsl: false,
-            vscode: crate::tui::VscodeDetection::Other,
+            owner: crate::terminal_capabilities::PasteOwner::Application,
         },
         daemon_cli_executable: None,
         pending_update_action: None,
@@ -9287,6 +9313,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             provider_writes: HashMap::new(),
             realtime_call_client: Arc::default(),
             feature_write_lock: Arc::default(),
+            voice_settings_pending: false,
             config_notification_test_generation: 0,
             config_notification_test_pending: None,
             model_catalog: chat_widget.model_catalog(),
@@ -9351,7 +9378,7 @@ pub(super) async fn make_test_app_with_channels() -> (
                 platform_default: true,
                 ssh: false,
                 wsl: false,
-                vscode: crate::tui::VscodeDetection::Other,
+                owner: crate::terminal_capabilities::PasteOwner::Application,
             },
             daemon_cli_executable: None,
             pending_update_action: None,
@@ -13232,6 +13259,7 @@ async fn clear_only_ui_reset_preserves_chat_session_state() {
         crate::keymap::RuntimeKeymap::defaults().pager,
         /*copy_on_select*/ false,
         /*mouse_scroll_speed*/ 1.0,
+        /*bidi_layout*/ false,
     ));
     app.deferred_history_lines = vec![Line::from("stale buffered line").into()];
     app.has_emitted_history_lines = true;

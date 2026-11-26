@@ -105,6 +105,33 @@ use codex_rollout::state_db::StateDbHandle;
 
 static LIVE_THREADS: Gauge = Gauge::new("core.threads.live");
 
+/// The live settings needed to display a thread list or search result.
+#[derive(Debug, PartialEq)]
+pub struct ThreadViewSettings {
+    pub model: String,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub environments: Vec<ThreadEnvironmentView>,
+    pub session_source: SessionSource,
+}
+
+/// The selected workspace for display, without the environment's execution config.
+#[derive(Debug, PartialEq)]
+pub struct ThreadEnvironmentView {
+    pub environment_id: String,
+    pub cwd: PathUri,
+    pub workspace_roots: Vec<PathUri>,
+}
+
+impl From<&TurnEnvironmentSelection> for ThreadEnvironmentView {
+    fn from(selection: &TurnEnvironmentSelection) -> Self {
+        Self {
+            environment_id: selection.environment_id.clone(),
+            cwd: selection.cwd.clone(),
+            workspace_roots: selection.workspace_roots.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ThreadConfigSnapshot {
     /// Trusted host country inherited by future turns.
@@ -660,6 +687,48 @@ impl CodexThread {
                 unreachable!("start-if-idle submission must start or decline")
             }
         }
+    }
+
+    /// Starts an automatic goal turn with its live, account-bound preference.
+    pub async fn start_goal_turn_if_idle(
+        &self,
+        request: TurnInputRequest,
+        snapshot: Option<crate::GoalDaybreakSnapshot>,
+    ) -> CodexResult<StartIfIdleSubmission> {
+        let Some(snapshot) = snapshot.filter(|_| self.daybreak_program_propagation_enrolled())
+        else {
+            return self.start_turn_if_idle(request).await;
+        };
+        let mut data = codex_extension_api::ExtensionDataInit::new();
+        data.insert(crate::agent::helper_daybreak::goal::GoalDaybreakAdmission(
+            snapshot,
+        ));
+        self.start_turn_if_idle(WithTurnExtensionData::new(request, data))
+            .await
+    }
+
+    /// Captures the current saved preference for a newly accepted external goal.
+    pub async fn capture_saved_goal_daybreak(&self) -> Option<crate::GoalDaybreakSnapshot> {
+        if !self.daybreak_program_propagation_enrolled() {
+            return None;
+        }
+        crate::GoalDaybreakSnapshot::capture_saved(&self.session).await
+    }
+
+    /// Captures the exact turn's saved preference, never a later foreground turn's.
+    pub async fn capture_originating_saved_goal_daybreak(
+        &self,
+        expected_turn_id: &str,
+    ) -> Option<crate::GoalDaybreakSnapshot> {
+        if !self.daybreak_program_propagation_enrolled() {
+            return None;
+        }
+        let active = self.session.active_turn.lock().await;
+        let task = active.as_ref()?.task.as_ref()?;
+        if task.turn_context.sub_id != expected_turn_id || task.cancellation_token.is_cancelled() {
+            return None;
+        }
+        crate::GoalDaybreakSnapshot::from_turn(&task.turn_context)
     }
 
     /// Starts a new internal continuation turn when idle, including in Plan mode.
@@ -1456,6 +1525,11 @@ impl CodexThread {
     /// when the tier must be validated against the selected model.
     pub async fn configured_snapshot(&self) -> ThreadConfigSnapshot {
         self.session.configured_snapshot().await
+    }
+
+    /// Reads display settings without materializing an execution permission profile.
+    pub async fn thread_view_settings(&self) -> ThreadViewSettings {
+        self.session.thread_view_settings().await
     }
 
     pub async fn config_snapshot(&self) -> ThreadConfigSnapshot {

@@ -1008,6 +1008,9 @@ async fn live_center_search_row_appears_only_while_editing() {
             "live_center_search_active",
             screen(&view, area.width, area.height)
         );
+        view.handle_key_event(KeyCode::Char('g').into());
+        assert!(screen(&view, area.width, area.height).contains("Search › findg"));
+        view.handle_key_event(KeyCode::Backspace.into());
         view.handle_key_event(KeyCode::Tab.into());
         let created = screen(&view, area.width, area.height);
         assert!(created.contains("Status  Created"), "{created}");
@@ -1220,12 +1223,11 @@ async fn workspace_navigation_preserves_the_draft_and_reading_position() -> Resu
     ] {
         tui.terminal.resize(size)?;
         if center_focused && !app.workspace_center_owns_input() {
-            crate::boxed_future!(app.handle_event(
-                &mut tui,
-                &mut server,
-                AppEvent::OpenAgentsOverview
-            ))
-            .await?;
+            let prefix = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+            for key in [prefix, KeyCode::Char('a').into()] {
+                let event = TuiEvent::Key(key);
+                crate::boxed_future!(app.handle_tui_event(&mut tui, &mut server, event)).await?;
+            }
         } else if !center_focused && app.workspace_center_owns_input() {
             let click = crossterm::event::MouseEvent {
                 kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -1272,6 +1274,10 @@ async fn workspace_navigation_preserves_the_draft_and_reading_position() -> Resu
                     .expect("visible task, filter and draft");
                 buffer[(prefix.chars().count() as u16, row as u16)].style()
             }));
+        }
+        if label == "Wide conversation" {
+            let center_footer = screen.lines().last().unwrap().split_once('│').unwrap().0;
+            insta::assert_snapshot!(center_footer.trim(), @"⌃x a focus Command Center");
         }
         if matches!(label, "Wide Command Center" | "Narrow Command Center") {
             let screen = normalize_agent_center_snapshot(screen);
@@ -1361,12 +1367,53 @@ async fn workspace_navigation_preserves_the_draft_and_reading_position() -> Resu
     use crossterm::event::MouseEventKind::Down;
     use crossterm::event::MouseEventKind::Drag;
     use crossterm::event::MouseEventKind::Moved;
+    use crossterm::event::MouseEventKind::Up;
     let mut pointers = Vec::new();
-    for column in [divider.x, center.right(), center.right() + 1] {
+    for column in [
+        divider.x,
+        center.right(),
+        center.right() + 1,
+        center.right() + 2,
+    ] {
         crate::boxed_future!(app.handle_tui_event(&mut tui, &mut server, mouse(Moved, column)))
             .await?;
         pointers.push(tui.link_hover.shape);
     }
+    // Grab the padding cell. The divider should keep its one-column offset.
+    let gutter = center.right() + 1;
+    for event in [
+        mouse(Down(Left), gutter),
+        mouse(Drag(Left), gutter + 5),
+        TuiEvent::FocusGained,
+    ] {
+        crate::boxed_future!(app.handle_tui_event(&mut tui, &mut server, event)).await?;
+    }
+    crate::app::test_support::side_frame(&mut app, &mut tui, three_panes)?;
+    let preview = app.conversation_frame.command_center.unwrap().right();
+    assert_eq!(preview, center.right() + 5);
+    let accent = tui.terminal.previous_buffer()[(preview, 4)]
+        .style()
+        .add_modifier
+        .contains(ratatui::style::Modifier::BOLD);
+    crate::boxed_future!(app.handle_tui_event(&mut tui, &mut server, mouse(Up(Left), gutter + 8)))
+        .await?;
+    crate::app::test_support::side_frame(&mut app, &mut tui, three_panes)?;
+    let released = app.conversation_frame.command_center.unwrap().right();
+    assert_eq!(released, center.right() + 8);
+    // Focus loss can replace a release. Continue to route the focus event.
+    for event in [
+        mouse(Down(Left), released),
+        mouse(Drag(Left), center.right()),
+        TuiEvent::FocusLost,
+        TuiEvent::FocusGained,
+    ] {
+        crate::boxed_future!(app.handle_tui_event(&mut tui, &mut server, event)).await?;
+    }
+    crate::app::test_support::side_frame(&mut app, &mut tui, three_panes)?;
+    let interrupted = app.conversation_frame.command_center.unwrap().right();
+    assert_eq!(interrupted, center.right());
+    insta::assert_snapshot!(format!("preview {preview}, highlighted {accent}, release {released}, focus loss {interrupted}"), @"preview 41, highlighted true, release 44, focus loss 36");
+    // Reserve the simulated three-pane size for the sidebar press, after the preview draws.
     tui.screen_size_for_event(&TuiEvent::Resize(three_panes))?;
     crate::boxed_future!(app.handle_tui_event(&mut tui, &mut server, mouse(Down(Left), divider.x)))
         .await?;
@@ -1420,7 +1467,7 @@ async fn workspace_navigation_preserves_the_draft_and_reading_position() -> Resu
         crate::boxed_future!(app.handle_tui_event(&mut tui, &mut server, event)).await?;
         pointers.push(tui.link_hover.shape);
     }
-    insta::assert_snapshot!(format!("{pointers:?}"), @"[Resize, Resize, Default, Resize, Resize]");
+    insta::assert_snapshot!(format!("{pointers:?}"), @"[Resize, Resize, Resize, Default, Resize, Resize]");
     let release = mouse(crossterm::event::MouseEventKind::Up(Left), resized);
     crate::boxed_future!(app.handle_tui_event(&mut tui, &mut server, release)).await?;
     crate::app::test_support::side_frame(&mut app, &mut tui, three_panes)?;
@@ -1524,10 +1571,20 @@ async fn search_sort_tab_respects_configured_list_bindings_and_rename() {
         "Task",
         ThreadStatus::Idle,
     );
-    let config: TuiKeymap = toml::from_str("[list]\nmove_down = 'tab'").unwrap();
+    let config: TuiKeymap = toml::from_str(
+        "[list]\nmove_down = 'tab'\naccept = 'x'\n[agents]\ntoggle_grouping = 'ctrl-a'",
+    )
+    .unwrap();
     app.keymap = RuntimeKeymap::from_config(&config).unwrap();
     let mut view = app.agents_overview_view(vec![thread], Some(id));
     view.handle_key_event(KeyCode::Char('/').into());
+    let search = screen(&view, /*width*/ 88, /*height*/ 16);
+    let group_key = crate::key_hint::ctrl(KeyCode::Char('a')).display_label();
+    assert!(
+        search.contains(&format!("Group: Project  {group_key}")),
+        "{search}"
+    );
+    assert!(!search.contains("x open"), "{search}");
     view.handle_key_event(KeyCode::Tab.into());
     assert_eq!(
         app.agents_overview.view_state.lock().unwrap().search_sort,
@@ -1536,6 +1593,17 @@ async fn search_sort_tab_respects_configured_list_bindings_and_rename() {
     assert!(!screen(&view, /*width*/ 88, /*height*/ 16).contains("Tab sort"));
     view.handle_key_event(KeyCode::Esc.into());
     view.handle_key_event(KeyCode::Char('r').into());
+    let rename = screen(&view, /*width*/ 88, /*height*/ 16);
+    assert!(
+        !rename.contains(&format!("Group: Project  {group_key}")),
+        "{rename}"
+    );
+    assert!(!rename.contains("x rename"), "{rename}");
+    view.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert_eq!(
+        app.agents_overview.view_state.lock().unwrap().grouping,
+        AgentsOverviewGrouping::Project
+    );
     view.handle_key_event(KeyCode::Tab.into());
     assert_eq!(
         app.agents_overview.view_state.lock().unwrap().search_sort,
