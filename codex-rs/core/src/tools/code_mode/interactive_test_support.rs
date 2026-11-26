@@ -6,6 +6,7 @@ use codex_hooks::HookMcpExecutor;
 use codex_hooks::HookMcpOutput;
 use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
+use codex_protocol::mcp::CallToolResult;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::Notify;
@@ -33,8 +34,12 @@ impl HookMcpExecutor for ReviewHook {
             }
             // No decision: continue through the real reviewer/user path.
             Ok(HookMcpOutput {
-                text: String::new(),
-                structured_content: None,
+                result: CallToolResult {
+                    content: Vec::new(),
+                    structured_content: None,
+                    is_error: None,
+                    meta: None,
+                },
                 source_tool_namespace: None,
             })
         })
