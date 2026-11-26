@@ -876,7 +876,7 @@ impl NetworkApprovalService {
             Arc::clone(&turn_context),
             &settings,
             review_environments,
-            reviewed_action_root_turn_id,
+            reviewed_action_root_turn_id.clone(),
         );
         if !allows_network_approval_flow(review_context.approval_policy) {
             if let Some(owner_call) = owner_call.as_ref() {
@@ -963,6 +963,7 @@ impl NetworkApprovalService {
                         Arc::clone(&turn),
                         &settings,
                         ctx.review_context.environments(),
+                        reviewed_action_root_turn_id.clone(),
                     );
                     ctx.strict_auto_review = strict;
                     let mut action = action.clone();
