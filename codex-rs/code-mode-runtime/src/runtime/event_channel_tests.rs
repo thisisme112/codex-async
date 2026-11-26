@@ -1,5 +1,8 @@
 //! Raw emissions and control events share one bounded FIFO before collection.
 
+use std::future::poll_fn;
+use std::task::Poll;
+
 use pretty_assertions::assert_eq;
 use tokio::sync::oneshot;
 
@@ -29,7 +32,8 @@ async fn a_blocked_send_uses_the_released_slot_before_the_receiver_takes_the_ite
         let mut slot = permits.next().unwrap();
         loop {
             let mut next = std::pin::pin!(raw.reserve());
-            assert!(futures::poll!(next.as_mut()).is_pending());
+            let state = poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await;
+            assert!(state.is_pending());
             drop(slot);
             tokio::select! {
                 result = &mut done_rx => break result.unwrap(),
@@ -98,7 +102,8 @@ async fn full_channel_blocks_the_producer_and_receiver_drop_releases_it() {
         // Tokio's blocking_send runs this same send future. Polling it first
         // proves the full channel has registered this producer as a waiter.
         let mut send = std::pin::pin!(tx.send(RuntimeEvent::YieldRequested));
-        assert!(futures::poll!(send.as_mut()).is_pending());
+        let state = poll_fn(|cx| Poll::Ready(send.as_mut().poll(cx))).await;
+        assert!(state.is_pending());
         ready_tx.send(()).unwrap();
         send.await
     });

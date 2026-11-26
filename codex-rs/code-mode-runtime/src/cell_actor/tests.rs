@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::future::poll_fn;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc as std_mpsc;
+use std::task::Poll;
 use std::time::Duration;
 
 use codex_code_mode_protocol::CodeModeOutputTruncation;
@@ -201,7 +203,8 @@ async fn termination_drains_a_send_already_blocked_by_backpressure() {
         let mut send = std::pin::pin!(tx.send(RuntimeEvent::ContentItem(OutputItem::InputText {
             text: "blocked".to_string(),
         })));
-        assert!(futures::poll!(send.as_mut()).is_pending());
+        let state = poll_fn(|cx| Poll::Ready(send.as_mut().poll(cx))).await;
+        assert!(state.is_pending());
         // terminate() synchronously cancels. No event was consumed between the
         // Pending poll and cancellation; run_cell must drain while terminating.
         let termination = harness.handle.terminate();
