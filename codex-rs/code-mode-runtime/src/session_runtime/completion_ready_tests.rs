@@ -13,7 +13,7 @@ impl SessionRuntimeDelegate for Probe {
         &self,
         _: NestedToolCall,
         _: CancellationToken,
-    ) -> Result<JsonValue, String> {
+    ) -> Result<CodeModeToolResult, String> {
         unreachable!()
     }
 

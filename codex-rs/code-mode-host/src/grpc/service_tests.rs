@@ -363,6 +363,7 @@ async fn filtered_subscriptions_match_default_namespace_aliases() {
             outcome: Some(proto::complete_tool_call_request::Outcome::Succeeded(
                 proto::ToolCallSucceeded {
                     output_json: br#""done""#.to_vec(),
+                    ..Default::default()
                 },
             )),
         }))
@@ -436,6 +437,7 @@ async fn filtered_subscriptions_receive_ordered_calls_and_unary_completions() {
             outcome: Some(proto::complete_tool_call_request::Outcome::Succeeded(
                 proto::ToolCallSucceeded {
                     output_json: format!(r#""result-{sequence}""#).into_bytes(),
+                    ..Default::default()
                 },
             )),
         }))

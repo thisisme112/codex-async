@@ -121,7 +121,7 @@ impl App {
                     },
                     |document| {
                         document.owns_interaction_key(key_event)
-                            && (!document.allows_tab_shortcut(key_event)
+                            && (!document.allows_tab_shortcut(key_event, &self.keymap)
                                 || crate::transcript_view::JumpTarget::from_key(key_event)
                                     .is_none())
                     },
@@ -260,7 +260,7 @@ impl App {
             && self.sidebar_chooser_available()
     }
 
-    fn key_chord_contexts(&self, tui: &tui::Tui) -> crate::keymap::KeymapContextSet {
+    pub(super) fn key_chord_contexts(&self, tui: &tui::Tui) -> crate::keymap::KeymapContextSet {
         let contexts = self.active_keymap_contexts();
         if !self.conversation_focus_available(tui) {
             return contexts;
@@ -347,7 +347,9 @@ impl App {
         if self.chat_widget.no_modal_or_popup_active()
             && let Some(doc) = self.focused_document()
         {
-            return if doc.is_search_editing() {
+            return if doc.path_actions.scroll.is_some() {
+                KeymapContextSet::new(KeymapContext::List)
+            } else if doc.is_search_editing() {
                 KeymapContextSet::new(KeymapContext::Editor)
             } else {
                 KeymapContextSet::transcript()
@@ -403,13 +405,18 @@ impl App {
             && self.keymap.chat.toggle_voice.is_pressed(key)
     }
 
-    pub(super) fn handle_voice_toggle_key(&mut self, tui: &mut tui::Tui, key: KeyEvent) -> bool {
+    pub(super) async fn handle_voice_toggle_key(
+        &mut self,
+        tui: &mut tui::Tui,
+        key: KeyEvent,
+    ) -> bool {
         if !self.voice_toggle_pressed(key) {
             return false;
         }
         self.cancel_transcript_browsing(tui);
         if !self.chat_widget.handle_startup_submission_key(key) {
-            self.control_voice(crate::app_event::VoiceControl::Toggle);
+            self.control_voice(crate::app_event::VoiceControl::Toggle)
+                .await;
         }
         true
     }
@@ -859,6 +866,13 @@ impl App {
         };
     }
 
+    pub(super) fn is_side_toggle(&self, key: KeyEvent) -> bool {
+        let bindings = &self.keymap.app.toggle_side_conversation;
+        bindings.is_pressed(key)
+            || bindings.contains(&crate::key_hint::ctrl(KeyCode::Char('/')))
+                && crate::key_hint::ctrl(KeyCode::Char('7')).is_press(key)
+    }
+
     pub(crate) async fn handle_shared_app_keymap_action(
         &mut self,
         tui: &mut tui::Tui,
@@ -870,11 +884,7 @@ impl App {
             self.chat_widget.open_warnings(&self.transcript_cells);
             return true;
         }
-        let side_toggle_bindings = &self.keymap.app.toggle_side_conversation;
-        if side_toggle_bindings.is_pressed(key_event)
-            || side_toggle_bindings.contains(&crate::key_hint::ctrl(KeyCode::Char('/')))
-                && crate::key_hint::ctrl(KeyCode::Char('7')).is_press(key_event)
-        {
+        if self.is_side_toggle(key_event) {
             if let Err(err) = self.toggle_side_conversation(tui, app_server).await {
                 self.chat_widget
                     .add_error_message(format!("Failed to switch side conversation: {err}"));

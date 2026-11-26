@@ -1,11 +1,14 @@
 use std::collections::HashMap;
+use std::future::poll_fn;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc as std_mpsc;
+use std::task::Poll;
 use std::time::Duration;
 
 use codex_code_mode_protocol::CodeModeOutputTruncation;
+use codex_code_mode_protocol::CodeModeToolResult;
 use codex_code_mode_protocol::host::BOUNDED_OUTPUT_MAX_IMAGE_BYTES;
 use pretty_assertions::assert_eq;
 use serde_json::Value as JsonValue;
@@ -33,7 +36,7 @@ impl CellHost for TestHost {
         &self,
         _invocation: CellToolCall,
         _cancellation_token: CancellationToken,
-    ) -> Result<JsonValue, String> {
+    ) -> Result<CodeModeToolResult, String> {
         Err("unexpected tool call".to_string())
     }
 
@@ -67,7 +70,7 @@ impl CellHost for RecordingHost {
         &self,
         _invocation: CellToolCall,
         _cancellation_token: CancellationToken,
-    ) -> Result<JsonValue, String> {
+    ) -> Result<CodeModeToolResult, String> {
         Err("unexpected tool call".to_string())
     }
 
@@ -200,7 +203,8 @@ async fn termination_drains_a_send_already_blocked_by_backpressure() {
         let mut send = std::pin::pin!(tx.send(RuntimeEvent::ContentItem(OutputItem::InputText {
             text: "blocked".to_string(),
         })));
-        assert!(futures::poll!(send.as_mut()).is_pending());
+        let state = poll_fn(|cx| Poll::Ready(send.as_mut().poll(cx))).await;
+        assert!(state.is_pending());
         // terminate() synchronously cancels. No event was consumed between the
         // Pending poll and cancellation; run_cell must drain while terminating.
         let termination = harness.handle.terminate();

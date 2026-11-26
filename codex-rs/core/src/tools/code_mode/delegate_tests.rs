@@ -8,6 +8,7 @@ use codex_code_mode::CellId;
 use codex_code_mode::CodeModeNestedToolCall;
 use codex_code_mode::CodeModeSessionDelegate;
 use codex_code_mode::CodeModeToolKind;
+use codex_code_mode::CodeModeToolResult;
 use codex_tools::ToolName;
 use pretty_assertions::assert_eq;
 use tokio_util::sync::CancellationToken;
@@ -175,7 +176,10 @@ async fn detached_code_mode_callback_keeps_thread_id_on_dispatch_span() -> anyho
     })
     .await?
     .map_err(anyhow::Error::msg)?;
-    assert_eq!(result, serde_json::json!("audit-probe-ok"));
+    assert_eq!(
+        result,
+        CodeModeToolResult::from(serde_json::json!("audit-probe-ok"))
+    );
     let records = records.lock().unwrap();
     let [(fields, has_turn_ancestor)] = records.as_slice() else {
         panic!("expected one nested dispatch span, got {records:?}");
@@ -305,7 +309,10 @@ async fn replacement_hands_off_gated_call_and_idle_notify_does_not_block_tools()
     drop(old); // Receiver holds the message, but its Cell gate is still closed.
     let _replacement = broker.start_turn_worker(session.clone(), step, tracker);
     broker.mark_cell_ready_for_dispatch(&cell_id, /*originating_call*/ None);
-    assert_eq!(callback.await, Ok(serde_json::json!("audit-probe-ok")));
+    assert_eq!(
+        callback.await,
+        Ok(CodeModeToolResult::from(serde_json::json!("audit-probe-ok")))
+    );
 
     let mut notification = delegate.notify(
         "notice".to_string(),
@@ -319,7 +326,7 @@ async fn replacement_hands_off_gated_call_and_idle_notify_does_not_block_tools()
         delegate
             .invoke_tool(invocation, CancellationToken::new())
             .await,
-        Ok(serde_json::json!("audit-probe-ok"))
+        Ok(CodeModeToolResult::from(serde_json::json!("audit-probe-ok")))
     );
     assert!(futures::poll!(notification.as_mut()).is_pending());
     *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());

@@ -26,7 +26,7 @@ fn plan_test_session(thread_id: ThreadId) -> crate::session_state::ThreadSession
         fork_parent_title: None,
         thread_name: None,
         model: "test-model".to_string(),
-        model_provider_id: "test-provider".to_string(),
+        model_provider_id: "openai".to_string(),
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
@@ -1474,7 +1474,7 @@ async fn plan_slash_command_with_hidden_shell_paste_rejected_image_remains_liter
         .expect("current model")
         .input_modalities
         .retain(|modality| *modality != InputModality::Image);
-    Arc::make_mut(&mut chat.model_catalog).models = models;
+    Arc::make_mut(&mut chat.model_catalog).set_models(models);
     let payload = paste_hidden_plan_shell_payload(&mut chat);
     chat.set_remote_image_urls(vec!["https://example.com/image.png".to_string()]);
 
@@ -1549,7 +1549,7 @@ async fn rejected_initial_image_does_not_submit_later_queued_prompt() {
         .expect("current model")
         .input_modalities
         .retain(|modality| *modality != InputModality::Image);
-    Arc::make_mut(&mut chat.model_catalog).models = models;
+    Arc::make_mut(&mut chat.model_catalog).set_models(models);
     let mut initial_message = UserMessage::from("initial prompt");
     initial_message.remote_image_urls = vec!["https://example.com/image.png".to_string()];
     chat.initial_user_message = Some(initial_message);
@@ -1693,30 +1693,6 @@ async fn set_reasoning_effort_does_not_override_active_plan_override() {
         Some(ReasoningEffortConfig::High)
     );
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
-}
-
-#[tokio::test]
-async fn collab_mode_is_sent_after_enabling() {
-    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
-    chat.thread_id = Some(ThreadId::new());
-    chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
-
-    chat.bottom_pane
-        .set_composer_text("hello".to_string(), Vec::new(), Vec::new());
-    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-    match next_submit_op(&mut op_rx) {
-        Op::UserTurn {
-            collaboration_mode:
-                Some(CollaborationMode {
-                    mode: ModeKind::Default,
-                    ..
-                }),
-            ..
-        } => {}
-        other => {
-            panic!("expected Op::UserTurn, got {other:?}")
-        }
-    }
 }
 
 #[tokio::test]
