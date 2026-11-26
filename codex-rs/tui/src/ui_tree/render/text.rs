@@ -6,6 +6,7 @@ use super::RenderTheme;
 use super::Visit;
 use super::sanitize_leaf;
 use crate::line_truncation::span_width;
+use crate::ui_tree::BadgeColor;
 use crate::ui_tree::theme::Color;
 use ratatui::buffer::CellWidth;
 use ratatui::style::Style;
@@ -25,8 +26,10 @@ pub(super) struct Paint {
     pub(super) foreground: Option<Color>,
     pub(super) background: Option<Color>,
     pub(super) href: Option<Arc<String>>,
+    pub(super) badge: Option<BadgeColor>,
     pub(super) inline_code: bool,
     pub(super) preserve_whitespace: bool,
+    pub(super) break_long_words: bool,
 }
 
 impl Paint {
@@ -35,10 +38,15 @@ impl Paint {
         style.fg = self.foreground.map(|c| theme.resolve(c));
         style.bg = self.background.map(|c| theme.resolve(c));
         if self.inline_code {
-            theme.inline_code_style(style)
-        } else {
-            style
+            style = theme.inline_code_style(style);
         }
+        if let Some(color) = self.badge {
+            style = style.patch(theme.badge_style(color, style.bg));
+            if self.href.is_some() {
+                style = style.add_modifier(ratatui::style::Modifier::UNDERLINED);
+            }
+        }
+        style
     }
 }
 
@@ -116,6 +124,7 @@ pub(super) struct PreparedText {
 pub(super) struct InlineText {
     after_span: bool,
     text: PreparedText,
+    completed: Vec<Chunk>,
     line: Vec<Run>,
     space: Option<Paint>,
 }
@@ -139,6 +148,44 @@ impl InlineText {
         self.push_sanitized(sanitize_leaf(raw), paint);
     }
 
+    pub(super) fn push_badge(&mut self, label: String, color: BadgeColor, mut paint: Paint) {
+        let label = if label.contains('\r') {
+            label.replace('\r', " ")
+        } else {
+            label
+        };
+        let label = sanitize_leaf(label);
+        let label = label.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
+        let text = RunText::new(format!(" {label} "));
+        paint.badge = Some(color);
+        // An inline-flex badge forms one unbreakable box with a break on either side.
+        self.completed
+            .extend(chunks(std::mem::take(&mut self.line)));
+        if let Some(last) = self.completed.last_mut() {
+            last.trailing_space = self.space.take();
+        }
+        self.completed.push(Chunk {
+            width_cells: span_width(&Span::raw(&*text)),
+            runs: vec![Run {
+                break_before: false,
+                text,
+                paint,
+            }],
+            ..Chunk::default()
+        });
+    }
+
+    fn finish_line(&mut self) {
+        let mut line = std::mem::take(&mut self.completed);
+        let rest = chunks(std::mem::take(&mut self.line));
+        if line.is_empty() {
+            line = rest;
+        } else {
+            line.extend(rest);
+        }
+        self.text.lines.push(line);
+    }
+
     fn push_sanitized(&mut self, raw: String, paint: Paint) {
         let after_span = !raw.is_empty() && std::mem::take(&mut self.after_span);
         let break_before = after_span && paint.preserve_whitespace && raw.starts_with([' ', '\t']);
@@ -154,6 +201,11 @@ impl InlineText {
             .chain(std::iter::once((text.len(), "")))
         {
             if start < end {
+                if self.line.is_empty()
+                    && let Some(last) = self.completed.last_mut()
+                {
+                    last.trailing_space = self.space.take();
+                }
                 if let Some(paint) = self.space.take() {
                     self.line.push(Run {
                         break_before: false,
@@ -168,9 +220,9 @@ impl InlineText {
                 });
             }
             if ch == "\n" {
-                self.text.lines.push(chunks(std::mem::take(&mut self.line)));
+                self.finish_line();
                 self.space = None;
-            } else if !ch.is_empty() && !self.line.is_empty() {
+            } else if !ch.is_empty() && (!self.line.is_empty() || !self.completed.is_empty()) {
                 self.space.get_or_insert_with(|| paint.clone());
             }
             start = end + ch.len();
@@ -179,8 +231,8 @@ impl InlineText {
 
     pub(super) fn finish(mut self) -> PreparedText {
         self.text.has_authored_break = !self.text.lines.is_empty();
-        if !self.line.is_empty() {
-            self.text.lines.push(chunks(self.line));
+        if !self.line.is_empty() || !self.completed.is_empty() {
+            self.finish_line();
         }
         self.text
     }
@@ -327,19 +379,20 @@ fn chunks(runs: Vec<Run>) -> Vec<Chunk> {
     let mut offset = 0;
     let mut previous: Option<char> = None;
     let mut word_hyphen = false;
-    let mut previous_preserved = false;
+    let mut previous_break_words = false;
     for run in runs {
+        let break_words = run.paint.preserve_whitespace || run.paint.break_long_words;
         let mut start = 0;
         for (i, grapheme) in run.text.grapheme_indices(true) {
             let position = offset + i;
             while breaks.next_if(|b| *b < position).is_some() {}
-            // Ordinary text uses textwrap’s word hyphens. In preserved text, Chromium also breaks
+            // Ordinary text uses textwrap’s word hyphens. In break-word text, Chromium also breaks
             // at flag hyphens and keeps paths and shell operators within a word.
             let first = grapheme.as_bytes()[0];
             let can_break = match previous {
                 _ if i == 0 && run.break_before => true,
                 Some(prev)
-                    if (previous_preserved || run.paint.preserve_whitespace)
+                    if (previous_break_words || break_words)
                         && prev.is_ascii_graphic()
                         && first.is_ascii_graphic() =>
                 {
@@ -348,7 +401,7 @@ fn chunks(runs: Vec<Run>) -> Vec<Chunk> {
                 Some('-') => word_hyphen && grapheme.starts_with(char::is_alphanumeric),
                 // A collapsed separator can wrap before the first preserved space.
                 Some(' ' | '\t')
-                    if previous_preserved
+                    if previous_break_words
                         || (run.paint.preserve_whitespace && matches!(first, b' ' | b'\t')) =>
                 {
                     true
@@ -356,16 +409,16 @@ fn chunks(runs: Vec<Run>) -> Vec<Chunk> {
                 Some('\u{ad}') => false,
                 _ => breaks.peek() == Some(&position),
             };
-            // Preserve normal word breaks first. An overlong preserved word can also
+            // Preserve normal word breaks first. An overlong preserved or clamped word can also
             // wrap at a grapheme boundary, as it does under overflow-wrap: break-word.
-            let preserved_boundary = position > 0
-                && (run.paint.preserve_whitespace
-                    || (previous_preserved && !matches!(run.text, RunText::Space)));
-            if can_break || preserved_boundary {
+            let emergency_boundary = position > 0
+                && (break_words || previous_break_words)
+                && !matches!(run.text, RunText::Space);
+            if can_break || emergency_boundary {
                 // A break after a literal space or tab can precede a collapsed
                 // prose separator. Keep the separator on this chunk, so only
                 // the prose space disappears when the line wraps.
-                let end = if previous_preserved && matches!(run.text, RunText::Space) {
+                let end = if previous_break_words && matches!(run.text, RunText::Space) {
                     run.text.len()
                 } else {
                     i
@@ -385,13 +438,13 @@ fn chunks(runs: Vec<Run>) -> Vec<Chunk> {
                 }
                 chunk.break_before = if !can_break {
                     BreakBefore::Emergency
-                } else if previous_preserved && word_hyphen && first.is_ascii_digit() {
+                } else if previous_break_words && word_hyphen && first.is_ascii_digit() {
                     BreakBefore::AfterHyphenBeforeDigit
                 } else {
                     BreakBefore::Preferred
                 };
             }
-            previous_preserved = run.paint.preserve_whitespace;
+            previous_break_words = break_words;
             for ch in grapheme.chars() {
                 word_hyphen = ch == '-' && previous.is_some_and(char::is_alphanumeric);
                 previous = Some(ch);
@@ -409,6 +462,12 @@ fn chunks(runs: Vec<Run>) -> Vec<Chunk> {
 const TAB_SPACES: &str = "        ";
 
 impl Chunk {
+    fn is_badge(&self) -> bool {
+        self.runs
+            .first()
+            .is_some_and(|run| run.paint.badge.is_some())
+    }
+
     pub(super) fn prefers_break_before(&self, index_in_line: usize) -> bool {
         match self.break_before {
             BreakBefore::Preferred => true,
@@ -423,6 +482,14 @@ impl Chunk {
         match self.runs.as_slice() {
             [run] if run.paint.preserve_whitespace && &*run.text == "\t" => Some(&run.paint),
             _ => None,
+        }
+    }
+
+    pub(super) fn minimum_cells(&self) -> usize {
+        if self.tab_paint().is_some() {
+            1
+        } else {
+            self.width_cells
         }
     }
 
@@ -454,6 +521,7 @@ impl PreparedText {
         limit: usize,
         visit: &mut Visit<'a, '_>,
     ) -> usize {
+        let visible = width.visible;
         let width = width.cells;
         let mut y = 0;
         for line in &self.lines {
@@ -461,6 +529,13 @@ impl PreparedText {
             loop {
                 let (end, cells) = fit_visual_line(remaining, width);
                 let (fitted, rest) = remaining.split_at(end);
+                // Keep both gutters for wrapping. At the viewport edge the
+                // decorative right gutter can clip while the entire label fits.
+                let cells = if cells == visible + 1 && fitted.last().is_some_and(Chunk::is_badge) {
+                    visible
+                } else {
+                    cells
+                };
                 visit(y, Fragment::Text(fitted, cells));
                 y += 1;
                 if y == limit {
@@ -500,14 +575,28 @@ fn fit_visual_line(line: &[Chunk], width: usize) -> (usize, usize) {
     (line.len(), used)
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum Cut {
+    Viewport,
+    LineClamp { prior_content: bool },
+}
+
 pub(super) fn visit_chunks<'a>(
     chunks: &'a [Chunk],
     limit: usize,
+    cut: Cut,
     mut draw: impl FnMut(usize, &str, usize, &'a Paint),
 ) -> usize {
     let mut used = 0;
 
     for (index, chunk) in chunks.iter().enumerate() {
+        if let Cut::LineClamp { prior_content } = cut
+            && (prior_content || used > 0)
+            && chunk.is_badge()
+            && chunk.width_cells > limit - used
+        {
+            return used;
+        }
         if let Some(paint) = chunk.tab_paint() {
             let cells = chunk.width_at(used).min(limit.saturating_sub(used));
             if cells == 0 {

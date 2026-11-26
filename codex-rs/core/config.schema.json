@@ -1132,6 +1132,9 @@
             "guardianv3": {
               "$ref": "#/definitions/FeatureToml_for_GuardianV3ConfigToml"
             },
+            "guardianv3_shadow": {
+              "type": "boolean"
+            },
             "hooks": {
               "type": "boolean"
             },
@@ -2684,6 +2687,13 @@
         },
         {
           "properties": {
+            "additionalContextLimit": {
+              "description": "Approximate token threshold for spilling plaintext `additionalContext` to disk. Defaults to 2,500. For MCP hooks, `0` and values above 10,000 trigger a warning and use 10,000. Command hooks can disable spilling with `0` or set a higher threshold. The MCP ceiling mirrors the current default tool-output budget and may change in the future. Encrypted hook output has a separate byte limit.",
+              "format": "uint",
+              "maximum": 10000.0,
+              "minimum": 1.0,
+              "type": "integer"
+            },
             "input": {
               "additionalProperties": true,
               "default": {},
@@ -4739,9 +4749,6 @@
         },
         "version": {
           "$ref": "#/definitions/RealtimeConversationVersion"
-        },
-        "voice": {
-          "$ref": "#/definitions/RealtimeVoice"
         }
       },
       "type": "object"
@@ -4750,46 +4757,6 @@
       "enum": [
         "webrtc",
         "websocket"
-      ],
-      "type": "string"
-    },
-    "RealtimeVoice": {
-      "enum": [
-        "alloy",
-        "arbor",
-        "ash",
-        "aube",
-        "ballad",
-        "breeze",
-        "bubbie",
-        "cedar",
-        "coral",
-        "cove",
-        "echo",
-        "ember",
-        "haetsal",
-        "hanul",
-        "himari",
-        "juniper",
-        "leher",
-        "maple",
-        "marin",
-        "miko",
-        "neer",
-        "porto",
-        "rindo",
-        "rio",
-        "rivage",
-        "sage",
-        "selva",
-        "shimmer",
-        "sol",
-        "sonna",
-        "spruce",
-        "tinta",
-        "vale",
-        "verse",
-        "viola"
       ],
       "type": "string"
     },
@@ -8554,6 +8521,9 @@
         },
         "guardianv3": {
           "$ref": "#/definitions/FeatureToml_for_GuardianV3ConfigToml"
+        },
+        "guardianv3_shadow": {
+          "type": "boolean"
         },
         "hooks": {
           "type": "boolean"

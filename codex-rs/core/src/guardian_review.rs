@@ -1,88 +1,15 @@
 //! Host adapter types and assessment results for synchronous Guardian review.
 //! The extension supplies agent startup and owns the reviewer pool and its lifecycle.
 
-use crate::context_manager::ContextManager;
 pub use crate::guardian::GuardianReviewSession;
 pub use crate::guardian::GuardianReviewState;
 pub use crate::guardian::PreparedGuardianContext;
 pub use crate::guardian::prepare_review_prewarm;
 pub use crate::mcp_tool_call::conversation_history::conversation_history_tools;
-use std::sync::Mutex;
-use std::sync::PoisonError;
-use tokio::sync::watch;
 
-/// Tracks root evidence that is visible in memory and still awaiting a history append.
-/// Only reviewers that read persisted history install this tracker.
-#[derive(Default)]
-pub struct PendingReviewWrites {
-    pending: Mutex<Vec<watch::Receiver<bool>>>,
-}
-
-/// An evidence write that the session must finish. After a failed append, we
-/// still preserve later writes, but can no longer confirm a complete history.
-pub(crate) struct ReviewWrite {
-    receipt: Option<watch::Sender<bool>>,
-}
-
-impl ReviewWrite {
-    /// Record under the session lock so a reviewer cannot see the new revision
-    /// before its pending write is registered.
-    pub(crate) fn record<T>(
-        writes: Option<&PendingReviewWrites>,
-        history: &mut ContextManager,
-        record: impl FnOnce(&mut ContextManager) -> T,
-    ) -> (T, Option<Self>) {
-        let Some(writes) = writes else {
-            return (record(history), None);
-        };
-        let before = history.guardian_revisions();
-        let result = record(history);
-        let write = (history.guardian_revisions() != before).then(|| writes.begin());
-        (result, write)
-    }
-
-    pub(crate) fn confirm(self) {
-        if let Some(receipt) = self.receipt {
-            receipt.send_replace(true);
-        }
-    }
-}
-
-impl PendingReviewWrites {
-    fn begin(&self) -> ReviewWrite {
-        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-        pending.retain(|write| !*write.borrow());
-        // A dropped or failed append leaves a gap for this root's lifetime.
-        if pending
-            .iter()
-            .any(|write| write.has_changed().is_err() && !*write.borrow())
-        {
-            return ReviewWrite { receipt: None };
-        }
-        let (appended, write) = watch::channel(/*init*/ false);
-        pending.push(write);
-        ReviewWrite {
-            receipt: Some(appended),
-        }
-    }
-
-    /// Wait for writes already visible to this review. Later instructions are
-    /// covered by the reviewer's authorization recheck and its next attempt.
-    pub async fn wait(&self) -> Result<(), ReviewPreparationError> {
-        let pending = {
-            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-            pending.retain(|write| !*write.borrow());
-            pending.clone()
-        };
-        for mut write in pending {
-            write
-                .wait_for(|appended| *appended)
-                .await
-                .map_err(|_| ReviewPreparationError::HistoryWriteUnconfirmed)?;
-        }
-        Ok(())
-    }
-}
+/// Opts a root into session-owned evidence saves that survive turn cancellation.
+/// Install at thread startup. Reviewers do not wait for these writes.
+pub struct PreserveReviewWrites;
 
 /// Retrieval guidance for the tools installed in a private verdict session.
 #[derive(Clone)]
@@ -113,28 +40,21 @@ pub fn reviewer_headers(config: &crate::config::Config) -> crate::CodexResponses
     }
 }
 
-/// A thread's synchronous reviewer. Bind its evidence position before the action waits.
-/// Routing may hand the action to a human without ever requesting preparation.
-pub trait AttachedReviewer: Send + Sync {
-    fn bind(self: std::sync::Arc<Self>) -> BoundReviewer;
+/// Kept out of the authoritative reviewer slot so routing and prewarming stay unchanged.
+pub struct ShadowReviewer {
+    pub reviewer: std::sync::Arc<dyn AttachedReviewer>,
+    /// Stops this actor when it shuts down or the root leaves Auto Review.
+    pub cancellation: tokio_util::sync::CancellationToken,
 }
 
-/// Evidence preparation bound to one action, shared by its review attempts.
-#[derive(Clone)]
-pub struct BoundReviewer {
-    pub preparation: std::sync::Arc<dyn ReviewerPreparation>,
-    pub retrieval: ReviewRetrieval,
-}
+/// Marks the private inference thread, which must never forward items to its parent.
+pub struct ShadowReviewSession;
 
 /// Safe to report with a review ID before a verdict has started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ReviewPreparationError {
     #[error("Guardian board evidence is unavailable")]
     EvidenceUnavailable,
-    #[error(
-        "An instruction may not have been saved. Reload the root thread, check the history and resend any missing instructions before retrying."
-    )]
-    HistoryWriteUnconfirmed,
     #[error("timed out preparing Guardian review")]
     PreparationTimedOut,
     #[error("reviewer is unavailable")]
@@ -145,9 +65,16 @@ pub enum ReviewPreparationError {
     Cancelled,
 }
 
-/// Reserve the actor's reviewer after routing and delivery have covered this attempt.
-/// A retry must cover authorization changes since the previous attempt.
-pub trait ReviewerPreparation: Send + Sync {
+/// A thread's synchronous reviewer. Reserve the conversation and admit the
+/// available evidence for each attempt, including retries.
+pub trait AttachedReviewer: Send + Sync {
+    fn retrieval(&self) -> ReviewRetrieval;
+
+    /// Resolve the worker's currently loaded root. The root actor uses its own reset signal.
+    fn root_thread(
+        &self,
+    ) -> codex_extension_api::ExtensionFuture<'_, Option<std::sync::Arc<crate::CodexThread>>>;
+
     fn prepare<'a>(
         &'a self,
         setup: &'a PreparedGuardianContext,
@@ -158,7 +85,7 @@ pub trait ReviewerPreparation: Send + Sync {
     >;
 }
 
-/// Holds the model session until the host finishes validating the original authority.
+/// Holds the model session until the host accepts or discards its verdict.
 /// Dropping an interrupted reservation discards its partially admitted conversation.
 pub trait PreparedAssessment: Send + Sync {
     fn runtime(&self) -> &GuardianReviewSession;

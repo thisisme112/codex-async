@@ -444,7 +444,7 @@ pub enum Feature {
     SkillMcpDependencyInstall,
     /// Omit descriptions from the model-visible available-skills catalog.
     OmitSkillDescriptions,
-    /// Run cheap skill-search methods in shadow mode and emit experiment metrics.
+    /// Removed compatibility flag for shadow skill ranking.
     SkillSearch,
     /// Append skill additions and edits within a cumulative context budget.
     SkillCatalogDeltas,
@@ -493,6 +493,8 @@ pub enum Feature {
     GuardianV2DecisionsComparison,
     /// Enable Guardian V3 integrations.
     GuardianV3,
+    /// Observe Guardian V3 alongside the existing automatic reviewer.
+    GuardianV3Shadow,
     /// Removed compatibility flag for the unused Guardian extension prototype.
     GuardianExt,
     /// Enable persisted thread goals and automatic goal continuation.
@@ -832,7 +834,7 @@ impl Features {
                 "personality" | "plugin_discovery_prefetch" | "plugin_hooks" => {
                     continue;
                 }
-                "skill_env_var_dependency_prompt" => {
+                "skill_env_var_dependency_prompt" | "skill_search" => {
                     continue;
                 }
                 "terminal_resize_reflow" => {
@@ -1883,8 +1885,8 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::McpSharedReplCwd,
         key: "mcp_shared_repl_cwd",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::McpLazyStdioStartup,
@@ -2231,8 +2233,8 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::SkillSearch,
         key: "skill_search",
-        stage: Stage::Stable,
-        default_enabled: true,
+        stage: Stage::Removed,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::SkillCatalogDeltas,
@@ -2381,6 +2383,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::GuardianV3,
         key: "guardianv3",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::GuardianV3Shadow,
+        key: "guardianv3_shadow",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

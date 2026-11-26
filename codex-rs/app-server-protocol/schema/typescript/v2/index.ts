@@ -13,6 +13,7 @@ export type { AccountTokenUsageDailyBucket } from "./AccountTokenUsageDailyBucke
 export type { AccountTokenUsageSummary } from "./AccountTokenUsageSummary";
 export type { AccountUpdateReason } from "./AccountUpdateReason";
 export type { AccountUpdatedNotification } from "./AccountUpdatedNotification";
+export type { AccountVoiceOption } from "./AccountVoiceOption";
 export type { ActivePermissionProfile } from "./ActivePermissionProfile";
 export type { AddCreditsNudgeCreditType } from "./AddCreditsNudgeCreditType";
 export type { AddCreditsNudgeEmailStatus } from "./AddCreditsNudgeEmailStatus";
@@ -452,6 +453,7 @@ export type { ProjectChangeType } from "./ProjectChangeType";
 export type { ProjectChangedNotification } from "./ProjectChangedNotification";
 export type { ProjectRoot } from "./ProjectRoot";
 export type { ProjectSortKey } from "./ProjectSortKey";
+export type { PromptWellbeingResult } from "./PromptWellbeingResult";
 export type { ProviderSettings } from "./ProviderSettings";
 export type { ProviderSettingsPatch } from "./ProviderSettingsPatch";
 export type { QueuedSubmission } from "./QueuedSubmission";

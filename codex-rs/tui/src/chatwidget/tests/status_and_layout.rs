@@ -840,18 +840,10 @@ async fn rate_limit_warnings_emit_thresholds() {
     assert_eq!(
         warnings,
         vec![
-            String::from(
-                "Heads up, you have less than 25% of your 5h limit left. Run /status for a breakdown."
-            ),
-            String::from(
-                "Heads up, you have less than 25% of your weekly limit left. Run /status for a breakdown.",
-            ),
-            String::from(
-                "Heads up, you have less than 5% of your 5h limit left. Run /status for a breakdown."
-            ),
-            String::from(
-                "Heads up, you have less than 5% of your weekly limit left. Run /status for a breakdown.",
-            ),
+            String::from("Heads up, you have less than 25% of your 5h limit left."),
+            String::from("Heads up, you have less than 25% of your weekly limit left.",),
+            String::from("Heads up, you have less than 5% of your 5h limit left."),
+            String::from("Heads up, you have less than 5% of your weekly limit left.",),
         ],
         "expected one warning per limit for the highest crossed threshold"
     );
@@ -918,7 +910,7 @@ async fn test_rate_limit_warnings_monthly() {
     assert_eq!(
         warnings,
         vec![String::from(
-            "Heads up, you have less than 25% of your monthly limit left. Run /status for a breakdown.",
+            "Heads up, you have less than 25% of your monthly limit left.",
         ),],
         "expected one warning per limit for the highest crossed threshold"
     );
@@ -947,12 +939,8 @@ async fn test_rate_limit_warnings_use_generic_fallback_labels() {
             /*primary_window_minutes*/ None,
         ),
         vec![
-            String::from(
-                "Heads up, you have less than 25% of your secondary usage limit left. Run /status for a breakdown.",
-            ),
-            String::from(
-                "Heads up, you have less than 25% of your usage limit left. Run /status for a breakdown.",
-            ),
+            String::from("Heads up, you have less than 25% of your secondary usage limit left.",),
+            String::from("Heads up, you have less than 25% of your usage limit left.",),
         ],
     );
 }
@@ -970,7 +958,7 @@ async fn test_rate_limit_warnings_use_secondary_fallback_for_unsupported_window(
             /*primary_window_minutes*/ None,
         ),
         vec![String::from(
-            "Heads up, you have less than 25% of your secondary usage limit left. Run /status for a breakdown.",
+            "Heads up, you have less than 25% of your secondary usage limit left.",
         )],
     );
 }
@@ -1428,6 +1416,39 @@ async fn rate_limit_switch_prompt_skips_when_on_lower_cost_model() {
         chat.rate_limit_switch_prompt,
         RateLimitSwitchPromptState::Idle
     ));
+}
+
+#[tokio::test]
+async fn custom_provider_warns_from_turn_without_rate_limit_switch_prompt() {
+    let (mut chat, mut rx, _) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.config.model_provider_id = "custom".into();
+    chat.requires_openai_auth = false;
+    let mut usage = snapshot(/*percent*/ 96.0);
+    usage.primary.as_mut().unwrap().window_duration_mins = Some(10080);
+    chat.on_rolling_rate_limit_snapshot(usage.clone());
+
+    let warnings = drain_insert_history_transcript(&mut rx);
+    insta::assert_snapshot!(lines_to_single_string(&warnings.concat()), @r"
+    ⚠ Heads up, you have less than 5% of your weekly limit left.
+    ");
+    assert!(matches!(
+        chat.rate_limit_switch_prompt,
+        RateLimitSwitchPromptState::Idle
+    ));
+    let notice = chat.usage_notice(/*width*/ 160).unwrap().to_string();
+    insta::assert_snapshot!(notice, @"⚠ weekly limit: only 4% left");
+
+    let mut sparse = snapshot(/*percent*/ 10.0);
+    sparse.secondary = sparse.primary.take();
+    chat.on_rolling_rate_limit_snapshot(sparse);
+    assert_eq!(
+        chat.usage_notice(/*width*/ 160).unwrap().to_string(),
+        notice
+    );
+
+    usage.primary.as_mut().unwrap().used_percent = 10;
+    chat.on_rolling_rate_limit_snapshot(usage);
+    assert!(chat.usage_notice(/*width*/ 160).is_none());
 }
 
 #[tokio::test]
@@ -2663,22 +2684,53 @@ fn assert_goal_paused_event(
 }
 
 #[tokio::test]
-async fn idle_commit_ticks_do_not_restore_status_without_commentary_completion() {
+async fn unphased_stream_keeps_activity_visible_until_turn_completion() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    handle_turn_started(&mut chat, "turn-1");
 
-    chat.on_task_started();
-    assert_eq!(chat.bottom_pane.status_indicator_visible(), true);
-
-    chat.on_agent_message_delta("Final answer line\n".to_string());
+    let whitespace = "\u{3000}\n";
+    handle_agent_message_delta(&mut chat, whitespace);
     chat.on_commit_tick();
-    drain_insert_history(&mut rx);
+    assert!(drain_insert_history(&mut rx).is_empty());
+    assert!(chat.bottom_pane.status_indicator_visible());
+    complete_assistant_message(&mut chat, "msg-1", whitespace, /*phase*/ None);
+    assert!(chat.bottom_pane.status_indicator_visible());
 
-    assert_eq!(chat.bottom_pane.status_indicator_visible(), false);
-    assert_eq!(chat.bottom_pane.is_task_running(), true);
-
-    // A second idle tick should not toggle the row back on and cause jitter.
+    chat.on_agent_message_delta("Checking the workbook.\n".to_string());
     chat.on_commit_tick();
-    assert_eq!(chat.bottom_pane.status_indicator_visible(), false);
+    chat.on_commit_tick();
+    let footer = |chat: &ChatWidget, width| {
+        hook_status_frame(chat, width)
+            .lines()
+            .last()
+            .unwrap()
+            .to_owned()
+    };
+    assert!(!chat.bottom_pane.status_indicator_visible());
+    let mut hints = vec![footer(&chat, 60)];
+    chat.apply_external_edit("Follow up".into());
+    hints.push(footer(&chat, 60));
+    hints.push(footer(&chat, 26));
+    chat.apply_external_edit(String::new());
+    chat.bottom_pane.set_vim_enabled(/*enabled*/ true);
+    chat.handle_key_event(KeyCode::Insert.into());
+    hints.push(footer(&chat, 60));
+    chat.handle_key_event(KeyCode::Esc.into());
+    hints.push(footer(&chat, 60));
+    chat.bottom_pane.set_vim_enabled(/*enabled*/ false);
+    assert_chatwidget_snapshot!("streaming_interrupt_hint", hints.join("\n"));
+    complete_assistant_message(
+        &mut chat,
+        "msg-2",
+        "Checking the workbook.",
+        /*phase*/ None,
+    );
+    assert_chatwidget_snapshot!(
+        "paused_unphased_message",
+        hook_status_frame(&chat, /*width*/ 60)
+    );
+    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
+    assert!(!chat.bottom_pane.status_indicator_visible());
 }
 
 #[tokio::test]

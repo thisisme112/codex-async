@@ -70,12 +70,19 @@ impl App {
         }
         self.zoomed_thread = None;
         let parent = self.current_displayed_thread_id();
-        let pane = self.sidebar_mut();
+        let sidebar_parent = self.sidebar_parent();
+        let pane = self.sidebars.entry(sidebar_parent).or_default();
         pane.closing_chats.retain(|_, task| !task.is_finished());
         pane.show(SidebarContent::Chooser, PaneFocus::Sidebar);
         if pane.creation.is_none()
             && let Some(parent) = parent
         {
+            if self.primary_thread_id == Some(parent) {
+                pane.sync_agent_rows(&self.agent_navigation);
+                if pane.agents.rows.iter().any(|agent| !agent.selectable) {
+                    self.refresh_agent_picker_threads(server, parent);
+                }
+            }
             self.refresh_saved_chats(server, parent);
             self.refresh_sidebar_files(server, parent).await;
         }
@@ -297,6 +304,19 @@ impl App {
                     tui.frame_requester().schedule_frame();
                     if down {
                         self.sidebar_press = candidate;
+                        if button == MouseButton::Left
+                            && mouse.modifiers.is_empty()
+                            && self.chooser_focus() == Some(PaneFocus::Main)
+                            && self.sidebar().is_some_and(|pane| pane.showing_file_path)
+                            && frame.sidebar_input == current
+                            && self.pane_resize.is_none()
+                            && frame.panel_area().is_some_and(|area| {
+                                sidebar_chooser::file_path_areas(area)[0].contains(point)
+                            })
+                        {
+                            self.sidebar_mut()
+                                .show(SidebarContent::Chooser, PaneFocus::Sidebar);
+                        }
                         return true;
                     }
                     let Some(press) = candidate.filter(|candidate| Some(*candidate) == pressed)
@@ -535,6 +555,10 @@ impl App {
             && pane.creation.is_none()
             && let Some(agent) = pane.chat_tabs().agent(index).map(|agent| agent.id)
         {
+            if pane.chat_tabs().agent_is_disabled(index) {
+                self.guard_chooser_key(activation);
+                return true;
+            }
             pane.choice = index;
             if self
                 .agent_navigation

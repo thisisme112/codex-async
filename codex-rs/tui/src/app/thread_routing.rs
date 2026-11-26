@@ -425,9 +425,14 @@ impl App {
                     match &params.request {
                         codex_app_server_protocol::McpServerElicitationRequest::Form {
                             message,
+                            requested_schema,
                             ..
                         } => Some(ThreadInteractiveRequest::Approval(
                             ApprovalRequest::McpElicitation(McpElicitationApprovalRequest {
+                                has_required_fields: requested_schema
+                                    .required
+                                    .as_ref()
+                                    .is_some_and(|fields| !fields.is_empty()),
                                 thread_id,
                                 thread_label,
                                 server_name: params.server_name.clone(),
@@ -926,17 +931,15 @@ impl App {
                 let registration = self.chat_widget.begin_call_negotiation();
                 let mut server = app_server.request_view();
                 let config = self.config.clone();
-                let cwd = self.chat_widget.config_ref().cwd.clone();
                 let offer = String::from(offer_sdp.clone());
                 let call_client = Arc::clone(&self.realtime_call_client);
                 let tx = self.app_event_tx.clone();
                 tokio::spawn(async move {
                     let create = async {
-                        let voice = Self::effective_realtime_voice(&server, &cwd).await?;
                         let thread = server
                             .thread_read(thread_id, /*include_turns*/ false)
                             .await?;
-                        call_client.create(&config, &thread, offer, voice).await
+                        call_client.create(&config, &thread, offer).await
                     };
                     if let Ok(result) = futures::future::Abortable::new(create, registration).await
                     {
