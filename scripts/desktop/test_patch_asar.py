@@ -11,10 +11,13 @@ desktop_patch = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(desktop_patch)
 
 
-def fixture(app, compatible=True):
+def fixture(app, compatible=True, newer=False):
     resources = app / 'resources'
     resources.mkdir(parents=True)
     composer = b'c=n("zTeN");f=n("zd8w");eX=n("Oj9r");' + desktop_patch.COMPOSER + b' x ' + desktop_patch.INSERTION + b' x ' + desktop_patch.RAIL
+    if newer:
+        composer = (desktop_patch.NEW_COMPOSER + b'a=n("qmMi");i=n("zd8w");el=n("tSEg");r=n("ABep");' +
+                    b'function eQ(e){let t,n,a,s=(0,l.c)(4),{onRetry:o}=e;' + desktop_patch.NEW_INSERTION)
     if not compatible:
         composer = composer.replace(desktop_patch.INSERTION, b'changed-upstream')
     members = {
@@ -41,6 +44,20 @@ def fixture(app, compatible=True):
 
 
 class DesktopPatchTests(unittest.TestCase):
+    def test_newer_composer_uses_new_scope_and_output_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp) / 'app'
+            fixture(app, newer=True)
+            desktop_patch.patch(app)
+            with (app / 'resources' / 'app.asar').open('rb') as f:
+                _, size, _, json_size = struct.unpack('<IIII', f.read(16))
+                header = json.loads(f.read(json_size))
+                entry = header['files']['webview']['files']['assets']['files']['composer.js']
+                f.seek(8 + size + int(entry['offset']))
+                data = f.read(entry['size'])
+            self.assertIn(b'(0,a._U)(x.w,item.itemKey)?.text', data)
+            self.assertIn(b'children:[b,I,(0,r.jsx)(i.Suspense', data)
+
     def test_candidate_updates_header_marker_and_preserves_unrelated_content(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = Path(tmp) / 'app'

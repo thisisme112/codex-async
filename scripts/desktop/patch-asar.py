@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import struct
 from pathlib import Path
 
@@ -11,6 +12,8 @@ COMPOSER = b'function o3(e){let t,n,r,i,s,l,d,c,u,m,h=(0,a.c)(54)'
 INSERTION = b's9?null:yt,cx?(0,o.jsx)(o3,'
 RAIL = b'rk=xl&&null==ix?(0,o.jsxs)(eH.l,'
 STATE_MARKER = b'Dropping commandExecution/outputDelta for missing item'
+NEW_COMPOSER = b'UVLr(e,t,n){n.d(t,{LocalConversationBackgroundAgentTab:'
+NEW_INSERTION = b'children:[b,I,w]'
 OLD_GUID = b'e5768d8b-6936-4f45-b1ad-4c5fb414cb35'
 NEW_GUID = b'67d18a29-bc8e-4356-bbe5-24859a20c913'
 
@@ -63,13 +66,26 @@ def patch(app):
         base = 8 + size
         assets = lambda p: p.startswith('webview/assets/') and p.endswith('.js')
         main = lambda p: p.startswith('.vite/build/') and p.endswith('.js')
-        composer_name, _, composer = unique_member(old, base, entries, assets, COMPOSER, 'composer')
-        for required in (b'c=n("zTeN")', b'f=n("zd8w")', b'eX=n("Oj9r")'):
-            if required not in composer:
-                raise RuntimeError('composer dependency changed; manual adaptation required')
-        composer = replace_once(composer, COMPOSER, PANEL.read_bytes() + COMPOSER, 'composer component')
-        composer = replace_once(composer, INSERTION, b's9?null:yt,(0,o.jsx)(f.Suspense,{fallback:null,children:(0,o.jsx)(xkBackgroundPanel,{})}),cx?(0,o.jsx)(o3,', 'composer insertion')
-        composer = replace_once(composer, RAIL, b'rk=null==ix?(0,o.jsxs)(eH.l,', 'composer rail')
+        try:
+            composer_name, _, composer = unique_member(old, base, entries, assets, NEW_COMPOSER, 'composer')
+        except RuntimeError:
+            composer_name, _, composer = unique_member(old, base, entries, assets, COMPOSER, 'composer')
+            for required in (b'c=n("zTeN")', b'f=n("zd8w")', b'eX=n("Oj9r")'):
+                if required not in composer:
+                    raise RuntimeError('composer dependency changed; manual adaptation required')
+            composer = replace_once(composer, COMPOSER, PANEL.read_bytes() + COMPOSER, 'composer component')
+            composer = replace_once(composer, INSERTION, b's9?null:yt,(0,o.jsx)(f.Suspense,{fallback:null,children:(0,o.jsx)(xkBackgroundPanel,{})}),cx?(0,o.jsx)(o3,', 'composer insertion')
+            composer = replace_once(composer, RAIL, b'rk=null==ix?(0,o.jsxs)(eH.l,', 'composer rail')
+        else:
+            for required in (b'a=n("qmMi")', b'i=n("zd8w")', b'el=n("tSEg")', b'r=n("ABep")'):
+                if required not in composer:
+                    raise RuntimeError('composer dependency changed; manual adaptation required')
+            panel = PANEL.read_text(encoding='utf-8')
+            panel = re.sub(r'\b(f|c|o|eX)\b', lambda m: {'f':'i','c':'a','o':'r','eX':'el'}[m[0]], panel)
+            panel = panel.replace('(0,a._U)(x.w,item.itemKey)??""', '(0,a._U)(x.w,item.itemKey)?.text??""')
+            insertion = b'function eQ(e){let t,n,a,s=(0,l.c)(4),{onRetry:o}=e;'
+            composer = replace_once(composer, insertion, panel.encode() + insertion, 'composer component')
+            composer = replace_once(composer, NEW_INSERTION, b'children:[b,I,(0,r.jsx)(i.Suspense,{fallback:null,children:(0,r.jsx)(xkBackgroundPanel,{})}),w]', 'composer insertion')
         state_name, _, state = unique_member(old, base, entries, assets, STATE_MARKER, 'output updates')
         position = state.index(STATE_MARKER)
         flag = b'broadcastPatchesToFollowers:!1'
